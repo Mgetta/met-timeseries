@@ -104,4 +104,3 @@ met-timeseries/
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
-meteorlogical timeseries downloading and procressing for hydrologic models
