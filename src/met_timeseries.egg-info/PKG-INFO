@@ -1,3 +1,20 @@
+Metadata-Version: 2.4
+Name: met-timeseries
+Version: 0.1.0
+Summary: Meteorological timeseries downloading and processing for hydrologic models
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: click>=8.0
+Requires-Dist: geopandas>=0.14
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: pyarrow>=12.0
+Requires-Dist: shapely>=2.0
+Requires-Dist: xarray>=2023.1
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"
+
 # met-timeseries
 
 Meteorological timeseries downloading and processing for hydrologic models.

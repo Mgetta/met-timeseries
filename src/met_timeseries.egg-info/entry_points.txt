@@ -1,0 +1,2 @@
+[console_scripts]
+met-timeseries = met_timeseries.cli:main
