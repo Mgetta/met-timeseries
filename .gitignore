@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Output
+output/
+ledger*.csv
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
