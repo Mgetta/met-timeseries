@@ -122,9 +122,18 @@ def process_nldas_month(
 
         for var_name, da in derived.items():
             stats = aggregate_over_polygon(xr.Dataset({var_name: da}), geom)
-            row_df = pd.DataFrame(
-                [{"year": year, "month": month, **stats}]
-            )
+            values = stats[var_name]
+            if isinstance(values, list):
+                # Hourly timeseries: one row per timestep
+                time_coords = da.coords["time"].values if "time" in da.coords else range(len(values))
+                row_df = pd.DataFrame({
+                    "datetime": pd.to_datetime(time_coords),
+                    "year": year,
+                    "month": month,
+                    var_name: values,
+                })
+            else:
+                row_df = pd.DataFrame([{"year": year, "month": month, **stats}])
             save_timeseries(
                 df=row_df,
                 output_dir=output_dir,

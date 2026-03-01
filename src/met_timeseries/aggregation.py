@@ -51,8 +51,8 @@ def aggregate_over_polygon(
     polygon: BaseGeometry,
     lat_dim: str = "lat",
     lon_dim: str = "lon",
-) -> dict[str, float]:
-    """Compute the area-weighted mean of each variable in *dataset* over *polygon*.
+) -> dict[str, list[float] | float]:
+    """Compute the spatial mean of each variable in *dataset* over *polygon*.
 
     Each grid cell's contribution is proportional to the fraction of its area
     that overlaps *polygon*.  If no cells overlap the polygon the function
@@ -72,8 +72,8 @@ def aggregate_over_polygon(
 
     Returns
     -------
-    dict mapping variable name to its area-weighted mean scalar value over the
-    polygon.
+    dict mapping variable name to either a scalar float (2D data) or a list of
+    floats with one value per timestep (3D data with a leading time dimension).
     """
     lats = dataset[lat_dim].values
     lons = dataset[lon_dim].values
@@ -95,21 +95,20 @@ def aggregate_over_polygon(
         weights[lat_idx, lon_idx] = 1.0
         total_weight = 1.0
 
-    result: dict[str, float] = {}
+    result: dict[str, list[float] | float] = {}
     for var in dataset.data_vars:
         arr = dataset[var].values
         if arr.ndim == 2:
-            spatial = arr
+            values = arr[mask]
+            result[str(var)] = float(np.nanmean(values)) if len(values) > 0 else float("nan")
         elif arr.ndim == 3:
-            # (time, lat, lon) — average over time first
-            spatial = arr.mean(axis=0)
+            # (time, lat, lon) — return one spatial mean per timestep
+            mask_flat = mask.ravel()
+            arr_2d = arr.reshape(arr.shape[0], -1)  # (time, lat*lon)
+            selected = arr_2d[:, mask_flat]          # (time, n_cells)
+            result[str(var)] = np.nanmean(selected, axis=1).tolist()
         else:
-            spatial = arr.reshape(len(lats), len(lons))
-
-        weighted_sum = float(np.nansum(spatial * weights))
-        # Account for NaN cells by subtracting their weights from total
-        nan_weight = float(np.nansum(weights[np.isnan(spatial)]))
-        effective_weight = total_weight - nan_weight
-        result[str(var)] = weighted_sum / effective_weight if effective_weight > 0 else float("nan")
+            values = arr.ravel()
+            result[str(var)] = float(np.nanmean(values)) if len(values) > 0 else float("nan")
 
     return result
