@@ -1,50 +1,15 @@
 """
-Tests for met_timeseries.sources.nldas — URL template and error handling.
+Tests for met_timeseries.sources.nldas — earthaccess-based implementation.
 """
 
 from __future__ import annotations
 
 from unittest.mock import patch, MagicMock
 
+import numpy as np
+import pandas as pd
 import pytest
-
-
-class TestOpendapTemplate:
-    """Verify that the URL template produces correct filenames."""
-
-    def test_url_ends_with_grb(self) -> None:
-        from met_timeseries.sources.nldas import _OPENDAP_TEMPLATE
-
-        url = _OPENDAP_TEMPLATE.format(year=2010, doy=1, month=1, day=1, hour=0)
-        assert url.endswith(".grb"), f"URL should end with .grb, got: {url}"
-
-    def test_url_does_not_contain_sub_nc(self) -> None:
-        from met_timeseries.sources.nldas import _OPENDAP_TEMPLATE
-
-        url = _OPENDAP_TEMPLATE.format(year=2010, doy=1, month=1, day=1, hour=0)
-        assert ".SUB.nc" not in url, f"URL must not contain .SUB.nc suffix: {url}"
-
-    def test_url_uses_version_020(self) -> None:
-        from met_timeseries.sources.nldas import _OPENDAP_TEMPLATE
-
-        url = _OPENDAP_TEMPLATE.format(year=2010, doy=1, month=1, day=1, hour=0)
-        assert ".020.grb" in url, f"URL should contain version code .020, got: {url}"
-
-    def test_url_does_not_use_version_002(self) -> None:
-        from met_timeseries.sources.nldas import _OPENDAP_TEMPLATE
-
-        url = _OPENDAP_TEMPLATE.format(year=2010, doy=1, month=1, day=1, hour=0)
-        assert ".002." not in url, f"URL must not contain old version code .002: {url}"
-
-    def test_url_example_matches_expected(self) -> None:
-        from met_timeseries.sources.nldas import _OPENDAP_TEMPLATE
-
-        url = _OPENDAP_TEMPLATE.format(year=2010, doy=1, month=1, day=1, hour=0)
-        expected = (
-            "https://hydro1.gesdisc.eosdis.nasa.gov/opendap/NLDAS/NLDAS_FORA0125_H.2.0/"
-            "2010/001/NLDAS_FORA0125_H.A20100101.0000.020.grb"
-        )
-        assert url == expected
+import xarray as xr
 
 
 @pytest.fixture()
@@ -54,23 +19,163 @@ def bounds():
     return BoundingBox(west=-110.0, east=-109.0, south=45.0, north=46.0)
 
 
-class TestOpenDatasetErrorHandling:
-    """Verify that _open_dataset raises descriptive RuntimeErrors for HTTP errors."""
+def _make_mock_dataset(variables=("APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD")):
+    """Create a small mock xarray Dataset mimicking NLDAS-2 output."""
+    times = pd.date_range("2010-01-01", periods=2, freq="h")
+    lats = np.array([44.9375, 45.0625, 45.9375, 46.0625])
+    lons = np.array([-110.0625, -109.9375, -109.0625, -108.9375])
 
-    @pytest.mark.parametrize(
-        "error_msg, exc_type, match",
-        [
-            ("404 not found", RuntimeError, "File not found"),
-            ("401 unauthorized", RuntimeError, "Authentication required"),
-            ("403 forbidden", RuntimeError, "Access forbidden"),
-            ("connection reset", OSError, "connection reset"),
-        ],
+    data_vars = {
+        var: (["time", "lat", "lon"], np.ones((2, 4, 4), dtype=np.float32))
+        for var in variables
+    }
+
+    return xr.Dataset(
+        data_vars,
+        coords={"time": times, "lat": lats, "lon": lons},
     )
-    def test_http_errors_produce_correct_exception(
-        self, bounds, error_msg: str, exc_type: type, match: str
-    ) -> None:
-        from met_timeseries.sources.nldas import _open_dataset
 
-        with patch("xarray.open_dataset", side_effect=OSError(error_msg)):
-            with pytest.raises(exc_type, match=match):
-                _open_dataset("http://example.com/fake.grb", bounds, ["APCP"], None)
+
+class TestFetchNldasCallsEarthaccess:
+    """Verify that fetch_nldas calls earthaccess correctly."""
+
+    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_calls_login(self, mock_login, mock_search, mock_open, mock_mfdataset, bounds):
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_mfdataset.return_value = _make_mock_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        fetch_nldas(bounds, 2010, 1)
+
+        mock_login.assert_called_once()
+
+    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_calls_search_data_with_correct_params(
+        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+    ):
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_mfdataset.return_value = _make_mock_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        fetch_nldas(bounds, 2010, 1)
+
+        mock_search.assert_called_once_with(
+            short_name="NLDAS_FORA0125_H",
+            version="2.0",
+            temporal=("2010-01-01", "2010-01-31"),
+            bounding_box=(-110.0, 45.0, -109.0, 46.0),
+        )
+
+    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_calls_open_with_search_results(
+        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+    ):
+        granules = [MagicMock()]
+        mock_search.return_value = granules
+        mock_open.return_value = [MagicMock()]
+        mock_mfdataset.return_value = _make_mock_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        fetch_nldas(bounds, 2010, 1)
+
+        mock_open.assert_called_once_with(granules)
+
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_raises_when_no_granules_found(self, mock_login, mock_search, bounds):
+        mock_search.return_value = []
+
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        with pytest.raises(RuntimeError, match="No NLDAS-2 granules found"):
+            fetch_nldas(bounds, 2010, 1)
+
+    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_dataset_has_requested_variables(
+        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+    ):
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_mfdataset.return_value = _make_mock_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        result = fetch_nldas(bounds, 2010, 1, variables=["APCP", "TMP"])
+
+        assert "APCP" in result
+        assert "TMP" in result
+        assert "DSWRF" not in result
+
+    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_dataset_has_time_lat_lon_dims(
+        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+    ):
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_mfdataset.return_value = _make_mock_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        result = fetch_nldas(bounds, 2010, 1, variables=["APCP"])
+
+        assert "time" in result.dims
+        assert "lat" in result.dims
+        assert "lon" in result.dims
+
+
+class TestCachingMechanism:
+    """Verify that the caching mechanism works correctly."""
+
+    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_writes_to_cache(
+        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds, tmp_path
+    ):
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_mfdataset.return_value = _make_mock_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        fetch_nldas(bounds, 2010, 1, cache_dir=str(tmp_path))
+
+        cache_file = tmp_path / "nldas" / "201001.nc"
+        assert cache_file.exists()
+
+    def test_loads_from_cache(self, bounds, tmp_path):
+        # Pre-populate the cache
+        cache_dir = tmp_path / "nldas"
+        cache_dir.mkdir()
+        ds = _make_mock_dataset()
+        ds.to_netcdf(cache_dir / "201001.nc")
+
+        with patch("earthaccess.login") as mock_login:
+            from met_timeseries.sources.nldas import fetch_nldas
+
+            result = fetch_nldas(bounds, 2010, 1, cache_dir=str(tmp_path))
+
+        # earthaccess.login must NOT be called when loading from cache
+        mock_login.assert_not_called()
+        assert "APCP" in result
