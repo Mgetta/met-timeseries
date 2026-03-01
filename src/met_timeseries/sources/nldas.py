@@ -85,7 +85,7 @@ def fetch_nldas(
         If data cannot be fetched for the requested period.
     """
     if variables is None:
-        variables = ["APCP", "TMP", "DSWRF"]
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP"]
 
     logger.info("Fetching NLDAS-2 data: year=%d month=%d bounds=%r", year, month, bounds)
 
@@ -105,7 +105,7 @@ def fetch_nldas(
     # Monthly aggregation: sum precipitation, mean everything else
     result_vars: dict[str, xr.DataArray] = {}
     for var in variables:
-        if var in ("APCP",):
+        if var in ("APCP", "PEVAP"):
             result_vars[var] = combined[var].sum(dim="time")
         else:
             result_vars[var] = combined[var].mean(dim="time")
