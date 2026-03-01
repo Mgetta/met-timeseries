@@ -49,6 +49,10 @@ def derive_variables(nldas_data: xr.Dataset) -> dict[str, xr.DataArray]:
         derived["pet_hargreaves_mm"] = _hargreaves_pet(
             nldas_data["TMP"], nldas_data["DSWRF"]
         )
+    if "UGRD" in nldas_data and "VGRD" in nldas_data:
+        derived["wind_speed_ms"] = (
+            np.sqrt(nldas_data["UGRD"] ** 2 + nldas_data["VGRD"] ** 2)
+        ).rename("wind_speed_ms")
 
     return derived
 
