@@ -52,11 +52,11 @@ def fetch_nldas(
     variables: list[str] | None = None,
     cache_dir: str | None = None,
 ) -> xr.Dataset:
-    """Fetch NLDAS-2 monthly forcing data for the given bounding box.
+    """Fetch NLDAS-2 hourly forcing data for the given bounding box.
 
     Downloads hourly data for each day of *month*/*year*, subsets to
-    *bounds*, and returns a Dataset with one variable per requested forcing
-    containing the monthly mean (or total for precipitation).
+    *bounds*, and returns a Dataset with a ``time`` dimension containing one
+    entry per hour (~720 for a 30-day month).
 
     Parameters
     ----------
@@ -76,8 +76,9 @@ def fetch_nldas(
     Returns
     -------
     xarray.Dataset
-        Monthly Dataset with ``lat`` and ``lon`` dimensions and the requested
-        variables.
+        Hourly Dataset with ``time``, ``lat``, and ``lon`` dimensions and the
+        requested variables.  The ``time`` coordinate carries proper
+        ``datetime64`` timestamps.
 
     Raises
     ------
@@ -100,17 +101,7 @@ def fetch_nldas(
     if not datasets:
         raise RuntimeError(f"No NLDAS data retrieved for {year}-{month:02d}")
 
-    combined = xr.concat(datasets, dim="time")
-
-    # Monthly aggregation: sum precipitation, mean everything else
-    result_vars: dict[str, xr.DataArray] = {}
-    for var in variables:
-        if var in ("APCP",):
-            result_vars[var] = combined[var].sum(dim="time")
-        else:
-            result_vars[var] = combined[var].mean(dim="time")
-
-    return xr.Dataset(result_vars)
+    return xr.concat(datasets, dim="time")
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +123,9 @@ def _fetch_nldas_day(
     variables: list[str],
     cache_dir: str | None,
 ) -> xr.Dataset:
-    """Fetch and aggregate a single day of NLDAS-2 data."""
+    """Fetch a single day of NLDAS-2 data as an hourly Dataset."""
+    import datetime as dt
+
     hourly: list[xr.Dataset] = []
     for hour in range(0, 2400, 100):
         url = _OPENDAP_TEMPLATE.format(
@@ -140,6 +133,12 @@ def _fetch_nldas_day(
         )
         cache_path = _cache_path(cache_dir, url) if cache_dir else None
         ds_hour = _open_dataset(url, bounds, variables, cache_path)
+        # Assign a proper datetime64 time coordinate for this granule
+        timestamp = np.datetime64(dt.datetime(year, month, day, hour // 100), "ns")
+        if "time" in ds_hour.dims:
+            ds_hour = ds_hour.assign_coords(time=[timestamp])
+        else:
+            ds_hour = ds_hour.expand_dims({"time": [timestamp]})
         hourly.append(ds_hour)
 
     return xr.concat(hourly, dim="time")

@@ -14,8 +14,8 @@ def aggregate_over_polygon(
     polygon: BaseGeometry,
     lat_dim: str = "lat",
     lon_dim: str = "lon",
-) -> dict[str, float]:
-    """Compute the mean of each variable in *dataset* over *polygon*.
+) -> dict[str, list[float] | float]:
+    """Compute the spatial mean of each variable in *dataset* over *polygon*.
 
     Grid cells whose centres fall within *polygon* are selected and averaged.
     If no grid cells fall within the polygon the function falls back to the
@@ -35,7 +35,8 @@ def aggregate_over_polygon(
 
     Returns
     -------
-    dict mapping variable name to its mean scalar value over the polygon.
+    dict mapping variable name to either a scalar float (2D data) or a list of
+    floats with one value per timestep (3D data with a leading time dimension).
     """
     lats = dataset[lat_dim].values
     lons = dataset[lon_dim].values
@@ -64,16 +65,20 @@ def aggregate_over_polygon(
         lon_idx = int(np.argmin(np.abs(lons - cx)))
         mask[lat_idx, lon_idx] = True
 
-    result: dict[str, float] = {}
+    result: dict[str, list[float] | float] = {}
     for var in dataset.data_vars:
         arr = dataset[var].values
         if arr.ndim == 2:
             values = arr[mask]
+            result[str(var)] = float(np.nanmean(values)) if len(values) > 0 else float("nan")
         elif arr.ndim == 3:
-            # (time, lat, lon) or similar — take time-mean first, then spatial
-            values = arr.mean(axis=0)[mask]
+            # (time, lat, lon) — return one spatial mean per timestep
+            mask_flat = mask.ravel()
+            arr_2d = arr.reshape(arr.shape[0], -1)  # (time, lat*lon)
+            selected = arr_2d[:, mask_flat]          # (time, n_cells)
+            result[str(var)] = np.nanmean(selected, axis=1).tolist()
         else:
             values = arr.ravel()
-        result[str(var)] = float(np.nanmean(values)) if len(values) > 0 else float("nan")
+            result[str(var)] = float(np.nanmean(values)) if len(values) > 0 else float("nan")
 
     return result

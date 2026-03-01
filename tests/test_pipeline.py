@@ -17,20 +17,24 @@ import xarray as xr
 import geopandas as gpd
 
 
-def _make_mock_dataset(lats, lons) -> xr.Dataset:
-    """Return a tiny Dataset with APCP and TMP for mocking fetch_nldas."""
-    data = np.ones((len(lats), len(lons)))
+def _make_mock_dataset(lats, lons, n_times: int = 3) -> xr.Dataset:
+    """Return a tiny Dataset with APCP and TMP for mocking fetch_nldas.
+
+    The dataset has a ``time`` dimension to simulate hourly output.
+    """
+    times = pd.date_range("2000-01-01", periods=n_times, freq="h")
+    data = np.ones((n_times, len(lats), len(lons)))
     return xr.Dataset(
         {
             "APCP": xr.DataArray(
                 data * 10.0,
-                dims=["lat", "lon"],
-                coords={"lat": lats, "lon": lons},
+                dims=["time", "lat", "lon"],
+                coords={"time": times, "lat": lats, "lon": lons},
             ),
             "TMP": xr.DataArray(
                 data * 285.0,
-                dims=["lat", "lon"],
-                coords={"lat": lats, "lon": lons},
+                dims=["time", "lat", "lon"],
+                coords={"time": times, "lat": lats, "lon": lons},
             ),
         }
     )
@@ -159,6 +163,36 @@ class TestProcessNldasMonth:
         for pq in output_dir.rglob("*.parquet"):
             df = pd.read_parquet(pq)
             assert "metzone_id" in df.columns
+
+    def test_parquet_has_hourly_rows(self, dissolved_polygons: gpd.GeoDataFrame, tmp_path: Path) -> None:
+        """Each Parquet file should have one row per timestep with a datetime column."""
+        from met_timeseries.pipeline import process_nldas_month
+
+        n_times = 5
+        lats = np.linspace(45.0, 46.5, 8)
+        lons = np.linspace(-110.0, -109.0, 8)
+        mock_ds = _make_mock_dataset(lats, lons, n_times=n_times)
+
+        output_dir = tmp_path / "output"
+        ledger = str(tmp_path / "ledger.csv")
+
+        with patch("met_timeseries.pipeline.fetch_nldas", return_value=mock_ds):
+            process_nldas_month(
+                polygons=dissolved_polygons,
+                metzone_column="metzone_id",
+                year=2000,
+                month=5,
+                output_dir=str(output_dir),
+                cache_dir=str(tmp_path / "cache"),
+                variables=["APCP"],
+                ledger_path=ledger,
+            )
+
+        for pq in output_dir.rglob("*.parquet"):
+            df = pd.read_parquet(pq)
+            assert len(df) == n_times, f"Expected {n_times} rows, got {len(df)}"
+            assert "datetime" in df.columns
+            assert df["datetime"].is_monotonic_increasing
 
 
 class TestRunPipeline:
