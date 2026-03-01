@@ -86,7 +86,7 @@ def fetch_nldas(
         If data cannot be fetched for the requested period.
     """
     if variables is None:
-        variables = ["APCP", "TMP", "DSWRF"]
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
     logger.info("Fetching NLDAS-2 data: year=%d month=%d bounds=%r", year, month, bounds)
 

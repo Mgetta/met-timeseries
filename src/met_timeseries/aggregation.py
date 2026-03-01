@@ -4,9 +4,46 @@ Zonal statistics: aggregate raster data over a polygon.
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 import xarray as xr
+from shapely.geometry import box as shapely_box
 from shapely.geometry.base import BaseGeometry
+
+
+@functools.lru_cache(maxsize=128)
+def _compute_weights(
+    polygon_wkb: bytes,
+    lats: tuple[float, ...],
+    lons: tuple[float, ...],
+) -> np.ndarray:
+    """Return a 2-D weight array (shape ``len(lats) × len(lons)``).
+
+    Each weight is the fraction of the corresponding grid-cell area that
+    overlaps *polygon* (0.0 – 1.0).  Results are cached so that repeated
+    calls for the same polygon / grid combination are free.
+    """
+    from shapely import from_wkb
+
+    polygon: BaseGeometry = from_wkb(polygon_wkb)
+
+    lats_arr = np.asarray(lats, dtype=float)
+    lons_arr = np.asarray(lons, dtype=float)
+
+    dx = abs(float(lons_arr[1] - lons_arr[0])) if len(lons_arr) > 1 else 0.125
+    dy = abs(float(lats_arr[1] - lats_arr[0])) if len(lats_arr) > 1 else 0.125
+
+    weights = np.zeros((len(lats_arr), len(lons_arr)), dtype=float)
+    for i, lat in enumerate(lats_arr):
+        for j, lon in enumerate(lons_arr):
+            # shapely_box expects (minx, miny, maxx, maxy); lon maps to x, lat to y.
+            cell = shapely_box(lon - dx / 2, lat - dy / 2, lon + dx / 2, lat + dy / 2)
+            intersection_area = cell.intersection(polygon).area
+            if intersection_area > 0:
+                weights[i, j] = intersection_area / cell.area
+
+    return weights
 
 
 def aggregate_over_polygon(
@@ -17,9 +54,9 @@ def aggregate_over_polygon(
 ) -> dict[str, list[float] | float]:
     """Compute the spatial mean of each variable in *dataset* over *polygon*.
 
-    Grid cells whose centres fall within *polygon* are selected and averaged.
-    If no grid cells fall within the polygon the function falls back to the
-    nearest grid point.
+    Each grid cell's contribution is proportional to the fraction of its area
+    that overlaps *polygon*.  If no cells overlap the polygon the function
+    falls back to the nearest grid point to the polygon centroid.
 
     Parameters
     ----------
@@ -41,29 +78,22 @@ def aggregate_over_polygon(
     lats = dataset[lat_dim].values
     lons = dataset[lon_dim].values
 
-    lon_grid, lat_grid = np.meshgrid(lons, lats)
+    weights = _compute_weights(
+        polygon.wkb,
+        tuple(float(v) for v in lats),
+        tuple(float(v) for v in lons),
+    )
 
-    # Build a boolean mask for cells inside the polygon
-    try:
-        from shapely import contains_xy
+    total_weight = weights.sum()
 
-        mask = contains_xy(polygon, lon_grid.ravel(), lat_grid.ravel()).reshape(lon_grid.shape)
-    except ImportError:
-        from shapely.geometry import Point
-
-        mask = np.array(
-            [
-                [polygon.contains(Point(lon_grid[i, j], lat_grid[i, j])) for j in range(lon_grid.shape[1])]
-                for i in range(lon_grid.shape[0])
-            ]
-        )
-
-    if not mask.any():
+    if total_weight == 0:
         # Fallback: nearest grid point to polygon centroid
         cx, cy = polygon.centroid.x, polygon.centroid.y
         lat_idx = int(np.argmin(np.abs(lats - cy)))
         lon_idx = int(np.argmin(np.abs(lons - cx)))
-        mask[lat_idx, lon_idx] = True
+        weights = np.zeros_like(weights)
+        weights[lat_idx, lon_idx] = 1.0
+        total_weight = 1.0
 
     result: dict[str, list[float] | float] = {}
     for var in dataset.data_vars:
