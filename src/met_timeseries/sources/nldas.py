@@ -6,8 +6,9 @@ for a given bounding box, year, and month and returns an aggregated monthly
 :class:`xarray.Dataset`.
 
 Data access uses the NASA GES DISC OPeNDAP endpoint.  Users must have a
-valid NASA Earthdata account and a ``.netrc`` / ``~/.dodsrc`` configuration
-for authenticated access.  See:
+valid NASA Earthdata account and configure ``~/.netrc`` with credentials for
+``urs.earthdata.nasa.gov`` and a ``~/.dodsrc`` (or ``~/.pydap.rc``) pointing
+at that ``.netrc``.  See:
 https://disc.gsfc.nasa.gov/data-access#python-requests
 """
 
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _OPENDAP_TEMPLATE = (
     "https://hydro1.gesdisc.eosdis.nasa.gov/opendap/NLDAS/NLDAS_FORA0125_H.2.0/"
-    "{year}/{doy:03d}/NLDAS_FORA0125_H.A{year}{month:02d}{day:02d}.{hour:04d}.002.grb.SUB.nc"
+    "{year}/{doy:03d}/NLDAS_FORA0125_H.A{year}{month:02d}{day:02d}.{hour:04d}.020.grb"
 )
 
 #: NLDAS-2 variables available via the forcing-A product
@@ -161,7 +162,24 @@ def _open_dataset(
     if cache_path is not None and cache_path.exists():
         return xr.open_dataset(cache_path)
 
-    ds = xr.open_dataset(url, engine="netcdf4")
+    try:
+        ds = xr.open_dataset(url, engine="netcdf4")
+    except OSError as exc:
+        msg = str(exc).lower()
+        if "401" in msg or "unauthorized" in msg:
+            raise RuntimeError(
+                f"Authentication required for {url} — ensure ~/.netrc is configured "
+                "for urs.earthdata.nasa.gov"
+            ) from exc
+        if "403" in msg or "forbidden" in msg:
+            raise RuntimeError(
+                f"Access forbidden for {url} — check your Earthdata authorizations"
+            ) from exc
+        if "404" in msg or "not found" in msg:
+            raise RuntimeError(
+                f"File not found: {url} — check that the URL template is correct"
+            ) from exc
+        raise
     ds = ds[variables]
     ds = ds.sel(
         lat=slice(bounds.south, bounds.north),
