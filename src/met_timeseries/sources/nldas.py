@@ -5,6 +5,10 @@ The public API is :func:`fetch_nldas`, which downloads NLDAS-2 hourly forcings
 for a given bounding box, year, and month and returns an aggregated monthly
 :class:`xarray.Dataset`.
 
+For polygon-weighted timeseries, :func:`fetch_nldas_datarods` uses the NASA
+Giovanni in the Cloud Time Series Service API to fetch per-cell hourly data
+and compute weighted averages per polygon.
+
 Data access uses the ``earthaccess`` library, which handles NASA Earthdata
 authentication automatically via ``~/.netrc``, environment variables
 (``EARTHDATA_USERNAME`` / ``EARTHDATA_PASSWORD``), or an interactive prompt.
@@ -15,10 +19,13 @@ from __future__ import annotations
 
 import calendar
 import datetime as dt
+import io
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from met_timeseries.sources.base import BoundingBox
@@ -39,6 +46,26 @@ AVAILABLE_VARIABLES: list[str] = [
     "APCP",      # precipitation hourly total (kg/m²)
     "DSWRF",     # downward shortwave radiation (W/m²)
 ]
+
+_GIOVANNI_URL = "https://api.giovanni.earthdata.nasa.gov/timeseries"
+
+#: Number of metadata header lines in a Giovanni Time Series CSV response.
+_GIOVANNI_HEADER_LINES = 13
+
+#: Mapping from our short variable names to Giovanni Time Series Service
+#: data parameter identifiers for NLDAS_FORA0125_H v2.0.
+#: The naming pattern is: {collection_with_underscores}_{giovanni_short_name}
+_GIOVANNI_VARIABLES: dict[str, str] = {
+    "TMP": "NLDAS_FORA0125_H_2_0_Tair",
+    "SPFH": "NLDAS_FORA0125_H_2_0_Qair",
+    "PRES": "NLDAS_FORA0125_H_2_0_PSurf",
+    "UGRD": "NLDAS_FORA0125_H_2_0_Wind_E",
+    "VGRD": "NLDAS_FORA0125_H_2_0_Wind_N",
+    "DLWRF": "NLDAS_FORA0125_H_2_0_LWdown",
+    "PEVAP": "NLDAS_FORA0125_H_2_0_PotEvap",
+    "APCP": "NLDAS_FORA0125_H_2_0_Rainf",
+    "DSWRF": "NLDAS_FORA0125_H_2_0_SWdown",
+}
 
 
 def fetch_nldas(
@@ -160,3 +187,238 @@ def fetch_nldas(
 
 def _monthly_cache_path(cache_dir: str, year: int, month: int) -> Path:
     return Path(cache_dir) / "nldas" / f"{year}{month:02d}.nc"
+
+
+def _parse_giovanni_response(text: str) -> pd.Series:
+    """Parse a CSV response from the Giovanni Time Series Service API.
+
+    The response has 13 header lines as key,value pairs followed by
+    standard CSV data with Timestamp and value columns.
+
+    Parameters
+    ----------
+    text:
+        Raw CSV response text from the Giovanni API.
+
+    Returns
+    -------
+    pandas.Series
+        Series with DatetimeIndex and float values.
+    """
+    with io.StringIO(text) as f:
+        # First _GIOVANNI_HEADER_LINES lines are metadata key,value pairs; skip them
+        for _ in range(_GIOVANNI_HEADER_LINES):
+            f.readline()
+
+        # Read the CSV data (has a header row with column names)
+        df = pd.read_csv(
+            f,
+            header=0,
+            parse_dates=[0],
+        )
+
+    # Return as Series with DatetimeIndex
+    ts_col = df.columns[0]
+    val_col = df.columns[1]
+    return pd.Series(
+        pd.to_numeric(df[val_col], errors="coerce").values,
+        index=pd.DatetimeIndex(df[ts_col]),
+        dtype=float,
+    )
+
+
+def _fetch_giovanni_cell(
+    lat: float,
+    lon: float,
+    variable: str,
+    year: int,
+    month: int,
+    cache_dir: str | None = None,
+    max_retries: int = 3,
+    _token: str | None = None,
+) -> pd.Series:
+    """Fetch a single-cell timeseries from the Giovanni Time Series API.
+
+    Parameters
+    ----------
+    lat, lon:
+        Grid cell center coordinates (EPSG:4326).
+    variable:
+        Short variable name (e.g. ``"APCP"``).
+    year, month:
+        Temporal period.
+    cache_dir:
+        Optional cache directory for per-cell CSV files.
+    max_retries:
+        Number of retry attempts with exponential back-off on 429/5xx.
+    _token:
+        Pre-fetched Earthdata bearer token. If None, obtains one via
+        ``earthaccess.login()`` and ``earthaccess.get_edl_token()``.
+
+    Returns
+    -------
+    pandas.Series
+        Hourly timeseries for the cell with DatetimeIndex.
+    """
+    import earthaccess
+    import requests as req
+
+    if variable not in _GIOVANNI_VARIABLES:
+        raise ValueError(
+            f"Unknown variable {variable!r}. "
+            f"Available: {list(_GIOVANNI_VARIABLES)}"
+        )
+
+    # Check cache
+    if cache_dir is not None:
+        cache_path = (
+            Path(cache_dir) / "giovanni"
+            / f"{lat}_{lon}_{variable}_{year}{month:02d}.csv"
+        )
+        if cache_path.exists():
+            return pd.read_csv(cache_path, index_col=0, parse_dates=True).iloc[:, 0]
+
+    # Get auth token
+    if _token is None:
+        earthaccess.login()
+        _token = earthaccess.get_edl_token()["access_token"]
+
+    _, n_days = calendar.monthrange(year, month)
+    time_start = f"{year}-{month:02d}-01T00:00:00"
+    time_end = f"{year}-{month:02d}-{n_days:02d}T23:00:00"
+
+    params = {
+        "data": _GIOVANNI_VARIABLES[variable],
+        "location": f"[{lat},{lon}]",
+        "time": f"{time_start}/{time_end}",
+    }
+    headers = {"Authorization": f"Bearer {_token}"}
+
+    for attempt in range(max_retries):
+        try:
+            resp = req.get(
+                _GIOVANNI_URL, params=params, headers=headers, timeout=60
+            )
+            resp.raise_for_status()
+            text = resp.text
+            break
+        except req.exceptions.HTTPError as exc:
+            code = exc.response.status_code if exc.response else 0
+            if code == 429 or code >= 500:
+                wait = 2 ** attempt
+                logger.warning(
+                    "Giovanni HTTP %d for %s (lat=%s lon=%s); retrying in %ds",
+                    code, variable, lat, lon, wait,
+                )
+                time.sleep(wait)
+                if attempt == max_retries - 1:
+                    raise
+            else:
+                raise
+        except req.exceptions.RequestException as exc:
+            wait = 2 ** attempt
+            logger.warning(
+                "Giovanni request error for %s (lat=%s lon=%s): %s; retrying in %ds",
+                variable, lat, lon, exc, wait,
+            )
+            time.sleep(wait)
+            if attempt == max_retries - 1:
+                raise
+
+    series = _parse_giovanni_response(text)
+
+    if cache_dir is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        series.to_csv(cache_path, header=True)
+
+    return series
+
+
+def fetch_nldas_datarods(
+    weights: pd.DataFrame,
+    year: int,
+    month: int,
+    variables: list[str] | None = None,
+    polygon_id_col: str = "metzone_id",
+    cache_dir: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Fetch NLDAS-2 hourly data using Giovanni Time Series Service.
+
+    Uses NASA's Giovanni in the Cloud Time Series API (replacement for
+    the discontinued Hydrology Data Rods service) to fetch per-cell hourly
+    timeseries for all cells in a weight table, then computes weighted
+    averages per polygon.
+
+    Requires a valid NASA Earthdata account. Authentication is handled
+    via ``earthaccess.login()``.
+
+    Parameters
+    ----------
+    weights:
+        Weight table with columns ``lat_center``, ``lon_center``,
+        ``{polygon_id_col}``, and ``weight``.
+    year:
+        Calendar year (e.g. 2010).
+    month:
+        Calendar month (1–12).
+    variables:
+        NLDAS-2 short variable names to fetch. Defaults to
+        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
+    polygon_id_col:
+        Column name in *weights* that identifies each polygon.
+    cache_dir:
+        Optional directory for per-cell CSV cache files.
+
+    Returns
+    -------
+    dict[str, pandas.DataFrame]
+        Mapping from variable name to a DataFrame with a DatetimeIndex
+        and one column per polygon.
+    """
+    import earthaccess
+
+    if variables is None:
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+    # Authenticate once and reuse the token for all requests
+    earthaccess.login()
+    token = earthaccess.get_edl_token()["access_token"]
+
+    unique_cells = weights[["lat_center", "lon_center"]].drop_duplicates()
+    n_cells = len(unique_cells)
+    logger.info(
+        "Fetching Giovanni timeseries: %d unique cells × %d variables for %d-%02d",
+        n_cells, len(variables), year, month,
+    )
+
+    cell_data: dict[tuple[float, float], dict[str, pd.Series]] = {}
+    for i, (_, row) in enumerate(unique_cells.iterrows(), start=1):
+        lat, lon = row["lat_center"], row["lon_center"]
+        logger.debug("Fetching cell %d/%d: lat=%s lon=%s", i, n_cells, lat, lon)
+        cell_data[(lat, lon)] = {}
+        for var in variables:
+            series = _fetch_giovanni_cell(
+                lat=lat, lon=lon, variable=var,
+                year=year, month=month,
+                cache_dir=cache_dir, _token=token,
+            )
+            cell_data[(lat, lon)][var] = series
+
+    # Compute weighted averages per polygon
+    results: dict[str, pd.DataFrame] = {}
+    for var in variables:
+        polygon_series: dict = {}
+        for polygon_id, grp in weights.groupby(polygon_id_col):
+            first_key = (grp.iloc[0]["lat_center"], grp.iloc[0]["lon_center"])
+            weighted_sum = pd.Series(
+                0.0, index=cell_data[first_key][var].index
+            )
+            for _, wrow in grp.iterrows():
+                key = (wrow["lat_center"], wrow["lon_center"])
+                weighted_sum = weighted_sum.add(
+                    cell_data[key][var] * wrow["weight"], fill_value=0
+                )
+            polygon_series[polygon_id] = weighted_sum
+        results[var] = pd.DataFrame(polygon_series)
+
+    return results
