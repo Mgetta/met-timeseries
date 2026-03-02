@@ -6,10 +6,12 @@ from __future__ import annotations
 
 from unittest.mock import patch, MagicMock
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from shapely.geometry import box
 
 
 @pytest.fixture()
@@ -323,3 +325,148 @@ class TestFetchNldasDatarods:
 
         mock_login.assert_called_once()
         mock_get_token.assert_called_once()
+
+
+class TestGenerateNldasGrid:
+    """Verify generate_nldas_grid produces a correct GeoDataFrame."""
+
+    def test_returns_geodataframe(self):
+        from met_timeseries.sources.nldas import generate_nldas_grid
+
+        result = generate_nldas_grid(west=-100.0, south=40.0, east=-99.0, north=41.0)
+        assert isinstance(result, gpd.GeoDataFrame)
+
+    def test_crs_is_epsg4326(self):
+        from met_timeseries.sources.nldas import generate_nldas_grid
+
+        result = generate_nldas_grid(west=-100.0, south=40.0, east=-99.0, north=41.0)
+        assert result.crs.to_epsg() == 4326
+
+    def test_columns_present(self):
+        from met_timeseries.sources.nldas import generate_nldas_grid
+
+        result = generate_nldas_grid(west=-100.0, south=40.0, east=-99.0, north=41.0)
+        assert "lat_center" in result.columns
+        assert "lon_center" in result.columns
+        assert "geometry" in result.columns
+
+    def test_cell_count_for_small_extent(self):
+        from met_timeseries.sources.nldas import generate_nldas_grid
+
+        # 1° × 1° extent at 0.125° resolution => 9 × 9 = 81 cells
+        result = generate_nldas_grid(
+            west=-100.0, south=40.0, east=-99.0, north=41.0, resolution=0.125
+        )
+        assert len(result) == 81
+
+    def test_cell_geometry_is_correct_size(self):
+        from met_timeseries.sources.nldas import generate_nldas_grid
+
+        result = generate_nldas_grid(west=-100.0, south=40.0, east=-99.0, north=41.0)
+        cell = result.geometry.iloc[0]
+        minx, miny, maxx, maxy = cell.bounds
+        assert (maxx - minx) == pytest.approx(0.125, abs=1e-6)
+        assert (maxy - miny) == pytest.approx(0.125, abs=1e-6)
+
+    def test_centroid_matches_lat_lon_center(self):
+        from met_timeseries.sources.nldas import generate_nldas_grid
+
+        result = generate_nldas_grid(west=-100.0, south=40.0, east=-99.0, north=41.0)
+        for _, row in result.iterrows():
+            centroid = row["geometry"].centroid
+            assert centroid.x == pytest.approx(row["lon_center"], abs=1e-4)
+            assert centroid.y == pytest.approx(row["lat_center"], abs=1e-4)
+
+
+class TestComputeNldasWeights:
+    """Verify compute_nldas_weights produces correct weight tables."""
+
+    def _make_polygon_gdf(self, geom, poly_id=1):
+        return gpd.GeoDataFrame(
+            {"metzone_id": [poly_id], "geometry": [geom]},
+            crs="EPSG:4326",
+        )
+
+    def test_weights_sum_to_one(self):
+        from met_timeseries.sources.nldas import compute_nldas_weights
+
+        poly = box(-99.5, 40.3, -99.2, 40.6)
+        gdf = self._make_polygon_gdf(poly)
+        result = compute_nldas_weights(gdf)
+        total = result.groupby("metzone_id")["weight"].sum()
+        assert total.iloc[0] == pytest.approx(1.0, abs=1e-6)
+
+    def test_output_columns(self):
+        from met_timeseries.sources.nldas import compute_nldas_weights
+
+        poly = box(-99.5, 40.3, -99.2, 40.6)
+        gdf = self._make_polygon_gdf(poly)
+        result = compute_nldas_weights(gdf)
+        assert list(result.columns) == ["metzone_id", "lat_center", "lon_center", "weight"]
+
+    def test_correct_cells_identified(self):
+        from met_timeseries.sources.nldas import compute_nldas_weights, generate_nldas_grid
+
+        # With west=-100.5, cell centers land at -100.5, -100.375, ..., -100.0, -99.875, ..., -99.5
+        # Use cell centered at (-100.0, 40.0) which is on this grid
+        cell_lon, cell_lat = -100.0, 40.0
+        # Tiny polygon (0.02° × 0.02°) entirely within the 0.125° cell
+        poly = box(cell_lon - 0.01, cell_lat - 0.01, cell_lon + 0.01, cell_lat + 0.01)
+        gdf = self._make_polygon_gdf(poly)
+        grid = generate_nldas_grid(west=-100.5, south=39.5, east=-99.5, north=40.5)
+        result = compute_nldas_weights(gdf, nldas_grid=grid)
+        assert len(result) == 1
+        assert result.iloc[0]["weight"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_multiple_polygons_each_sum_to_one(self):
+        from met_timeseries.sources.nldas import compute_nldas_weights
+
+        poly1 = box(-99.5, 40.3, -99.2, 40.6)
+        poly2 = box(-98.5, 41.3, -98.2, 41.6)
+        gdf = gpd.GeoDataFrame(
+            {"metzone_id": [1, 2], "geometry": [poly1, poly2]},
+            crs="EPSG:4326",
+        )
+        result = compute_nldas_weights(gdf)
+        totals = result.groupby("metzone_id")["weight"].sum()
+        assert totals[1] == pytest.approx(1.0, abs=1e-6)
+        assert totals[2] == pytest.approx(1.0, abs=1e-6)
+
+
+class TestFetchNldasStrategyParameter:
+    """Verify the strategy parameter on fetch_nldas."""
+
+    def test_unknown_strategy_raises_value_error(self):
+        from met_timeseries.sources.base import BoundingBox
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        bounds = BoundingBox(west=-110.0, east=-109.0, south=45.0, north=46.0)
+        with pytest.raises(ValueError, match="Unknown strategy"):
+            fetch_nldas(bounds, 2010, 1, strategy="invalid")
+
+    def test_datarods_without_weights_raises_value_error(self):
+        from met_timeseries.sources.base import BoundingBox
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        bounds = BoundingBox(west=-110.0, east=-109.0, south=45.0, north=46.0)
+        with pytest.raises(ValueError, match="weights must be provided"):
+            fetch_nldas(bounds, 2010, 1, strategy="datarods")
+
+    @patch("met_timeseries.sources.nldas.fetch_nldas_datarods")
+    def test_datarods_strategy_delegates_to_fetch_nldas_datarods(self, mock_datarods):
+        from met_timeseries.sources.base import BoundingBox
+        from met_timeseries.sources.nldas import fetch_nldas
+
+        mock_datarods.return_value = {"APCP": pd.DataFrame()}
+        bounds = BoundingBox(west=-110.0, east=-109.0, south=45.0, north=46.0)
+        weights = pd.DataFrame(
+            {
+                "metzone_id": [1],
+                "lat_center": [45.0625],
+                "lon_center": [-109.9375],
+                "weight": [1.0],
+            }
+        )
+        result = fetch_nldas(bounds, 2010, 1, strategy="datarods", weights=weights)
+        mock_datarods.assert_called_once()
+        assert result is mock_datarods.return_value

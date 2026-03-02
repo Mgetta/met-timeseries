@@ -24,9 +24,11 @@ import logging
 import time
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import xarray as xr
+from shapely.geometry import box
 
 from met_timeseries.sources.base import BoundingBox
 
@@ -74,7 +76,10 @@ def fetch_nldas(
     month: int,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
-) -> xr.Dataset:
+    strategy: str = "grid",
+    weights: pd.DataFrame | None = None,
+    polygon_id_col: str = "metzone_id",
+) -> xr.Dataset | dict[str, pd.DataFrame]:
     """Fetch NLDAS-2 hourly forcing data for the given bounding box.
 
     Authentication is handled automatically by :func:`earthaccess.login`,
@@ -96,23 +101,54 @@ def fetch_nldas(
     cache_dir:
         If provided, a subsetted monthly NetCDF file is cached here and
         loaded on subsequent calls for the same month.
+    strategy:
+        Download strategy.  ``"grid"`` (default) uses earthaccess to download
+        full gridded NetCDF files.  ``"datarods"`` uses the Giovanni Time
+        Series API to fetch per-cell hourly data and compute weighted averages
+        per polygon (requires *weights*).
+    weights:
+        Pre-computed weight table (see :func:`compute_nldas_weights`).
+        Required when ``strategy="datarods"``.
+    polygon_id_col:
+        Column in *weights* that identifies each polygon.  Used only when
+        ``strategy="datarods"``.
 
     Returns
     -------
     xarray.Dataset
-        Hourly Dataset with ``time``, ``lat``, and ``lon`` dimensions and the
-        requested variables.  The ``time`` coordinate carries proper
+        When ``strategy="grid"``: hourly Dataset with ``time``, ``lat``, and
+        ``lon`` dimensions.  The ``time`` coordinate carries proper
         ``datetime64`` timestamps.
+    dict[str, pandas.DataFrame]
+        When ``strategy="datarods"``: mapping from variable name to a
+        DataFrame with a DatetimeIndex and one column per polygon.
 
     Raises
     ------
     RuntimeError
-        If no granules are found for the requested period.
+        If no granules are found for the requested period (grid strategy).
+    ValueError
+        If ``strategy="datarods"`` and *weights* is ``None``, or if an
+        unknown strategy is specified.
     """
     import earthaccess
 
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+    if strategy == "datarods":
+        if weights is None:
+            raise ValueError("weights must be provided when strategy='datarods'")
+        return fetch_nldas_datarods(
+            weights=weights,
+            year=year,
+            month=month,
+            variables=variables,
+            polygon_id_col=polygon_id_col,
+            cache_dir=cache_dir,
+        )
+    elif strategy != "grid":
+        raise ValueError(f"Unknown strategy {strategy!r}. Must be 'grid' or 'datarods'.")
 
     logger.info("Fetching NLDAS-2 data: year=%d month=%d bounds=%r", year, month, bounds)
 
@@ -179,6 +215,126 @@ def fetch_nldas(
         logger.debug("Cached NLDAS-2 data to: %s", cache_path)
 
     return ds
+
+
+# ---------------------------------------------------------------------------
+# Grid generation and weight computation
+# ---------------------------------------------------------------------------
+
+def generate_nldas_grid(
+    west: float = -124.9375,
+    south: float = 25.0625,
+    east: float = -67.0625,
+    north: float = 52.9375,
+    resolution: float = 0.125,
+) -> gpd.GeoDataFrame:
+    """Generate the NLDAS 0.125° grid as a GeoDataFrame.
+
+    Each row represents one grid cell as a polygon, with ``lat_center``
+    and ``lon_center`` columns giving the cell centroid coordinates.
+
+    The default extent covers the CONUS NLDAS-2 domain.
+
+    Parameters
+    ----------
+    west, south, east, north:
+        Grid extent in EPSG:4326 degrees. Defaults to the full NLDAS-2 domain.
+    resolution:
+        Grid cell size in degrees. Default 0.125°.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        GeoDataFrame with columns ``lat_center``, ``lon_center``, ``geometry``
+        in EPSG:4326.
+    """
+    half = resolution / 2.0
+    lons = np.arange(west, east + half, resolution)
+    lats = np.arange(south, north + half, resolution)
+
+    records = []
+    for lon in lons:
+        for lat in lats:
+            cell = box(lon - half, lat - half, lon + half, lat + half)
+            records.append(
+                {
+                    "lon_center": round(lon, 4),
+                    "lat_center": round(lat, 4),
+                    "geometry": cell,
+                }
+            )
+
+    return gpd.GeoDataFrame(records, crs="EPSG:4326")
+
+
+def compute_nldas_weights(
+    polygons: gpd.GeoDataFrame,
+    polygon_id_col: str = "metzone_id",
+    nldas_grid: gpd.GeoDataFrame | None = None,
+) -> pd.DataFrame:
+    """Compute area-overlap weights between polygons and the NLDAS grid.
+
+    For each polygon, finds all NLDAS grid cells that intersect it and
+    computes the fractional overlap area. Weights are normalized so they
+    sum to 1.0 per polygon.
+
+    Parameters
+    ----------
+    polygons:
+        GeoDataFrame of user polygons (e.g., dissolved metzones).
+    polygon_id_col:
+        Column name for the polygon identifier.
+    nldas_grid:
+        Pre-generated NLDAS grid GeoDataFrame. If None, generates one
+        clipped to the total bounds of *polygons* (with a small buffer).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: ``[polygon_id_col, "lat_center", "lon_center", "weight"]``.
+        Weights sum to 1.0 per polygon.
+    """
+    if nldas_grid is None:
+        minx, miny, maxx, maxy = polygons.total_bounds
+        buf = 0.25
+        nldas_grid = generate_nldas_grid(
+            west=minx - buf,
+            south=miny - buf,
+            east=maxx + buf,
+            north=maxy + buf,
+        )
+
+    # Ensure matching CRS
+    polygons = polygons.to_crs("EPSG:4326")
+    nldas_grid = nldas_grid.to_crs("EPSG:4326")
+
+    # Compute polygon areas in equal-area projection for accuracy
+    polygons_ea = polygons.to_crs("EPSG:6933")
+    poly_areas = polygons_ea.geometry.area
+
+    # Intersection
+    intersection = gpd.overlay(
+        polygons[[polygon_id_col, "geometry"]],
+        nldas_grid[["lat_center", "lon_center", "geometry"]],
+        how="intersection",
+    )
+
+    # Compute overlap area in equal-area projection
+    intersection_ea = intersection.to_crs("EPSG:6933")
+    intersection["overlap_area"] = intersection_ea.geometry.area
+
+    # Attach polygon area for normalization
+    area_map = dict(zip(polygons[polygon_id_col], poly_areas))
+    intersection["poly_area"] = intersection[polygon_id_col].map(area_map)
+    intersection["weight"] = intersection["overlap_area"] / intersection["poly_area"]
+
+    # Normalize per polygon so weights sum to 1.0
+    weight_sum = intersection.groupby(polygon_id_col)["weight"].transform("sum")
+    intersection["weight"] = intersection["weight"] / weight_sum
+
+    return intersection[[polygon_id_col, "lat_center", "lon_center", "weight"]].reset_index(
+        drop=True
+    )
 
 
 # ---------------------------------------------------------------------------
