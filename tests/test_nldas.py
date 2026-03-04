@@ -470,3 +470,297 @@ class TestFetchNldasStrategyParameter:
         result = fetch_nldas(bounds, 2010, 1, strategy="datarods", weights=weights)
         mock_datarods.assert_called_once()
         assert result is mock_datarods.return_value
+
+
+class TestDownloadNldas:
+    """Verify download_nldas dispatching behaviour."""
+
+    def _make_weights(self):
+        return pd.DataFrame(
+            {
+                "metzone_id": [1],
+                "lat_center": [35.0625],
+                "lon_center": [-83.9375],
+                "weight": [1.0],
+            }
+        )
+
+    def test_unknown_method_raises_value_error(self):
+        from met_timeseries.sources.nldas import download_nldas
+
+        with pytest.raises(ValueError, match="Unknown download method"):
+            download_nldas(self._make_weights(), 2010, 1, method="invalid")
+
+    @patch("met_timeseries.sources.nldas.download_datarods")
+    def test_dispatches_to_download_datarods(self, mock_download_datarods):
+        from met_timeseries.sources.nldas import download_nldas
+
+        mock_download_datarods.return_value = {}
+        result = download_nldas(self._make_weights(), 2010, 1, method="datarods")
+        mock_download_datarods.assert_called_once()
+        assert result is mock_download_datarods.return_value
+
+    @patch("met_timeseries.sources.nldas.download_datarods")
+    def test_default_variables(self, mock_download_datarods):
+        from met_timeseries.sources.nldas import download_nldas
+
+        mock_download_datarods.return_value = {}
+        download_nldas(self._make_weights(), 2010, 1)
+        _, kwargs = mock_download_datarods.call_args
+        assert kwargs["variables"] == ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+
+class TestDownloadDatarods:
+    """Verify download_datarods raw download behaviour."""
+
+    def _make_weights(self):
+        return pd.DataFrame(
+            {
+                "metzone_id": [1, 1],
+                "lat_center": [35.0625, 35.1875],
+                "lon_center": [-83.9375, -83.9375],
+                "weight": [0.6, 0.4],
+            }
+        )
+
+    def _make_series(self):
+        return pd.Series(
+            [1.0, 2.0, 3.0],
+            index=pd.date_range("2010-01-01", periods=3, freq="h"),
+        )
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_returns_cell_data_dict(self, mock_login, mock_get_token, mock_fetch_cell):
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_fetch_cell.return_value = self._make_series()
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        result = download_datarods(self._make_weights(), 2010, 1, variables=["APCP"])
+
+        assert isinstance(result, dict)
+        for key, val in result.items():
+            assert isinstance(key, tuple)
+            assert len(key) == 2
+            assert isinstance(val, dict)
+            assert isinstance(val["APCP"], pd.Series)
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_authenticates_once(self, mock_login, mock_get_token, mock_fetch_cell):
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_fetch_cell.return_value = self._make_series()
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        download_datarods(self._make_weights(), 2010, 1, variables=["APCP", "TMP"])
+
+        mock_login.assert_called_once()
+        mock_get_token.assert_called_once()
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_fetches_all_cells_and_variables(
+        self, mock_login, mock_get_token, mock_fetch_cell
+    ):
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_fetch_cell.return_value = self._make_series()
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        variables = ["APCP", "TMP"]
+        download_datarods(self._make_weights(), 2010, 1, variables=variables)
+
+        # 2 unique cells × 2 variables = 4 calls
+        assert mock_fetch_cell.call_count == 4
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_passes_cache_dir(self, mock_login, mock_get_token, mock_fetch_cell):
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_fetch_cell.return_value = self._make_series()
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        download_datarods(
+            self._make_weights(), 2010, 1, variables=["APCP"], cache_dir="/tmp/cache"
+        )
+
+        for call in mock_fetch_cell.call_args_list:
+            assert call.kwargs["cache_dir"] == "/tmp/cache"
+
+
+class TestComputeWeightedAverages:
+    """Verify compute_weighted_averages spatial aggregation."""
+
+    def _make_cell_data(self, cells, variables, values=None):
+        times = pd.date_range("2010-01-01", periods=3, freq="h")
+        cell_data = {}
+        for i, cell in enumerate(cells):
+            cell_data[cell] = {}
+            for j, var in enumerate(variables):
+                v = values[i][j] if values else float(i + j + 1)
+                cell_data[cell][var] = pd.Series([v] * 3, index=times)
+        return cell_data
+
+    def test_returns_dict_of_dataframes(self):
+        from met_timeseries.sources.nldas import compute_weighted_averages
+
+        cell_data = self._make_cell_data([(35.0625, -83.9375)], ["APCP"])
+        weights = pd.DataFrame(
+            {
+                "metzone_id": [1],
+                "lat_center": [35.0625],
+                "lon_center": [-83.9375],
+                "weight": [1.0],
+            }
+        )
+        result = compute_weighted_averages(cell_data, weights, variables=["APCP"])
+        assert isinstance(result, dict)
+        assert isinstance(result["APCP"], pd.DataFrame)
+
+    def test_single_cell_weight_one(self):
+        from met_timeseries.sources.nldas import compute_weighted_averages
+
+        times = pd.date_range("2010-01-01", periods=3, freq="h")
+        raw = pd.Series([10.0, 20.0, 30.0], index=times)
+        cell_data = {(35.0625, -83.9375): {"APCP": raw}}
+        weights = pd.DataFrame(
+            {
+                "metzone_id": [1],
+                "lat_center": [35.0625],
+                "lon_center": [-83.9375],
+                "weight": [1.0],
+            }
+        )
+        result = compute_weighted_averages(cell_data, weights, variables=["APCP"])
+        pd.testing.assert_series_equal(
+            result["APCP"][1], raw, check_names=False
+        )
+
+    def test_two_cells_equal_weight(self):
+        from met_timeseries.sources.nldas import compute_weighted_averages
+
+        times = pd.date_range("2010-01-01", periods=3, freq="h")
+        s1 = pd.Series([10.0, 20.0, 30.0], index=times)
+        s2 = pd.Series([20.0, 40.0, 60.0], index=times)
+        cell_data = {
+            (35.0625, -83.9375): {"APCP": s1},
+            (35.1875, -83.9375): {"APCP": s2},
+        }
+        weights = pd.DataFrame(
+            {
+                "metzone_id": [1, 1],
+                "lat_center": [35.0625, 35.1875],
+                "lon_center": [-83.9375, -83.9375],
+                "weight": [0.5, 0.5],
+            }
+        )
+        result = compute_weighted_averages(cell_data, weights, variables=["APCP"])
+        expected = (s1 + s2) / 2
+        pd.testing.assert_series_equal(
+            result["APCP"][1], expected, check_names=False
+        )
+
+    def test_infers_variables_from_cell_data(self):
+        from met_timeseries.sources.nldas import compute_weighted_averages
+
+        times = pd.date_range("2010-01-01", periods=2, freq="h")
+        cell_data = {
+            (35.0625, -83.9375): {
+                "APCP": pd.Series([1.0, 2.0], index=times),
+                "TMP": pd.Series([300.0, 301.0], index=times),
+            }
+        }
+        weights = pd.DataFrame(
+            {
+                "metzone_id": [1],
+                "lat_center": [35.0625],
+                "lon_center": [-83.9375],
+                "weight": [1.0],
+            }
+        )
+        result = compute_weighted_averages(cell_data, weights)
+        assert "APCP" in result
+        assert "TMP" in result
+
+    def test_multiple_polygons(self):
+        from met_timeseries.sources.nldas import compute_weighted_averages
+
+        times = pd.date_range("2010-01-01", periods=2, freq="h")
+        cell_data = {
+            (35.0625, -83.9375): {"APCP": pd.Series([1.0, 2.0], index=times)},
+            (36.0625, -83.9375): {"APCP": pd.Series([3.0, 4.0], index=times)},
+        }
+        weights = pd.DataFrame(
+            {
+                "metzone_id": [1, 2],
+                "lat_center": [35.0625, 36.0625],
+                "lon_center": [-83.9375, -83.9375],
+                "weight": [1.0, 1.0],
+            }
+        )
+        result = compute_weighted_averages(cell_data, weights, variables=["APCP"])
+        assert 1 in result["APCP"].columns
+        assert 2 in result["APCP"].columns
+
+
+class TestFetchNldasDatarodsWrapper:
+    """Verify fetch_nldas_datarods is a thin wrapper over download_datarods + compute_weighted_averages."""
+
+    def _make_weights(self):
+        return pd.DataFrame(
+            {
+                "metzone_id": [1],
+                "lat_center": [35.0625],
+                "lon_center": [-83.9375],
+                "weight": [1.0],
+            }
+        )
+
+    @patch("met_timeseries.sources.nldas.compute_weighted_averages")
+    @patch("met_timeseries.sources.nldas.download_datarods")
+    def test_calls_download_then_compute(
+        self, mock_download, mock_compute
+    ):
+        from met_timeseries.sources.nldas import fetch_nldas_datarods
+
+        times = pd.date_range("2010-01-01", periods=3, freq="h")
+        fake_cell_data = {
+            (35.0625, -83.9375): {"APCP": pd.Series([1.0, 2.0, 3.0], index=times)}
+        }
+        fake_result = {"APCP": pd.DataFrame({1: [1.0, 2.0, 3.0]}, index=times)}
+        mock_download.return_value = fake_cell_data
+        mock_compute.return_value = fake_result
+
+        weights = self._make_weights()
+        result = fetch_nldas_datarods(weights, 2010, 1, variables=["APCP"])
+
+        mock_download.assert_called_once()
+        mock_compute.assert_called_once()
+        assert result is fake_result
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_backward_compatible_return_type(
+        self, mock_login, mock_get_token, mock_fetch_cell
+    ):
+        from met_timeseries.sources.nldas import fetch_nldas_datarods
+
+        mock_get_token.return_value = {"access_token": "tok"}
+        times = pd.date_range("2010-01-01", periods=3, freq="h")
+        mock_fetch_cell.return_value = pd.Series([1.0, 2.0, 3.0], index=times)
+
+        result = fetch_nldas_datarods(
+            self._make_weights(), 2010, 1, variables=["APCP"]
+        )
+
+        assert isinstance(result, dict)
+        assert "APCP" in result
+        assert isinstance(result["APCP"], pd.DataFrame)

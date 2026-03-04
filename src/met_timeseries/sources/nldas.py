@@ -1,13 +1,23 @@
 """
 NLDAS-2 data source.
 
-The public API is :func:`fetch_nldas`, which downloads NLDAS-2 hourly forcings
-for a given bounding box, year, and month and returns an aggregated monthly
-:class:`xarray.Dataset`.
+Architecture
+------------
+The module separates data access into two layers:
 
-For polygon-weighted timeseries, :func:`fetch_nldas_datarods` uses the NASA
-Giovanni in the Cloud Time Series Service API to fetch per-cell hourly data
-and compute weighted averages per polygon.
+**Download layer** – acquires raw per-cell timeseries:
+    :func:`download_nldas` is the public entry point, dispatching to
+    :func:`download_datarods` (Giovanni Time Series API).  Each function
+    returns a ``dict[(lat, lon), dict[var, pd.Series]]`` of raw hourly
+    data, optionally caching per-cell CSVs.
+
+**Processing layer** – spatial aggregation:
+    :func:`compute_weighted_averages` takes raw cell data and a weight
+    table and produces polygon-level weighted-average timeseries.  This
+    is independent of the download method.
+
+For convenience, :func:`fetch_nldas_datarods` wraps both layers in a
+single call, and :func:`fetch_nldas` provides strategy-based routing.
 
 Data access uses the ``earthaccess`` library, which handles NASA Earthdata
 authentication automatically via ``~/.netrc``, environment variables
@@ -68,6 +78,190 @@ _GIOVANNI_VARIABLES: dict[str, str] = {
     "APCP": "NLDAS_FORA0125_H_2_0_Rainf",
     "DSWRF": "NLDAS_FORA0125_H_2_0_SWdown",
 }
+
+
+def download_nldas(
+    weights: pd.DataFrame,
+    year: int,
+    month: int,
+    variables: list[str] | None = None,
+    method: str = "datarods",
+    cache_dir: str | None = None,
+) -> dict[tuple[float, float], dict[str, pd.Series]]:
+    """Download raw NLDAS-2 per-cell timeseries data.
+
+    This is the public entry point for downloading raw data. It dispatches
+    to the appropriate backend based on *method*. The returned data is
+    **unprocessed** — no spatial averaging or derivations are applied.
+
+    Parameters
+    ----------
+    weights:
+        Weight table with columns ``lat_center``, ``lon_center``.
+        Used to determine which grid cells to fetch. The ``weight``
+        column is not used here — only cell coordinates matter.
+    year:
+        Calendar year (e.g. 2010).
+    month:
+        Calendar month (1–12).
+    variables:
+        NLDAS-2 short variable names to fetch. Defaults to
+        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
+    method:
+        Download method.  ``"datarods"`` (default) uses the Giovanni
+        Time Series API to fetch per-cell hourly data.
+    cache_dir:
+        Optional directory for caching raw per-cell CSV files.
+
+    Returns
+    -------
+    dict[tuple[float, float], dict[str, pandas.Series]]
+        Mapping from ``(lat, lon)`` cell coordinates to a dict of
+        variable name → hourly timeseries (as ``pd.Series`` with
+        ``DatetimeIndex``).
+
+    Raises
+    ------
+    ValueError
+        If an unknown method is specified.
+    """
+    if variables is None:
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+    if method == "datarods":
+        return download_datarods(
+            weights=weights,
+            year=year,
+            month=month,
+            variables=variables,
+            cache_dir=cache_dir,
+        )
+    else:
+        raise ValueError(
+            f"Unknown download method {method!r}. Available: 'datarods'."
+        )
+
+
+def download_datarods(
+    weights: pd.DataFrame,
+    year: int,
+    month: int,
+    variables: list[str] | None = None,
+    cache_dir: str | None = None,
+) -> dict[tuple[float, float], dict[str, pd.Series]]:
+    """Download raw NLDAS-2 per-cell timeseries via Giovanni Time Series API.
+
+    Authenticates with NASA Earthdata once, then fetches hourly timeseries
+    for each unique grid cell in *weights*. Raw per-cell data is optionally
+    cached as CSV files.
+
+    Parameters
+    ----------
+    weights:
+        Weight table with columns ``lat_center``, ``lon_center``.
+    year:
+        Calendar year (e.g. 2010).
+    month:
+        Calendar month (1–12).
+    variables:
+        NLDAS-2 short variable names to fetch. Defaults to
+        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
+    cache_dir:
+        Optional directory for per-cell CSV cache files.
+
+    Returns
+    -------
+    dict[tuple[float, float], dict[str, pandas.Series]]
+        Mapping from ``(lat, lon)`` to a dict of variable name →
+        hourly ``pd.Series`` with ``DatetimeIndex``.
+    """
+    import earthaccess
+
+    if variables is None:
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+    # Authenticate once and reuse the token for all requests
+    earthaccess.login()
+    token = earthaccess.get_edl_token()["access_token"]
+
+    unique_cells = weights[["lat_center", "lon_center"]].drop_duplicates()
+    n_cells = len(unique_cells)
+    logger.info(
+        "Downloading Giovanni timeseries: %d unique cells × %d variables for %d-%02d",
+        n_cells, len(variables), year, month,
+    )
+
+    cell_data: dict[tuple[float, float], dict[str, pd.Series]] = {}
+    for i, (_, row) in enumerate(unique_cells.iterrows(), start=1):
+        lat, lon = row["lat_center"], row["lon_center"]
+        logger.debug("Fetching cell %d/%d: lat=%s lon=%s", i, n_cells, lat, lon)
+        cell_data[(lat, lon)] = {}
+        for var in variables:
+            series = _fetch_giovanni_cell(
+                lat=lat, lon=lon, variable=var,
+                year=year, month=month,
+                cache_dir=cache_dir, _token=token,
+            )
+            cell_data[(lat, lon)][var] = series
+
+    return cell_data
+
+
+def compute_weighted_averages(
+    cell_data: dict[tuple[float, float], dict[str, pd.Series]],
+    weights: pd.DataFrame,
+    variables: list[str] | None = None,
+    polygon_id_col: str = "metzone_id",
+) -> dict[str, pd.DataFrame]:
+    """Compute weighted spatial averages from per-cell timeseries data.
+
+    Takes raw per-cell data (as returned by :func:`download_nldas`) and
+    a weight table, and produces one timeseries per polygon per variable.
+    This function is independent of the download method.
+
+    Parameters
+    ----------
+    cell_data:
+        Raw per-cell data as returned by :func:`download_nldas` or
+        :func:`download_datarods`.  Mapping from ``(lat, lon)`` to
+        ``dict[variable_name, pd.Series]``.
+    weights:
+        Weight table with columns ``lat_center``, ``lon_center``,
+        ``{polygon_id_col}``, and ``weight``.  Weights should sum
+        to 1.0 per polygon (as returned by :func:`compute_nldas_weights`).
+    variables:
+        Variable names to process.  If ``None``, uses all variables
+        found in the first cell of *cell_data*.
+    polygon_id_col:
+        Column name in *weights* that identifies each polygon.
+
+    Returns
+    -------
+    dict[str, pandas.DataFrame]
+        Mapping from variable name to a DataFrame with a
+        ``DatetimeIndex`` and one column per polygon.
+    """
+    if variables is None:
+        first_key = next(iter(cell_data))
+        variables = list(cell_data[first_key].keys())
+
+    results: dict[str, pd.DataFrame] = {}
+    for var in variables:
+        polygon_series: dict = {}
+        for polygon_id, grp in weights.groupby(polygon_id_col):
+            first_key = (grp.iloc[0]["lat_center"], grp.iloc[0]["lon_center"])
+            weighted_sum = pd.Series(
+                0.0, index=cell_data[first_key][var].index
+            )
+            for _, wrow in grp.iterrows():
+                key = (wrow["lat_center"], wrow["lon_center"])
+                weighted_sum = weighted_sum.add(
+                    cell_data[key][var] * wrow["weight"], fill_value=0
+                )
+            polygon_series[polygon_id] = weighted_sum
+        results[var] = pd.DataFrame(polygon_series)
+
+    return results
 
 
 def fetch_nldas(
@@ -498,15 +692,14 @@ def fetch_nldas_datarods(
     polygon_id_col: str = "metzone_id",
     cache_dir: str | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch NLDAS-2 hourly data using Giovanni Time Series Service.
+    """Fetch NLDAS-2 hourly data and compute weighted averages.
 
-    Uses NASA's Giovanni in the Cloud Time Series API (replacement for
-    the discontinued Hydrology Data Rods service) to fetch per-cell hourly
-    timeseries for all cells in a weight table, then computes weighted
-    averages per polygon.
+    .. deprecated::
+        Use :func:`download_nldas` + :func:`compute_weighted_averages`
+        separately for more control over the pipeline.
 
-    Requires a valid NASA Earthdata account. Authentication is handled
-    via ``earthaccess.login()``.
+    This is a convenience wrapper that downloads raw per-cell data via
+    the Giovanni Time Series API, then applies weighted spatial averaging.
 
     Parameters
     ----------
@@ -531,50 +724,20 @@ def fetch_nldas_datarods(
         Mapping from variable name to a DataFrame with a DatetimeIndex
         and one column per polygon.
     """
-    import earthaccess
-
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
-    # Authenticate once and reuse the token for all requests
-    earthaccess.login()
-    token = earthaccess.get_edl_token()["access_token"]
-
-    unique_cells = weights[["lat_center", "lon_center"]].drop_duplicates()
-    n_cells = len(unique_cells)
-    logger.info(
-        "Fetching Giovanni timeseries: %d unique cells × %d variables for %d-%02d",
-        n_cells, len(variables), year, month,
+    cell_data = download_datarods(
+        weights=weights,
+        year=year,
+        month=month,
+        variables=variables,
+        cache_dir=cache_dir,
     )
 
-    cell_data: dict[tuple[float, float], dict[str, pd.Series]] = {}
-    for i, (_, row) in enumerate(unique_cells.iterrows(), start=1):
-        lat, lon = row["lat_center"], row["lon_center"]
-        logger.debug("Fetching cell %d/%d: lat=%s lon=%s", i, n_cells, lat, lon)
-        cell_data[(lat, lon)] = {}
-        for var in variables:
-            series = _fetch_giovanni_cell(
-                lat=lat, lon=lon, variable=var,
-                year=year, month=month,
-                cache_dir=cache_dir, _token=token,
-            )
-            cell_data[(lat, lon)][var] = series
-
-    # Compute weighted averages per polygon
-    results: dict[str, pd.DataFrame] = {}
-    for var in variables:
-        polygon_series: dict = {}
-        for polygon_id, grp in weights.groupby(polygon_id_col):
-            first_key = (grp.iloc[0]["lat_center"], grp.iloc[0]["lon_center"])
-            weighted_sum = pd.Series(
-                0.0, index=cell_data[first_key][var].index
-            )
-            for _, wrow in grp.iterrows():
-                key = (wrow["lat_center"], wrow["lon_center"])
-                weighted_sum = weighted_sum.add(
-                    cell_data[key][var] * wrow["weight"], fill_value=0
-                )
-            polygon_series[polygon_id] = weighted_sum
-        results[var] = pd.DataFrame(polygon_series)
-
-    return results
+    return compute_weighted_averages(
+        cell_data=cell_data,
+        weights=weights,
+        variables=variables,
+        polygon_id_col=polygon_id_col,
+    )
