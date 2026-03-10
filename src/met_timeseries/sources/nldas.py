@@ -82,6 +82,15 @@ _GIOVANNI_VARIABLES: dict[str, str] = {
     "DSWRF": "NLDAS_FORA0125_H_2_0_SWdown",
 }
 
+#: NLDAS-2 grid resolution in degrees; used as the cell buffer when selecting
+#: grid cells that fall within a bounding box.
+_NLDAS_RESOLUTION: float = 0.125
+
+
+def _bounds_to_polygon(bounds: BoundingBox):
+    """Return a Shapely box polygon for *bounds*."""
+    return box(bounds.west, bounds.south, bounds.east, bounds.north)
+
 
 def download_datarods(
     bounds: BoundingBox,
@@ -123,14 +132,13 @@ def download_datarods(
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
     # Determine NLDAS grid cells that fall within the bounding box
-    buf = 0.125  # one cell buffer
     grid = generate_nldas_grid(
-        west=bounds.west - buf,
-        south=bounds.south - buf,
-        east=bounds.east + buf,
-        north=bounds.north + buf,
+        west=bounds.west - _NLDAS_RESOLUTION,
+        south=bounds.south - _NLDAS_RESOLUTION,
+        east=bounds.east + _NLDAS_RESOLUTION,
+        north=bounds.north + _NLDAS_RESOLUTION,
     )
-    bbox_polygon = box(bounds.west, bounds.south, bounds.east, bounds.north)
+    bbox_polygon = _bounds_to_polygon(bounds)
     grid_in_bounds = grid[grid.intersects(bbox_polygon)]
     unique_cells = grid_in_bounds[["lat_center", "lon_center"]].drop_duplicates()
 
@@ -273,7 +281,7 @@ def process_nldas(
     )
 
     if weights is None:
-        bbox_polygon = box(bounds.west, bounds.south, bounds.east, bounds.north)
+        bbox_polygon = _bounds_to_polygon(bounds)
         polygons_gdf = gpd.GeoDataFrame(
             {polygon_id_col: ["bbox"], "geometry": [bbox_polygon]},
             crs="EPSG:4326",
