@@ -19,7 +19,7 @@ from met_timeseries.polygons import load_polygons
 from met_timeseries.ledger import is_complete, mark_complete, get_incomplete
 from met_timeseries.aggregation import aggregate_over_polygon
 from met_timeseries.io import save_timeseries
-from met_timeseries.sources.nldas import fetch_nldas
+from met_timeseries.sources.nldas import fetch_nldas_grid
 from met_timeseries.sources.prism import fetch_prism
 from met_timeseries.sources.base import BoundingBox
 from met_timeseries.derivations import derive_variables
@@ -117,7 +117,7 @@ def process_nldas_month(
             north=geom.bounds[3],
         )
 
-        raw = fetch_nldas(bounds, year, month, variables=variables, cache_dir=cache_dir)
+        raw = fetch_nldas_grid(bounds, year, month, variables=variables, cache_dir=cache_dir)
         derived = derive_variables(raw)
 
         for var_name, da in derived.items():

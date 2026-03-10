@@ -19,7 +19,7 @@ def derive_variables(nldas_data: xr.Dataset) -> dict[str, xr.DataArray]:
     Parameters
     ----------
     nldas_data:
-        Dataset produced by :func:`~met_timeseries.sources.nldas.fetch_nldas`
+        Dataset produced by :func:`~met_timeseries.sources.nldas.fetch_nldas_grid`
         containing at minimum ``APCP`` (precip), ``TMP`` (temperature), and
         ``DSWRF`` (shortwave radiation).  If ``PEVAP`` is present it is used
         directly as ``pet_mm``; otherwise a Hargreaves-based estimate is

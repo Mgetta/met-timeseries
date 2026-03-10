@@ -3,21 +3,24 @@ NLDAS-2 data source.
 
 Architecture
 ------------
-The module separates data access into two layers:
+The module separates data access into three layers:
 
 **Download layer** – acquires raw per-cell timeseries:
-    :func:`download_nldas` is the public entry point, dispatching to
-    :func:`download_datarods` (Giovanni Time Series API).  Each function
-    returns a ``dict[(lat, lon), dict[var, pd.Series]]`` of raw hourly
-    data, optionally caching per-cell CSVs.
+    :func:`download_datarods` fetches raw hourly data from the Giovanni
+    Time Series API for every NLDAS grid cell within a bounding box.
+    It is independent of any weighting and caches raw per-cell CSVs.
 
 **Processing layer** – spatial aggregation:
-    :func:`compute_weighted_averages` takes raw cell data and a weight
-    table and produces polygon-level weighted-average timeseries.  This
-    is independent of the download method.
+    :func:`process_nldas` is the main entry point for the datarods
+    workflow.  It calls :func:`download_datarods`, derives area-overlap
+    weights automatically from the bounding box and NLDAS grid (via
+    :func:`compute_nldas_weights`), and computes polygon-level
+    weighted-average timeseries via :func:`compute_weighted_averages`.
+    Pre-computed weights may also be supplied.
 
-For convenience, :func:`fetch_nldas_datarods` wraps both layers in a
-single call, and :func:`fetch_nldas` provides strategy-based routing.
+**Grid download layer** – full gridded NetCDF access:
+    :func:`fetch_nldas_grid` downloads full NLDAS-2 gridded files via
+    ``earthaccess`` and returns an :class:`xarray.Dataset`.
 
 Data access uses the ``earthaccess`` library, which handles NASA Earthdata
 authentication automatically via ``~/.netrc``, environment variables
@@ -80,70 +83,8 @@ _GIOVANNI_VARIABLES: dict[str, str] = {
 }
 
 
-def download_nldas(
-    weights: pd.DataFrame,
-    year: int,
-    month: int,
-    variables: list[str] | None = None,
-    method: str = "datarods",
-    cache_dir: str | None = None,
-) -> dict[tuple[float, float], dict[str, pd.Series]]:
-    """Download raw NLDAS-2 per-cell timeseries data.
-
-    This is the public entry point for downloading raw data. It dispatches
-    to the appropriate backend based on *method*. The returned data is
-    **unprocessed** — no spatial averaging or derivations are applied.
-
-    Parameters
-    ----------
-    weights:
-        Weight table with columns ``lat_center``, ``lon_center``.
-        Used to determine which grid cells to fetch. The ``weight``
-        column is not used here — only cell coordinates matter.
-    year:
-        Calendar year (e.g. 2010).
-    month:
-        Calendar month (1–12).
-    variables:
-        NLDAS-2 short variable names to fetch. Defaults to
-        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
-    method:
-        Download method.  ``"datarods"`` (default) uses the Giovanni
-        Time Series API to fetch per-cell hourly data.
-    cache_dir:
-        Optional directory for caching raw per-cell CSV files.
-
-    Returns
-    -------
-    dict[tuple[float, float], dict[str, pandas.Series]]
-        Mapping from ``(lat, lon)`` cell coordinates to a dict of
-        variable name → hourly timeseries (as ``pd.Series`` with
-        ``DatetimeIndex``).
-
-    Raises
-    ------
-    ValueError
-        If an unknown method is specified.
-    """
-    if variables is None:
-        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
-
-    if method == "datarods":
-        return download_datarods(
-            weights=weights,
-            year=year,
-            month=month,
-            variables=variables,
-            cache_dir=cache_dir,
-        )
-    else:
-        raise ValueError(
-            f"Unknown download method {method!r}. Available: 'datarods'."
-        )
-
-
 def download_datarods(
-    weights: pd.DataFrame,
+    bounds: BoundingBox,
     year: int,
     month: int,
     variables: list[str] | None = None,
@@ -151,14 +92,15 @@ def download_datarods(
 ) -> dict[tuple[float, float], dict[str, pd.Series]]:
     """Download raw NLDAS-2 per-cell timeseries via Giovanni Time Series API.
 
-    Authenticates with NASA Earthdata once, then fetches hourly timeseries
-    for each unique grid cell in *weights*. Raw per-cell data is optionally
-    cached as CSV files.
+    This function is independent of any weighting.  It determines which
+    NLDAS grid cells fall within *bounds*, authenticates with NASA Earthdata
+    once, then fetches hourly timeseries for each cell.  Raw per-cell data
+    is optionally cached as CSV files.
 
     Parameters
     ----------
-    weights:
-        Weight table with columns ``lat_center``, ``lon_center``.
+    bounds:
+        Spatial bounding box in EPSG:4326 used to select grid cells.
     year:
         Calendar year (e.g. 2010).
     month:
@@ -180,11 +122,22 @@ def download_datarods(
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
+    # Determine NLDAS grid cells that fall within the bounding box
+    buf = 0.125  # one cell buffer
+    grid = generate_nldas_grid(
+        west=bounds.west - buf,
+        south=bounds.south - buf,
+        east=bounds.east + buf,
+        north=bounds.north + buf,
+    )
+    bbox_polygon = box(bounds.west, bounds.south, bounds.east, bounds.north)
+    grid_in_bounds = grid[grid.intersects(bbox_polygon)]
+    unique_cells = grid_in_bounds[["lat_center", "lon_center"]].drop_duplicates()
+
     # Authenticate once and reuse the token for all requests
     earthaccess.login()
     token = earthaccess.get_edl_token()["access_token"]
 
-    unique_cells = weights[["lat_center", "lon_center"]].drop_duplicates()
     n_cells = len(unique_cells)
     logger.info(
         "Downloading Giovanni timeseries: %d unique cells × %d variables for %d-%02d",
@@ -215,16 +168,15 @@ def compute_weighted_averages(
 ) -> dict[str, pd.DataFrame]:
     """Compute weighted spatial averages from per-cell timeseries data.
 
-    Takes raw per-cell data (as returned by :func:`download_nldas`) and
+    Takes raw per-cell data (as returned by :func:`download_datarods`) and
     a weight table, and produces one timeseries per polygon per variable.
     This function is independent of the download method.
 
     Parameters
     ----------
     cell_data:
-        Raw per-cell data as returned by :func:`download_nldas` or
-        :func:`download_datarods`.  Mapping from ``(lat, lon)`` to
-        ``dict[variable_name, pd.Series]``.
+        Raw per-cell data as returned by :func:`download_datarods`.
+        Mapping from ``(lat, lon)`` to ``dict[variable_name, pd.Series]``.
     weights:
         Weight table with columns ``lat_center``, ``lon_center``,
         ``{polygon_id_col}``, and ``weight``.  Weights should sum
@@ -264,17 +216,91 @@ def compute_weighted_averages(
     return results
 
 
-def fetch_nldas(
+def process_nldas(
     bounds: BoundingBox,
     year: int,
     month: int,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
-    strategy: str = "grid",
     weights: pd.DataFrame | None = None,
     polygon_id_col: str = "metzone_id",
-) -> xr.Dataset | dict[str, pd.DataFrame]:
-    """Fetch NLDAS-2 hourly forcing data for the given bounding box.
+) -> dict[str, pd.DataFrame]:
+    """Download NLDAS-2 data via datarods and compute weighted averages.
+
+    This is the main entry point for the datarods-based workflow.  It
+    downloads raw per-cell data with :func:`download_datarods`, then
+    derives area-overlap weights automatically from the bounding box and
+    the NLDAS grid (unless pre-computed *weights* are supplied), and
+    finally applies :func:`compute_weighted_averages`.
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    year:
+        Calendar year (e.g. 2010).
+    month:
+        Calendar month (1–12).
+    variables:
+        NLDAS-2 short variable names to fetch.  Defaults to
+        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
+    cache_dir:
+        Optional directory for caching raw per-cell CSV files.
+    weights:
+        Pre-computed weight table (see :func:`compute_nldas_weights`).
+        If ``None`` (default), weights are derived automatically from
+        *bounds* and the NLDAS grid.
+    polygon_id_col:
+        Column name in *weights* that identifies each polygon.  When
+        weights are auto-derived the single polygon is labelled
+        ``"bbox"``.
+
+    Returns
+    -------
+    dict[str, pandas.DataFrame]
+        Mapping from variable name to a DataFrame with a
+        ``DatetimeIndex`` and one column per polygon.
+    """
+    if variables is None:
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+    cell_data = download_datarods(
+        bounds=bounds,
+        year=year,
+        month=month,
+        variables=variables,
+        cache_dir=cache_dir,
+    )
+
+    if weights is None:
+        bbox_polygon = box(bounds.west, bounds.south, bounds.east, bounds.north)
+        polygons_gdf = gpd.GeoDataFrame(
+            {polygon_id_col: ["bbox"], "geometry": [bbox_polygon]},
+            crs="EPSG:4326",
+        )
+        weights = compute_nldas_weights(
+            polygons_gdf, polygon_id_col=polygon_id_col,
+        )
+
+    return compute_weighted_averages(
+        cell_data=cell_data,
+        weights=weights,
+        variables=variables,
+        polygon_id_col=polygon_id_col,
+    )
+
+
+def fetch_nldas_grid(
+    bounds: BoundingBox,
+    year: int,
+    month: int,
+    variables: list[str] | None = None,
+    cache_dir: str | None = None,
+) -> xr.Dataset:
+    """Fetch NLDAS-2 hourly gridded data for the given bounding box.
+
+    Downloads full NLDAS-2 gridded NetCDF files via ``earthaccess`` and
+    returns a subsetted :class:`xarray.Dataset`.
 
     Authentication is handled automatically by :func:`earthaccess.login`,
     which reads ``~/.netrc``, environment variables (``EARTHDATA_USERNAME`` /
@@ -295,54 +321,22 @@ def fetch_nldas(
     cache_dir:
         If provided, a subsetted monthly NetCDF file is cached here and
         loaded on subsequent calls for the same month.
-    strategy:
-        Download strategy.  ``"grid"`` (default) uses earthaccess to download
-        full gridded NetCDF files.  ``"datarods"`` uses the Giovanni Time
-        Series API to fetch per-cell hourly data and compute weighted averages
-        per polygon (requires *weights*).
-    weights:
-        Pre-computed weight table (see :func:`compute_nldas_weights`).
-        Required when ``strategy="datarods"``.
-    polygon_id_col:
-        Column in *weights* that identifies each polygon.  Used only when
-        ``strategy="datarods"``.
 
     Returns
     -------
     xarray.Dataset
-        When ``strategy="grid"``: hourly Dataset with ``time``, ``lat``, and
-        ``lon`` dimensions.  The ``time`` coordinate carries proper
-        ``datetime64`` timestamps.
-    dict[str, pandas.DataFrame]
-        When ``strategy="datarods"``: mapping from variable name to a
-        DataFrame with a DatetimeIndex and one column per polygon.
+        Hourly Dataset with ``time``, ``lat``, and ``lon`` dimensions.
+        The ``time`` coordinate carries proper ``datetime64`` timestamps.
 
     Raises
     ------
     RuntimeError
-        If no granules are found for the requested period (grid strategy).
-    ValueError
-        If ``strategy="datarods"`` and *weights* is ``None``, or if an
-        unknown strategy is specified.
+        If no granules are found for the requested period.
     """
     import earthaccess
 
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
-
-    if strategy == "datarods":
-        if weights is None:
-            raise ValueError("weights must be provided when strategy='datarods'")
-        return fetch_nldas_datarods(
-            weights=weights,
-            year=year,
-            month=month,
-            variables=variables,
-            polygon_id_col=polygon_id_col,
-            cache_dir=cache_dir,
-        )
-    elif strategy != "grid":
-        raise ValueError(f"Unknown strategy {strategy!r}. Must be 'grid' or 'datarods'.")
 
     logger.info("Fetching NLDAS-2 data: year=%d month=%d bounds=%r", year, month, bounds)
 
@@ -682,62 +676,3 @@ def _fetch_giovanni_cell(
         series.to_csv(cache_path, header=True)
 
     return series
-
-
-def fetch_nldas_datarods(
-    weights: pd.DataFrame,
-    year: int,
-    month: int,
-    variables: list[str] | None = None,
-    polygon_id_col: str = "metzone_id",
-    cache_dir: str | None = None,
-) -> dict[str, pd.DataFrame]:
-    """Fetch NLDAS-2 hourly data and compute weighted averages.
-
-    .. deprecated::
-        Use :func:`download_nldas` + :func:`compute_weighted_averages`
-        separately for more control over the pipeline.
-
-    This is a convenience wrapper that downloads raw per-cell data via
-    the Giovanni Time Series API, then applies weighted spatial averaging.
-
-    Parameters
-    ----------
-    weights:
-        Weight table with columns ``lat_center``, ``lon_center``,
-        ``{polygon_id_col}``, and ``weight``.
-    year:
-        Calendar year (e.g. 2010).
-    month:
-        Calendar month (1–12).
-    variables:
-        NLDAS-2 short variable names to fetch. Defaults to
-        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
-    polygon_id_col:
-        Column name in *weights* that identifies each polygon.
-    cache_dir:
-        Optional directory for per-cell CSV cache files.
-
-    Returns
-    -------
-    dict[str, pandas.DataFrame]
-        Mapping from variable name to a DataFrame with a DatetimeIndex
-        and one column per polygon.
-    """
-    if variables is None:
-        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
-
-    cell_data = download_datarods(
-        weights=weights,
-        year=year,
-        month=month,
-        variables=variables,
-        cache_dir=cache_dir,
-    )
-
-    return compute_weighted_averages(
-        cell_data=cell_data,
-        weights=weights,
-        variables=variables,
-        polygon_id_col=polygon_id_col,
-    )
