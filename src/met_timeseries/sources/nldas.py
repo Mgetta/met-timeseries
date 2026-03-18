@@ -65,7 +65,7 @@ AVAILABLE_VARIABLES: list[str] = [
 _GIOVANNI_URL = "https://api.giovanni.earthdata.nasa.gov/timeseries"
 
 #: Number of metadata header lines in a Giovanni Time Series CSV response.
-_GIOVANNI_HEADER_LINES = 13
+_GIOVANNI_HEADER_LINES = 15
 
 #: Mapping from our short variable names to Giovanni Time Series Service
 #: data parameter identifiers for NLDAS_FORA0125_H v2.0.
@@ -91,6 +91,18 @@ def _bounds_to_polygon(bounds: BoundingBox):
     """Return a Shapely box polygon for *bounds*."""
     return box(bounds.west, bounds.south, bounds.east, bounds.north)
 
+
+def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:
+    """Return a GeoDataFrame of NLDAS grid cells that intersect the bounding box."""
+    grid = generate_nldas_grid(
+        west=bounds.west - _NLDAS_RESOLUTION,
+        south=bounds.south - _NLDAS_RESOLUTION,
+        east=bounds.east + _NLDAS_RESOLUTION,
+        north=bounds.north + _NLDAS_RESOLUTION,
+    )
+    bbox_polygon = _bounds_to_polygon(bounds)
+    grid_in_bounds = grid[grid.intersects(bbox_polygon)]
+    return grid_in_bounds[["lat_center", "lon_center", "geometry"]].drop_duplicates()
 
 def download_datarods(
     bounds: BoundingBox,
@@ -132,16 +144,8 @@ def download_datarods(
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
     # Determine NLDAS grid cells that fall within the bounding box
-    grid = generate_nldas_grid(
-        west=bounds.west - _NLDAS_RESOLUTION,
-        south=bounds.south - _NLDAS_RESOLUTION,
-        east=bounds.east + _NLDAS_RESOLUTION,
-        north=bounds.north + _NLDAS_RESOLUTION,
-    )
-    bbox_polygon = _bounds_to_polygon(bounds)
-    grid_in_bounds = grid[grid.intersects(bbox_polygon)]
-    unique_cells = grid_in_bounds[["lat_center", "lon_center"]].drop_duplicates()
-
+    unique_cells = get_nldas_gridcells(bounds)
+    
     # Authenticate once and reuse the token for all requests
     earthaccess.login()
     token = earthaccess.get_edl_token()["access_token"]
@@ -158,11 +162,17 @@ def download_datarods(
         logger.debug("Fetching cell %d/%d: lat=%s lon=%s", i, n_cells, lat, lon)
         cell_data[(lat, lon)] = {}
         for var in variables:
-            series = _fetch_giovanni_cell(
+            text = _fetch_giovanni_cell(
                 lat=lat, lon=lon, variable=var,
                 year=year, month=month,
                 cache_dir=cache_dir, _token=token,
             )
+            series = _parse_giovanni_response(text)
+
+            if cache_dir is not None:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                series.to_csv(cache_path, header=True)
+
             cell_data[(lat, lon)][var] = series
 
     return cell_data
@@ -677,10 +687,5 @@ def _fetch_giovanni_cell(
             if attempt == max_retries - 1:
                 raise
 
-    series = _parse_giovanni_response(text)
 
-    if cache_dir is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        series.to_csv(cache_path, header=True)
-
-    return series
+    return text
