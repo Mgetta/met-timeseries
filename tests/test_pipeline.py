@@ -18,7 +18,7 @@ import geopandas as gpd
 
 
 def _make_mock_dataset(lats, lons, n_times: int = 3) -> xr.Dataset:
-    """Return a tiny Dataset with APCP and TMP for mocking fetch_nldas.
+    """Return a tiny Dataset with APCP and TMP for mocking fetch_nldas_grid.
 
     The dataset has a ``time`` dimension to simulate hourly output.
     """
@@ -76,7 +76,7 @@ class TestProcessNldasMonth:
 
         ledger = str(tmp_path / "ledger.csv")
 
-        with patch("met_timeseries.pipeline.fetch_nldas", return_value=mock_ds):
+        with patch("met_timeseries.pipeline.fetch_nldas_grid", return_value=mock_ds):
             process_nldas_month(
                 polygons=dissolved_polygons,
                 metzone_column="metzone_id",
@@ -91,14 +91,14 @@ class TestProcessNldasMonth:
         assert is_complete(ledger, "nldas", 2000, 1)
 
     def test_skips_already_complete(self, dissolved_polygons: gpd.GeoDataFrame, tmp_path: Path) -> None:
-        """When the ledger shows completion, fetch_nldas should not be called."""
+        """When the ledger shows completion, fetch_nldas_grid should not be called."""
         from met_timeseries.pipeline import process_nldas_month
         from met_timeseries.ledger import mark_complete
 
         ledger = str(tmp_path / "ledger.csv")
         mark_complete(ledger, "nldas", 2000, 1)
 
-        with patch("met_timeseries.pipeline.fetch_nldas") as mock_fetch:
+        with patch("met_timeseries.pipeline.fetch_nldas_grid") as mock_fetch:
             process_nldas_month(
                 polygons=dissolved_polygons,
                 metzone_column="metzone_id",
@@ -122,7 +122,7 @@ class TestProcessNldasMonth:
         output_dir = tmp_path / "output"
         ledger = str(tmp_path / "ledger.csv")
 
-        with patch("met_timeseries.pipeline.fetch_nldas", return_value=mock_ds):
+        with patch("met_timeseries.pipeline.fetch_nldas_grid", return_value=mock_ds):
             process_nldas_month(
                 polygons=dissolved_polygons,
                 metzone_column="metzone_id",
@@ -148,7 +148,7 @@ class TestProcessNldasMonth:
         output_dir = tmp_path / "output"
         ledger = str(tmp_path / "ledger.csv")
 
-        with patch("met_timeseries.pipeline.fetch_nldas", return_value=mock_ds):
+        with patch("met_timeseries.pipeline.fetch_nldas_grid", return_value=mock_ds):
             process_nldas_month(
                 polygons=dissolved_polygons,
                 metzone_column="metzone_id",
@@ -176,7 +176,7 @@ class TestProcessNldasMonth:
         output_dir = tmp_path / "output"
         ledger = str(tmp_path / "ledger.csv")
 
-        with patch("met_timeseries.pipeline.fetch_nldas", return_value=mock_ds):
+        with patch("met_timeseries.pipeline.fetch_nldas_grid", return_value=mock_ds):
             process_nldas_month(
                 polygons=dissolved_polygons,
                 metzone_column="metzone_id",
@@ -204,7 +204,7 @@ class TestRunPipeline:
         lons = np.linspace(-110.0, -109.0, 8)
         mock_ds = _make_mock_dataset(lats, lons)
 
-        with patch("met_timeseries.pipeline.fetch_nldas", return_value=mock_ds):
+        with patch("met_timeseries.pipeline.fetch_nldas_grid", return_value=mock_ds):
             run_pipeline(pipeline_config)
 
         # All 12 months of 2000 should now be complete
