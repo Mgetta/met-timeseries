@@ -227,7 +227,7 @@ class TestParseGiovanniResponse:
 
 
 class TestFetchGiovanniCell:
-    """Verify _fetch_giovanni_cell raises on unknown variable."""
+    """Verify _fetch_giovanni_cell performs HTTP fetch and returns raw text."""
 
     def test_raises_on_unknown_variable(self):
         from met_timeseries.sources.nldas import _fetch_giovanni_cell
@@ -235,45 +235,122 @@ class TestFetchGiovanniCell:
         with pytest.raises(ValueError, match="Unknown variable"):
             _fetch_giovanni_cell(35.0, -85.0, "NOTAVAR", 2010, 1, _token="dummy")
 
-    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
     @patch("requests.get")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
     def test_uses_bearer_token(
-        self, mock_login, mock_get_token, mock_requests_get, mock_parse
+        self, mock_login, mock_get_token, mock_requests_get
     ):
         mock_get_token.return_value = {"access_token": "test-token"}
         mock_resp = MagicMock()
         mock_resp.text = "dummy"
         mock_requests_get.return_value = mock_resp
-        mock_parse.return_value = pd.Series(
-            [1.0], index=pd.DatetimeIndex(["2010-01-01"])
-        )
 
         from met_timeseries.sources.nldas import _fetch_giovanni_cell
 
-        _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1)
+        result = _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1)
 
         call_kwargs = mock_requests_get.call_args
         assert "Authorization" in call_kwargs.kwargs["headers"]
         assert call_kwargs.kwargs["headers"]["Authorization"].startswith("Bearer ")
+        assert result == "dummy"
 
-    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
     @patch("requests.get")
-    def test_uses_provided_token(self, mock_requests_get, mock_parse):
+    def test_uses_provided_token(self, mock_requests_get):
         mock_resp = MagicMock()
         mock_resp.text = "dummy"
         mock_requests_get.return_value = mock_resp
-        mock_parse.return_value = pd.Series(
-            [1.0], index=pd.DatetimeIndex(["2010-01-01"])
-        )
 
         from met_timeseries.sources.nldas import _fetch_giovanni_cell
 
-        _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1, _token="my-token")
+        result = _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1, _token="my-token")
 
         call_kwargs = mock_requests_get.call_args
         assert call_kwargs.kwargs["headers"]["Authorization"] == "Bearer my-token"
+        assert result == "dummy"
+
+    @patch("requests.get")
+    def test_returns_raw_text(self, mock_requests_get):
+        mock_resp = MagicMock()
+        mock_resp.text = "raw response text"
+        mock_requests_get.return_value = mock_resp
+
+        from met_timeseries.sources.nldas import _fetch_giovanni_cell
+
+        result = _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1, _token="tok")
+        assert isinstance(result, str)
+        assert result == "raw response text"
+
+
+class TestCacheGiovanniResponse:
+    """Verify _cache_giovanni_response caching of raw text."""
+
+    _SAMPLE_TEXT = (
+        "param_short_name,Tair\n"
+        "param_name,Near surface air temperature\n"
+        "unit,K\n"
+        "lat,35.0625\n"
+        "lon,-83.9375\n"
+        "start_time,2010-01-01T00:00:00\n"
+        "end_time,2010-01-01T02:00:00\n"
+        "temporal_resolution,hourly\n"
+        "grid_type,regular\n"
+        "grid_resolution,0.125\n"
+        "source,NLDAS_FORA0125_H_2.0\n"
+        "missing_value,-9999.0\n"
+        "num_values,3\n"
+        "Timestamp,Near surface air temperature\n"
+        "2010-01-01T00:00:00,274.663\n"
+        "2010-01-01T01:00:00,273.112\n"
+        "2010-01-01T02:00:00,271.500\n"
+    )
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    def test_returns_text_from_cache(self, mock_fetch, tmp_path):
+        from met_timeseries.sources.nldas import _cache_giovanni_response
+
+        # Pre-populate cache
+        cache_file = tmp_path / "giovanni" / "35.0625_-83.9375_APCP_201001.txt"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text(self._SAMPLE_TEXT)
+
+        result = _cache_giovanni_response(
+            35.0625, -83.9375, "APCP", 2010, 1,
+            cache_dir=str(tmp_path), _token="tok",
+        )
+
+        assert result == self._SAMPLE_TEXT
+        mock_fetch.assert_not_called()
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    def test_fetches_and_caches_when_missing(self, mock_fetch, tmp_path):
+        from met_timeseries.sources.nldas import _cache_giovanni_response
+
+        mock_fetch.return_value = self._SAMPLE_TEXT
+
+        result = _cache_giovanni_response(
+            35.0625, -83.9375, "APCP", 2010, 1,
+            cache_dir=str(tmp_path), _token="tok",
+        )
+
+        assert result == self._SAMPLE_TEXT
+        mock_fetch.assert_called_once()
+        cache_file = tmp_path / "giovanni" / "35.0625_-83.9375_APCP_201001.txt"
+        assert cache_file.exists()
+        assert cache_file.read_text() == self._SAMPLE_TEXT
+
+    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    def test_no_cache_dir_returns_text(self, mock_fetch):
+        from met_timeseries.sources.nldas import _cache_giovanni_response
+
+        mock_fetch.return_value = self._SAMPLE_TEXT
+
+        result = _cache_giovanni_response(
+            35.0625, -83.9375, "APCP", 2010, 1, _token="tok",
+        )
+
+        assert result == self._SAMPLE_TEXT
+        mock_fetch.assert_called_once()
 
 
 class TestProcessNldas:
@@ -494,12 +571,14 @@ class TestDownloadDatarods:
             index=pd.date_range("2010-01-01", periods=3, freq="h"),
         )
 
-    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
-    def test_returns_cell_data_dict(self, mock_login, mock_get_token, mock_fetch_cell):
+    def test_returns_cell_data_dict(self, mock_login, mock_get_token, mock_cache, mock_parse):
         mock_get_token.return_value = {"access_token": "tok"}
-        mock_fetch_cell.return_value = self._make_series()
+        mock_cache.return_value = "raw text"
+        mock_parse.return_value = self._make_series()
 
         from met_timeseries.sources.nldas import download_datarods
 
@@ -512,12 +591,14 @@ class TestDownloadDatarods:
             assert isinstance(val, dict)
             assert isinstance(val["APCP"], pd.Series)
 
-    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
-    def test_authenticates_once(self, mock_login, mock_get_token, mock_fetch_cell):
+    def test_authenticates_once(self, mock_login, mock_get_token, mock_cache, mock_parse):
         mock_get_token.return_value = {"access_token": "tok"}
-        mock_fetch_cell.return_value = self._make_series()
+        mock_cache.return_value = "raw text"
+        mock_parse.return_value = self._make_series()
 
         from met_timeseries.sources.nldas import download_datarods
 
@@ -526,14 +607,16 @@ class TestDownloadDatarods:
         mock_login.assert_called_once()
         mock_get_token.assert_called_once()
 
-    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
     def test_fetches_all_variables_for_each_cell(
-        self, mock_login, mock_get_token, mock_fetch_cell
+        self, mock_login, mock_get_token, mock_cache, mock_parse
     ):
         mock_get_token.return_value = {"access_token": "tok"}
-        mock_fetch_cell.return_value = self._make_series()
+        mock_cache.return_value = "raw text"
+        mock_parse.return_value = self._make_series()
 
         from met_timeseries.sources.nldas import download_datarods
 
@@ -542,14 +625,16 @@ class TestDownloadDatarods:
 
         n_cells = len(result)
         # Each cell should have all requested variables
-        assert mock_fetch_cell.call_count == n_cells * len(variables)
+        assert mock_cache.call_count == n_cells * len(variables)
 
-    @patch("met_timeseries.sources.nldas._fetch_giovanni_cell")
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
-    def test_passes_cache_dir(self, mock_login, mock_get_token, mock_fetch_cell):
+    def test_passes_cache_dir(self, mock_login, mock_get_token, mock_cache, mock_parse):
         mock_get_token.return_value = {"access_token": "tok"}
-        mock_fetch_cell.return_value = self._make_series()
+        mock_cache.return_value = "raw text"
+        mock_parse.return_value = self._make_series()
 
         from met_timeseries.sources.nldas import download_datarods
 
@@ -557,7 +642,7 @@ class TestDownloadDatarods:
             self._make_bounds(), 2010, 1, variables=["APCP"], cache_dir="/tmp/cache"
         )
 
-        for call in mock_fetch_cell.call_args_list:
+        for call in mock_cache.call_args_list:
             assert call.kwargs["cache_dir"] == "/tmp/cache"
 
 
