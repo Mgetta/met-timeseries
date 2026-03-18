@@ -65,7 +65,7 @@ AVAILABLE_VARIABLES: list[str] = [
 _GIOVANNI_URL = "https://api.giovanni.earthdata.nasa.gov/timeseries"
 
 #: Number of metadata header lines in a Giovanni Time Series CSV response.
-_GIOVANNI_HEADER_LINES = 15
+_GIOVANNI_HEADER_LINES = 13
 
 #: Mapping from our short variable names to Giovanni Time Series Service
 #: data parameter identifiers for NLDAS_FORA0125_H v2.0.
@@ -162,17 +162,12 @@ def download_datarods(
         logger.debug("Fetching cell %d/%d: lat=%s lon=%s", i, n_cells, lat, lon)
         cell_data[(lat, lon)] = {}
         for var in variables:
-            text = _fetch_giovanni_cell(
+            text = _cache_giovanni_response(
                 lat=lat, lon=lon, variable=var,
                 year=year, month=month,
                 cache_dir=cache_dir, _token=token,
             )
             series = _parse_giovanni_response(text)
-
-            if cache_dir is not None:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                series.to_csv(cache_path, header=True)
-
             cell_data[(lat, lon)][var] = series
 
     return cell_data
@@ -595,11 +590,13 @@ def _fetch_giovanni_cell(
     variable: str,
     year: int,
     month: int,
-    cache_dir: str | None = None,
     max_retries: int = 3,
     _token: str | None = None,
-) -> pd.Series:
-    """Fetch a single-cell timeseries from the Giovanni Time Series API.
+) -> str:
+    """Fetch raw text from the Giovanni Time Series API for a single cell.
+
+    This function performs only the HTTP request and returns the raw
+    response text.  It does **not** cache or parse the response.
 
     Parameters
     ----------
@@ -609,8 +606,6 @@ def _fetch_giovanni_cell(
         Short variable name (e.g. ``"APCP"``).
     year, month:
         Temporal period.
-    cache_dir:
-        Optional cache directory for per-cell CSV files.
     max_retries:
         Number of retry attempts with exponential back-off on 429/5xx.
     _token:
@@ -619,8 +614,8 @@ def _fetch_giovanni_cell(
 
     Returns
     -------
-    pandas.Series
-        Hourly timeseries for the cell with DatetimeIndex.
+    str
+        Raw CSV response text from the Giovanni API.
     """
     import earthaccess
     import requests as req
@@ -630,15 +625,6 @@ def _fetch_giovanni_cell(
             f"Unknown variable {variable!r}. "
             f"Available: {list(_GIOVANNI_VARIABLES)}"
         )
-
-    # Check cache
-    if cache_dir is not None:
-        cache_path = (
-            Path(cache_dir) / "giovanni"
-            / f"{lat}_{lon}_{variable}_{year}{month:02d}.csv"
-        )
-        if cache_path.exists():
-            return pd.read_csv(cache_path, index_col=0, parse_dates=True).iloc[:, 0]
 
     # Get auth token
     if _token is None:
@@ -687,5 +673,62 @@ def _fetch_giovanni_cell(
             if attempt == max_retries - 1:
                 raise
 
+    return text
+
+
+def _cache_giovanni_response(
+    lat: float,
+    lon: float,
+    variable: str,
+    year: int,
+    month: int,
+    cache_dir: str | None = None,
+    max_retries: int = 3,
+    _token: str | None = None,
+) -> str:
+    """Return raw Giovanni response text, using a file cache when available.
+
+    If *cache_dir* is provided and a cached file exists for the requested
+    cell/variable/month combination, the cached text is returned without
+    making an HTTP request.  Otherwise :func:`_fetch_giovanni_cell` is
+    called and the response is written to the cache before being returned.
+
+    Parameters
+    ----------
+    lat, lon:
+        Grid cell center coordinates (EPSG:4326).
+    variable:
+        Short variable name (e.g. ``"APCP"``).
+    year, month:
+        Temporal period.
+    cache_dir:
+        Optional directory for per-cell text cache files.
+    max_retries:
+        Passed through to :func:`_fetch_giovanni_cell`.
+    _token:
+        Pre-fetched Earthdata bearer token.
+
+    Returns
+    -------
+    str
+        Raw CSV response text (from cache or freshly fetched).
+    """
+    if cache_dir is not None:
+        cache_path = (
+            Path(cache_dir) / "giovanni"
+            / f"{lat}_{lon}_{variable}_{year}{month:02d}.txt"
+        )
+        if cache_path.exists():
+            return cache_path.read_text()
+
+    text = _fetch_giovanni_cell(
+        lat=lat, lon=lon, variable=variable,
+        year=year, month=month,
+        max_retries=max_retries, _token=_token,
+    )
+
+    if cache_dir is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(text)
 
     return text
