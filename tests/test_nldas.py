@@ -233,7 +233,11 @@ class TestFetchGiovanniCell:
         from met_timeseries.sources.nldas import _fetch_giovanni_cell
 
         with pytest.raises(ValueError, match="Unknown variable"):
-            _fetch_giovanni_cell(35.0, -85.0, "NOTAVAR", 2010, 1, _token="dummy")
+            _fetch_giovanni_cell(
+                35.0, -85.0, "NOTAVAR",
+                "2010-01-01T00:00:00", "2010-01-31T23:00:00",
+                _token="dummy",
+            )
 
     @patch("requests.get")
     @patch("earthaccess.get_edl_token")
@@ -248,7 +252,10 @@ class TestFetchGiovanniCell:
 
         from met_timeseries.sources.nldas import _fetch_giovanni_cell
 
-        result = _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1)
+        result = _fetch_giovanni_cell(
+            35.0, -85.0, "APCP",
+            "2010-01-01T00:00:00", "2010-01-31T23:00:00",
+        )
 
         call_kwargs = mock_requests_get.call_args
         assert "Authorization" in call_kwargs.kwargs["headers"]
@@ -263,7 +270,11 @@ class TestFetchGiovanniCell:
 
         from met_timeseries.sources.nldas import _fetch_giovanni_cell
 
-        result = _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1, _token="my-token")
+        result = _fetch_giovanni_cell(
+            35.0, -85.0, "APCP",
+            "2010-01-01T00:00:00", "2010-01-31T23:00:00",
+            _token="my-token",
+        )
 
         call_kwargs = mock_requests_get.call_args
         assert call_kwargs.kwargs["headers"]["Authorization"] == "Bearer my-token"
@@ -277,7 +288,11 @@ class TestFetchGiovanniCell:
 
         from met_timeseries.sources.nldas import _fetch_giovanni_cell
 
-        result = _fetch_giovanni_cell(35.0, -85.0, "APCP", 2010, 1, _token="tok")
+        result = _fetch_giovanni_cell(
+            35.0, -85.0, "APCP",
+            "2010-01-01T00:00:00", "2010-01-31T23:00:00",
+            _token="tok",
+        )
         assert isinstance(result, str)
         assert result == "raw response text"
 
@@ -309,13 +324,14 @@ class TestCacheGiovanniResponse:
     def test_returns_text_from_cache(self, mock_fetch, tmp_path):
         from met_timeseries.sources.nldas import _cache_giovanni_response
 
-        # Pre-populate cache
-        cache_file = tmp_path / "giovanni" / "35.0625_-83.9375_APCP_201001.txt"
+        # Pre-populate cache (new key format: start_end dates)
+        cache_file = tmp_path / "giovanni" / "35.0625_-83.9375_APCP_20100101_20100131.txt"
         cache_file.parent.mkdir(parents=True)
         cache_file.write_text(self._SAMPLE_TEXT)
 
         result = _cache_giovanni_response(
-            35.0625, -83.9375, "APCP", 2010, 1,
+            35.0625, -83.9375, "APCP",
+            "2010-01-01T00:00:00", "2010-01-31T23:00:00",
             cache_dir=str(tmp_path), _token="tok",
         )
 
@@ -329,13 +345,14 @@ class TestCacheGiovanniResponse:
         mock_fetch.return_value = self._SAMPLE_TEXT
 
         result = _cache_giovanni_response(
-            35.0625, -83.9375, "APCP", 2010, 1,
+            35.0625, -83.9375, "APCP",
+            "2010-01-01T00:00:00", "2010-01-31T23:00:00",
             cache_dir=str(tmp_path), _token="tok",
         )
 
         assert result == self._SAMPLE_TEXT
         mock_fetch.assert_called_once()
-        cache_file = tmp_path / "giovanni" / "35.0625_-83.9375_APCP_201001.txt"
+        cache_file = tmp_path / "giovanni" / "35.0625_-83.9375_APCP_20100101_20100131.txt"
         assert cache_file.exists()
         assert cache_file.read_text() == self._SAMPLE_TEXT
 
@@ -346,7 +363,9 @@ class TestCacheGiovanniResponse:
         mock_fetch.return_value = self._SAMPLE_TEXT
 
         result = _cache_giovanni_response(
-            35.0625, -83.9375, "APCP", 2010, 1, _token="tok",
+            35.0625, -83.9375, "APCP",
+            "2010-01-01T00:00:00", "2010-01-31T23:00:00",
+            _token="tok",
         )
 
         assert result == self._SAMPLE_TEXT
@@ -649,8 +668,8 @@ class TestDownloadDatarods:
     @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
-    def test_no_month_fetches_all_months(self, mock_login, mock_get_token, mock_cache, mock_parse):
-        """When month=None, download_datarods should iterate over all months from year to end_year."""
+    def test_no_month_fetches_yearly_chunks(self, mock_login, mock_get_token, mock_cache, mock_parse):
+        """When month=None, download_datarods should make one request per year (not per month)."""
         mock_get_token.return_value = {"access_token": "tok"}
         mock_cache.return_value = "raw text"
         mock_parse.return_value = self._make_series()
@@ -662,15 +681,15 @@ class TestDownloadDatarods:
         )
 
         n_cells = len(result)
-        # 12 months × n_cells × 1 variable
-        assert mock_cache.call_count == n_cells * 12
+        # 1 year × n_cells × 1 variable (yearly chunking, not monthly)
+        assert mock_cache.call_count == n_cells * 1
 
     @patch("met_timeseries.sources.nldas._parse_giovanni_response")
     @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
     def test_no_month_multi_year(self, mock_login, mock_get_token, mock_cache, mock_parse):
-        """No month with year range 2010-2011 should fetch 24 months."""
+        """No month with year range 2010-2011 should fetch 2 yearly chunks."""
         mock_get_token.return_value = {"access_token": "tok"}
         mock_cache.return_value = "raw text"
         mock_parse.return_value = self._make_series()
@@ -682,18 +701,18 @@ class TestDownloadDatarods:
         )
 
         n_cells = len(result)
-        # 24 months × n_cells × 1 variable
-        assert mock_cache.call_count == n_cells * 24
+        # 2 years × n_cells × 1 variable
+        assert mock_cache.call_count == n_cells * 2
 
     @patch("met_timeseries.sources.nldas.get_nldas_gridcells")
     @patch("met_timeseries.sources.nldas._parse_giovanni_response")
     @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
-    def test_no_month_concatenates_series(
+    def test_no_month_concatenates_yearly_series(
         self, mock_login, mock_get_token, mock_cache, mock_parse, mock_gridcells
     ):
-        """When multiple months are fetched, the series should be concatenated."""
+        """When multiple years are fetched, the series should be concatenated."""
         mock_get_token.return_value = {"access_token": "tok"}
         mock_cache.return_value = "raw text"
 
@@ -704,23 +723,23 @@ class TestDownloadDatarods:
             crs="EPSG:4326",
         )
 
-        # Mock 12 monthly series (1 cell × 1 variable × 12 months for year 2010)
-        all_monthly = [
-            pd.Series([float(m)], index=pd.date_range(f"2010-{m:02d}-01", periods=1, freq="h"))
-            for m in range(1, 13)
+        # Mock 2 yearly series (1 cell × 1 variable × 2 years)
+        yearly_series = [
+            pd.Series([1.0, 2.0], index=pd.date_range("2010-01-01", periods=2, freq="h")),
+            pd.Series([3.0, 4.0], index=pd.date_range("2011-01-01", periods=2, freq="h")),
         ]
-        mock_parse.side_effect = all_monthly
+        mock_parse.side_effect = yearly_series
 
         from met_timeseries.sources.nldas import download_datarods
 
         result = download_datarods(
-            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2010,
+            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2011,
         )
 
         cell_key = (35.0625, -83.9375)
         series = result[cell_key]["APCP"]
-        # Should have 12 data points (one per month)
-        assert len(series) == 12
+        # Should have 4 data points (2 per year × 2 years)
+        assert len(series) == 4
 
     @patch("met_timeseries.sources.nldas._parse_giovanni_response")
     @patch("met_timeseries.sources.nldas._cache_giovanni_response")
@@ -737,9 +756,9 @@ class TestDownloadDatarods:
         # Call with month specified to keep the test simple (single month)
         download_datarods(self._make_bounds(), month=1, variables=["APCP"])
 
-        # The cache calls should use year=1995
+        # The cache calls should use start_date beginning with 1995
         for call in mock_cache.call_args_list:
-            assert call.kwargs["year"] == 1995
+            assert call.kwargs["start_date"].startswith("1995-")
 
 
 class TestComputeWeightedAverages:
