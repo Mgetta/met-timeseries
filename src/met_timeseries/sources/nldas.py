@@ -106,10 +106,11 @@ def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:
 
 def download_datarods(
     bounds: BoundingBox,
-    year: int,
-    month: int,
+    year: int = 1995,
+    month: int | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
+    end_year: int | None = None,
 ) -> dict[tuple[float, float], dict[str, pd.Series]]:
     """Download raw NLDAS-2 per-cell timeseries via Giovanni Time Series API.
 
@@ -123,14 +124,20 @@ def download_datarods(
     bounds:
         Spatial bounding box in EPSG:4326 used to select grid cells.
     year:
-        Calendar year (e.g. 2010).
+        Start calendar year when *month* is ``None``, or the specific
+        calendar year when *month* is given.  Defaults to ``1995``.
     month:
-        Calendar month (1–12).
+        Calendar month (1–12).  When ``None`` (the default), all months
+        between *year* and *end_year* are downloaded and the per-cell
+        series are concatenated.
     variables:
         NLDAS-2 short variable names to fetch. Defaults to
         ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
     cache_dir:
         Optional directory for per-cell CSV cache files.
+    end_year:
+        Last calendar year (inclusive) when downloading multiple months.
+        Ignored when *month* is specified.  Defaults to the current year.
 
     Returns
     -------
@@ -143,6 +150,18 @@ def download_datarods(
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
+    # Build list of (year, month) pairs to fetch
+    if month is not None:
+        year_month_pairs = [(year, month)]
+    else:
+        if end_year is None:
+            end_year = dt.datetime.now().year
+        year_month_pairs = [
+            (y, m)
+            for y in range(year, end_year + 1)
+            for m in range(1, 13)
+        ]
+
     # Determine NLDAS grid cells that fall within the bounding box
     unique_cells = get_nldas_gridcells(bounds)
     
@@ -152,8 +171,8 @@ def download_datarods(
 
     n_cells = len(unique_cells)
     logger.info(
-        "Downloading Giovanni timeseries: %d unique cells × %d variables for %d-%02d",
-        n_cells, len(variables), year, month,
+        "Downloading Giovanni timeseries: %d unique cells × %d variables for %d period(s)",
+        n_cells, len(variables), len(year_month_pairs),
     )
 
     cell_data: dict[tuple[float, float], dict[str, pd.Series]] = {}
@@ -162,13 +181,18 @@ def download_datarods(
         logger.debug("Fetching cell %d/%d: lat=%s lon=%s", i, n_cells, lat, lon)
         cell_data[(lat, lon)] = {}
         for var in variables:
-            text = _cache_giovanni_response(
-                lat=lat, lon=lon, variable=var,
-                year=year, month=month,
-                cache_dir=cache_dir, _token=token,
-            )
-            series = _parse_giovanni_response(text)
-            cell_data[(lat, lon)][var] = series
+            monthly_series: list[pd.Series] = []
+            for y, m in year_month_pairs:
+                text = _cache_giovanni_response(
+                    lat=lat, lon=lon, variable=var,
+                    year=y, month=m,
+                    cache_dir=cache_dir, _token=token,
+                )
+                monthly_series.append(_parse_giovanni_response(text))
+            if len(monthly_series) == 1:
+                cell_data[(lat, lon)][var] = monthly_series[0]
+            else:
+                cell_data[(lat, lon)][var] = pd.concat(monthly_series).sort_index()
 
     return cell_data
 
@@ -231,12 +255,13 @@ def compute_weighted_averages(
 
 def process_nldas(
     bounds: BoundingBox,
-    year: int,
-    month: int,
+    year: int = 1995,
+    month: int | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
     weights: pd.DataFrame | None = None,
     polygon_id_col: str = "metzone_id",
+    end_year: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Download NLDAS-2 data via datarods and compute weighted averages.
 
@@ -251,9 +276,11 @@ def process_nldas(
     bounds:
         Spatial bounding box in EPSG:4326.
     year:
-        Calendar year (e.g. 2010).
+        Start calendar year when *month* is ``None``, or the specific
+        calendar year when *month* is given.  Defaults to ``1995``.
     month:
-        Calendar month (1–12).
+        Calendar month (1–12).  When ``None`` (the default), all months
+        between *year* and *end_year* are downloaded.
     variables:
         NLDAS-2 short variable names to fetch.  Defaults to
         ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
@@ -267,6 +294,9 @@ def process_nldas(
         Column name in *weights* that identifies each polygon.  When
         weights are auto-derived the single polygon is labelled
         ``"bbox"``.
+    end_year:
+        Last calendar year (inclusive) when downloading multiple months.
+        Ignored when *month* is specified.  Defaults to the current year.
 
     Returns
     -------
@@ -283,6 +313,7 @@ def process_nldas(
         month=month,
         variables=variables,
         cache_dir=cache_dir,
+        end_year=end_year,
     )
 
     if weights is None:

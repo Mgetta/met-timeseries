@@ -645,6 +645,110 @@ class TestDownloadDatarods:
         for call in mock_cache.call_args_list:
             assert call.kwargs["cache_dir"] == "/tmp/cache"
 
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_no_month_fetches_all_months(self, mock_login, mock_get_token, mock_cache, mock_parse):
+        """When month=None, download_datarods should iterate over all months from year to end_year."""
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_cache.return_value = "raw text"
+        mock_parse.return_value = self._make_series()
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        result = download_datarods(
+            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2010,
+        )
+
+        n_cells = len(result)
+        # 12 months × n_cells × 1 variable
+        assert mock_cache.call_count == n_cells * 12
+
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_no_month_multi_year(self, mock_login, mock_get_token, mock_cache, mock_parse):
+        """No month with year range 2010-2011 should fetch 24 months."""
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_cache.return_value = "raw text"
+        mock_parse.return_value = self._make_series()
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        result = download_datarods(
+            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2011,
+        )
+
+        n_cells = len(result)
+        # 24 months × n_cells × 1 variable
+        assert mock_cache.call_count == n_cells * 24
+
+    @patch("met_timeseries.sources.nldas.get_nldas_gridcells")
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_no_month_concatenates_series(
+        self, mock_login, mock_get_token, mock_cache, mock_parse, mock_gridcells
+    ):
+        """When multiple months are fetched, the series should be concatenated."""
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_cache.return_value = "raw text"
+
+        # Mock a single grid cell
+        mock_gridcells.return_value = gpd.GeoDataFrame(
+            {"lat_center": [35.0625], "lon_center": [-83.9375],
+             "geometry": [box(-84.0, 35.0, -83.875, 35.125)]},
+            crs="EPSG:4326",
+        )
+
+        jan_series = pd.Series(
+            [1.0, 2.0], index=pd.date_range("2010-01-01", periods=2, freq="h"),
+        )
+        feb_series = pd.Series(
+            [3.0, 4.0], index=pd.date_range("2010-02-01", periods=2, freq="h"),
+        )
+        # 1 cell × 1 variable × 2 months (use end_year same as start to limit months)
+        # We need exactly 2 parse calls: Jan + Feb
+        # But end_year=2010 means 12 months. Let's use a custom pair: mock all 12 monthly series
+        all_monthly = [
+            pd.Series([float(m)], index=pd.date_range(f"2010-{m:02d}-01", periods=1, freq="h"))
+            for m in range(1, 13)
+        ]
+        mock_parse.side_effect = all_monthly
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        result = download_datarods(
+            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2010,
+        )
+
+        cell_key = (35.0625, -83.9375)
+        series = result[cell_key]["APCP"]
+        # Should have 12 data points (one per month)
+        assert len(series) == 12
+
+    @patch("met_timeseries.sources.nldas._parse_giovanni_response")
+    @patch("met_timeseries.sources.nldas._cache_giovanni_response")
+    @patch("earthaccess.get_edl_token")
+    @patch("earthaccess.login")
+    def test_default_year_is_1995(self, mock_login, mock_get_token, mock_cache, mock_parse):
+        """When no year is provided, default should be 1995."""
+        mock_get_token.return_value = {"access_token": "tok"}
+        mock_cache.return_value = "raw text"
+        mock_parse.return_value = self._make_series()
+
+        from met_timeseries.sources.nldas import download_datarods
+
+        # Call with month specified to keep the test simple (single month)
+        download_datarods(self._make_bounds(), month=1, variables=["APCP"])
+
+        # The cache calls should use year=1995
+        for call in mock_cache.call_args_list:
+            assert call.kwargs["year"] == 1995
+
 
 class TestComputeWeightedAverages:
     """Verify compute_weighted_averages spatial aggregation."""
