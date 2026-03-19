@@ -106,10 +106,11 @@ def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:
 
 def download_datarods(
     bounds: BoundingBox,
-    year: int,
-    month: int,
+    year: int = 1995,
+    month: int | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
+    end_year: int | None = None,
 ) -> dict[tuple[float, float], dict[str, pd.Series]]:
     """Download raw NLDAS-2 per-cell timeseries via Giovanni Time Series API.
 
@@ -118,19 +119,29 @@ def download_datarods(
     once, then fetches hourly timeseries for each cell.  Raw per-cell data
     is optionally cached as CSV files.
 
+    When *month* is ``None`` the data is requested in yearly chunks
+    (one API call per year) rather than monthly, which greatly reduces
+    the total number of HTTP requests.
+
     Parameters
     ----------
     bounds:
         Spatial bounding box in EPSG:4326 used to select grid cells.
     year:
-        Calendar year (e.g. 2010).
+        Start calendar year when *month* is ``None``, or the specific
+        calendar year when *month* is given.  Defaults to ``1995``.
     month:
-        Calendar month (1–12).
+        Calendar month (1–12).  When ``None`` (the default), full years
+        between *year* and *end_year* are downloaded (one request per
+        year) and the per-cell series are concatenated.
     variables:
         NLDAS-2 short variable names to fetch. Defaults to
         ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
     cache_dir:
         Optional directory for per-cell CSV cache files.
+    end_year:
+        Last calendar year (inclusive) when downloading multiple months.
+        Ignored when *month* is specified.  Defaults to the current year.
 
     Returns
     -------
@@ -143,6 +154,23 @@ def download_datarods(
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
+    # Build list of (start_date, end_date) pairs to fetch.
+    # When a single month is specified we make one request for that month;
+    # otherwise we request full years to minimise API calls.
+    if month is not None:
+        _, n_days = calendar.monthrange(year, month)
+        date_ranges = [
+            (f"{year}-{month:02d}-01T00:00:00",
+             f"{year}-{month:02d}-{n_days:02d}T23:00:00"),
+        ]
+    else:
+        if end_year is None:
+            end_year = dt.datetime.now().year
+        date_ranges = [
+            (f"{y}-01-01T00:00:00", f"{y}-12-31T23:00:00")
+            for y in range(year, end_year + 1)
+        ]
+
     # Determine NLDAS grid cells that fall within the bounding box
     unique_cells = get_nldas_gridcells(bounds)
     
@@ -152,8 +180,8 @@ def download_datarods(
 
     n_cells = len(unique_cells)
     logger.info(
-        "Downloading Giovanni timeseries: %d unique cells × %d variables for %d-%02d",
-        n_cells, len(variables), year, month,
+        "Downloading Giovanni timeseries: %d unique cells × %d variables for %d period(s)",
+        n_cells, len(variables), len(date_ranges),
     )
 
     cell_data: dict[tuple[float, float], dict[str, pd.Series]] = {}
@@ -162,13 +190,18 @@ def download_datarods(
         logger.debug("Fetching cell %d/%d: lat=%s lon=%s", i, n_cells, lat, lon)
         cell_data[(lat, lon)] = {}
         for var in variables:
-            text = _cache_giovanni_response(
-                lat=lat, lon=lon, variable=var,
-                year=year, month=month,
-                cache_dir=cache_dir, _token=token,
-            )
-            series = _parse_giovanni_response(text)
-            cell_data[(lat, lon)][var] = series
+            chunk_series: list[pd.Series] = []
+            for start_date, end_date in date_ranges:
+                text = _cache_giovanni_response(
+                    lat=lat, lon=lon, variable=var,
+                    start_date=start_date, end_date=end_date,
+                    cache_dir=cache_dir, _token=token,
+                )
+                chunk_series.append(_parse_giovanni_response(text))
+            if len(chunk_series) == 1:
+                cell_data[(lat, lon)][var] = chunk_series[0]
+            else:
+                cell_data[(lat, lon)][var] = pd.concat(chunk_series).sort_index()
 
     return cell_data
 
@@ -231,12 +264,13 @@ def compute_weighted_averages(
 
 def process_nldas(
     bounds: BoundingBox,
-    year: int,
-    month: int,
+    year: int = 1995,
+    month: int | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
     weights: pd.DataFrame | None = None,
     polygon_id_col: str = "metzone_id",
+    end_year: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Download NLDAS-2 data via datarods and compute weighted averages.
 
@@ -251,9 +285,11 @@ def process_nldas(
     bounds:
         Spatial bounding box in EPSG:4326.
     year:
-        Calendar year (e.g. 2010).
+        Start calendar year when *month* is ``None``, or the specific
+        calendar year when *month* is given.  Defaults to ``1995``.
     month:
-        Calendar month (1–12).
+        Calendar month (1–12).  When ``None`` (the default), all months
+        between *year* and *end_year* are downloaded.
     variables:
         NLDAS-2 short variable names to fetch.  Defaults to
         ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
@@ -267,6 +303,9 @@ def process_nldas(
         Column name in *weights* that identifies each polygon.  When
         weights are auto-derived the single polygon is labelled
         ``"bbox"``.
+    end_year:
+        Last calendar year (inclusive) when downloading multiple months.
+        Ignored when *month* is specified.  Defaults to the current year.
 
     Returns
     -------
@@ -283,6 +322,7 @@ def process_nldas(
         month=month,
         variables=variables,
         cache_dir=cache_dir,
+        end_year=end_year,
     )
 
     if weights is None:
@@ -590,8 +630,8 @@ def _fetch_giovanni_cell(
     lat: float,
     lon: float,
     variable: str,
-    year: int,
-    month: int,
+    start_date: str,
+    end_date: str,
     max_retries: int = 3,
     _token: str | None = None,
 ) -> str:
@@ -606,8 +646,10 @@ def _fetch_giovanni_cell(
         Grid cell center coordinates (EPSG:4326).
     variable:
         Short variable name (e.g. ``"APCP"``).
-    year, month:
-        Temporal period.
+    start_date:
+        Start of the temporal range (e.g. ``"2010-01-01T00:00:00"``).
+    end_date:
+        End of the temporal range (e.g. ``"2010-12-31T23:00:00"``).
     max_retries:
         Number of retry attempts with exponential back-off on 429/5xx.
     _token:
@@ -633,14 +675,10 @@ def _fetch_giovanni_cell(
         earthaccess.login()
         _token = earthaccess.get_edl_token()["access_token"]
 
-    _, n_days = calendar.monthrange(year, month)
-    time_start = f"{year}-{month:02d}-01T00:00:00"
-    time_end = f"{year}-{month:02d}-{n_days:02d}T23:00:00"
-
     params = {
         "data": _GIOVANNI_VARIABLES[variable],
         "location": f"[{lat},{lon}]",
-        "time": f"{time_start}/{time_end}",
+        "time": f"{start_date}/{end_date}",
     }
     headers = {"Authorization": f"Bearer {_token}"}
 
@@ -682,8 +720,8 @@ def _cache_giovanni_response(
     lat: float,
     lon: float,
     variable: str,
-    year: int,
-    month: int,
+    start_date: str,
+    end_date: str,
     cache_dir: str | None = None,
     max_retries: int = 3,
     _token: str | None = None,
@@ -691,9 +729,10 @@ def _cache_giovanni_response(
     """Return raw Giovanni response text, using a file cache when available.
 
     If *cache_dir* is provided and a cached file exists for the requested
-    cell/variable/month combination, the cached text is returned without
-    making an HTTP request.  Otherwise :func:`_fetch_giovanni_cell` is
-    called and the response is written to the cache before being returned.
+    cell/variable/date-range combination, the cached text is returned
+    without making an HTTP request.  Otherwise :func:`_fetch_giovanni_cell`
+    is called and the response is written to the cache before being
+    returned.
 
     Parameters
     ----------
@@ -701,8 +740,8 @@ def _cache_giovanni_response(
         Grid cell center coordinates (EPSG:4326).
     variable:
         Short variable name (e.g. ``"APCP"``).
-    year, month:
-        Temporal period.
+    start_date, end_date:
+        Temporal range strings (e.g. ``"2010-01-01T00:00:00"``).
     cache_dir:
         Optional directory for per-cell text cache files.
     max_retries:
@@ -715,17 +754,19 @@ def _cache_giovanni_response(
     str
         Raw CSV response text (from cache or freshly fetched).
     """
+    # Build a short cache key from the date range (strip time portion)
+    start_tag = start_date[:10].replace("-", "")
+    end_tag = end_date[:10].replace("-", "")
+    cache_key = f"{lat}_{lon}_{variable}_{start_tag}_{end_tag}.txt"
+
     if cache_dir is not None:
-        cache_path = (
-            Path(cache_dir) / "giovanni"
-            / f"{lat}_{lon}_{variable}_{year}{month:02d}.txt"
-        )
+        cache_path = Path(cache_dir) / "giovanni" / cache_key
         if cache_path.exists():
             return cache_path.read_text()
 
     text = _fetch_giovanni_cell(
         lat=lat, lon=lon, variable=variable,
-        year=year, month=month,
+        start_date=start_date, end_date=end_date,
         max_retries=max_retries, _token=_token,
     )
 
