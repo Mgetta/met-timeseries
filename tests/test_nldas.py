@@ -704,15 +704,7 @@ class TestDownloadDatarods:
             crs="EPSG:4326",
         )
 
-        jan_series = pd.Series(
-            [1.0, 2.0], index=pd.date_range("2010-01-01", periods=2, freq="h"),
-        )
-        feb_series = pd.Series(
-            [3.0, 4.0], index=pd.date_range("2010-02-01", periods=2, freq="h"),
-        )
-        # 1 cell × 1 variable × 2 months (use end_year same as start to limit months)
-        # We need exactly 2 parse calls: Jan + Feb
-        # But end_year=2010 means 12 months. Let's use a custom pair: mock all 12 monthly series
+        # Mock 12 monthly series (1 cell × 1 variable × 12 months for year 2010)
         all_monthly = [
             pd.Series([float(m)], index=pd.date_range(f"2010-{m:02d}-01", periods=1, freq="h"))
             for m in range(1, 13)
