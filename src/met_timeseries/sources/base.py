@@ -44,7 +44,7 @@ class FetchFunction(Protocol):
     def __call__(
         self,
         bounds: BoundingBox,
-        year: int,
-        month: int | None = None,
+        start: str,
+        end: str | None = None,
         **kwargs: object,
     ) -> xr.Dataset: ...

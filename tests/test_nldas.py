@@ -67,7 +67,7 @@ class TestFetchNldasGridCallsEarthaccess:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, 1)
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31")
 
         mock_login.assert_called_once()
 
@@ -84,7 +84,7 @@ class TestFetchNldasGridCallsEarthaccess:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, 1)
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31")
 
         mock_search.assert_called_once_with(
             short_name="NLDAS_FORA0125_H",
@@ -107,7 +107,7 @@ class TestFetchNldasGridCallsEarthaccess:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, 1)
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31")
 
         mock_open.assert_called_once_with(granules)
 
@@ -119,7 +119,7 @@ class TestFetchNldasGridCallsEarthaccess:
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
         with pytest.raises(RuntimeError, match="No NLDAS-2 granules found"):
-            fetch_nldas_grid(bounds, 2010, 1)
+            fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31")
 
     @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
@@ -135,7 +135,7 @@ class TestFetchNldasGridCallsEarthaccess:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        result = fetch_nldas_grid(bounds, 2010, 1, variables=["APCP", "TMP"])
+        result = fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", variables=["APCP", "TMP"])
 
         assert "APCP" in result
         assert "TMP" in result
@@ -154,7 +154,7 @@ class TestFetchNldasGridCallsEarthaccess:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        result = fetch_nldas_grid(bounds, 2010, 1, variables=["APCP"])
+        result = fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", variables=["APCP"])
 
         assert "time" in result.dims
         assert "lat" in result.dims
@@ -177,7 +177,7 @@ class TestCachingMechanism:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, 1, cache_dir=str(tmp_path))
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", cache_dir=str(tmp_path))
 
         cache_file = tmp_path / "nldas" / "2010" / "20100101.nc"
         assert cache_file.exists()
@@ -193,7 +193,7 @@ class TestCachingMechanism:
         with patch("earthaccess.login") as mock_login:
             from met_timeseries.sources.nldas import fetch_nldas_grid
 
-            result = fetch_nldas_grid(bounds, 2010, 1, cache_dir=str(tmp_path))
+            result = fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", cache_dir=str(tmp_path))
 
         # earthaccess.login must NOT be called when loading from cache
         mock_login.assert_not_called()
@@ -220,7 +220,7 @@ class TestCachingMechanism:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, 1, cache_dir=str(tmp_path))
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", cache_dir=str(tmp_path))
 
         # Since some days are uncached, login and search must be called
         mock_login.assert_called_once()
@@ -240,7 +240,7 @@ class TestCachingMechanism:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, 1, cache_dir=str(tmp_path))
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", cache_dir=str(tmp_path))
 
         year_dir = tmp_path / "nldas" / "2010"
         assert year_dir.is_dir()
@@ -277,7 +277,7 @@ class TestSearchNldasGranules:
 
         from met_timeseries.sources.nldas import _search_nldas_granules
 
-        _search_nldas_granules(bounds, 2010, 1)
+        _search_nldas_granules(bounds, "2010-01-01", "2010-01-31")
 
         mock_search.assert_called_once_with(
             short_name="NLDAS_FORA0125_H",
@@ -293,7 +293,7 @@ class TestSearchNldasGranules:
         from met_timeseries.sources.nldas import _search_nldas_granules
 
         with pytest.raises(RuntimeError, match="No NLDAS-2 granules found"):
-            _search_nldas_granules(bounds, 2010, 1)
+            _search_nldas_granules(bounds, "2010-01-01", "2010-01-31")
 
     @patch("earthaccess.search_data")
     def test_returns_results(self, mock_search, bounds):
@@ -302,7 +302,7 @@ class TestSearchNldasGranules:
 
         from met_timeseries.sources.nldas import _search_nldas_granules
 
-        result = _search_nldas_granules(bounds, 2010, 1)
+        result = _search_nldas_granules(bounds, "2010-01-01", "2010-01-31")
 
         assert result is granules
 
@@ -327,7 +327,7 @@ class TestSearchNldasGranules:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, month=None, end_year=2010)
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-12-31")
 
         assert mock_search.call_count == 12
 
@@ -348,7 +348,7 @@ class TestSearchNldasGranules:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        result = fetch_nldas_grid(bounds, 2010, month=None, end_year=2011)
+        result = fetch_nldas_grid(bounds, start="2010-01-01", end="2011-12-31")
 
         assert mock_search.call_count == 24
         assert len(result["time"]) == 24
@@ -357,26 +357,24 @@ class TestSearchNldasGranules:
     @patch("earthaccess.open")
     @patch("earthaccess.search_data")
     @patch("earthaccess.login")
-    def test_fetch_grid_end_year_defaults_to_current(
+    def test_fetch_grid_single_day(
         self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
-        """When end_year=None and month=None, range extends to the current year."""
-        current_year = datetime.datetime.now().year
-        expected_months = (current_year - 2010 + 1) * 12
-
+        """When end is None, only the single day given by start is fetched."""
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_subset.side_effect = [
-            _make_single_granule_dataset(f"{y}-{m:02d}-01T00:00:00")
-            for y in range(2010, current_year + 1)
-            for m in range(1, 13)
-        ]
+        mock_subset.return_value = _make_single_granule_dataset("2010-01-15T00:00:00")
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, month=None, end_year=None)
+        fetch_nldas_grid(bounds, start="2010-01-15")
 
-        assert mock_search.call_count == expected_months
+        mock_search.assert_called_once_with(
+            short_name="NLDAS_FORA0125_H",
+            version="2.0",
+            temporal=("2010-01-15", "2010-01-15"),
+            bounding_box=(-110.0, 45.0, -109.0, 46.0),
+        )
 
     @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
@@ -385,14 +383,14 @@ class TestSearchNldasGranules:
     def test_fetch_grid_single_month_backward_compatible(
         self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
-        """Calling with month=1 still results in a single search_data call."""
+        """Specifying a full month via start/end results in a single search_data call."""
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
         mock_subset.return_value = _make_single_granule_dataset()
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        result = fetch_nldas_grid(bounds, 2010, month=1)
+        result = fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31")
 
         mock_search.assert_called_once()
         assert len(result["time"]) == 1
@@ -419,12 +417,61 @@ class TestSearchNldasGranules:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, 2010, month=None, end_year=2010,
+        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-12-31",
                          cache_dir=str(tmp_path),
                          variables=["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"])
 
         # search_data should have been called for each non-cached month (months 2-12)
         assert mock_search.call_count == 11
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_partial_month_range(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """Partial-month range clips the search to the requested days."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.return_value = _make_single_granule_dataset("2010-01-15T00:00:00")
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(bounds, start="2010-01-15", end="2010-01-20")
+
+        # Should search for exactly the requested range, not the full month
+        mock_search.assert_called_once_with(
+            short_name="NLDAS_FORA0125_H",
+            version="2.0",
+            temporal=("2010-01-15", "2010-01-20"),
+            bounding_box=(-110.0, 45.0, -109.0, 46.0),
+        )
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_cross_month_range(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """Cross-month range triggers two searches with clipped boundary dates."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.side_effect = [
+            _make_single_granule_dataset("2010-01-15T00:00:00"),
+            _make_single_granule_dataset("2010-02-01T00:00:00"),
+        ]
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(bounds, start="2010-01-15", end="2010-02-15")
+
+        # Should search January 15–31 and February 1–15
+        assert mock_search.call_count == 2
+        calls = mock_search.call_args_list
+        assert calls[0].kwargs["temporal"] == ("2010-01-15", "2010-01-31")
+        assert calls[1].kwargs["temporal"] == ("2010-02-01", "2010-02-15")
 
 
 class TestConcurrentDownloads:
@@ -454,7 +501,7 @@ class TestConcurrentDownloads:
         with patch("met_timeseries.sources.nldas.concurrent.futures.as_completed",
                    return_value=[mock_future]):
             from met_timeseries.sources.nldas import fetch_nldas_grid
-            fetch_nldas_grid(bounds, 2010, 1)
+            fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31")
 
         mock_executor_cls.assert_called_once()
 
@@ -481,7 +528,7 @@ class TestConcurrentDownloads:
         with patch("met_timeseries.sources.nldas.concurrent.futures.as_completed",
                    return_value=[mock_future]):
             from met_timeseries.sources.nldas import fetch_nldas_grid
-            fetch_nldas_grid(bounds, 2010, 1, max_connections=4)
+            fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", max_connections=4)
 
         mock_executor_cls.assert_called_once_with(max_workers=4)
 
@@ -508,7 +555,7 @@ class TestConcurrentDownloads:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        result = fetch_nldas_grid(bounds, 2010, 1, variables=["APCP"])
+        result = fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31", variables=["APCP"])
 
         # lat/lon should only span the bounds, not the full grid
         assert result["lat"].values.min() >= bounds.south
@@ -561,7 +608,7 @@ class TestConcurrentDownloads:
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        result = fetch_nldas_grid(bounds, 2010, 1)
+        result = fetch_nldas_grid(bounds, start="2010-01-01", end="2010-01-31")
 
         # Should succeed and only contain the good granule's data
         assert "time" in result.dims
@@ -780,7 +827,7 @@ class TestProcessNldas:
 
         bounds = BoundingBox(west=-84.0, east=-83.875, south=35.0, north=35.125)
         result = process_nldas(
-            bounds, 2010, 1, variables=["APCP"], weights=self._make_weights(),
+            bounds, start="2010-01-01", end="2010-01-31", variables=["APCP"], weights=self._make_weights(),
         )
 
         assert isinstance(result, dict)
@@ -799,7 +846,7 @@ class TestProcessNldas:
 
         bounds = BoundingBox(west=-84.0, east=-83.875, south=35.0, north=35.125)
         process_nldas(
-            bounds, 2010, 1, variables=["APCP"], weights=self._make_weights(),
+            bounds, start="2010-01-01", end="2010-01-31", variables=["APCP"], weights=self._make_weights(),
         )
 
         mock_download.assert_called_once()
@@ -825,7 +872,7 @@ class TestProcessNldas:
         })
 
         bounds = BoundingBox(west=-84.0, east=-83.875, south=35.0, north=35.125)
-        result = process_nldas(bounds, 2010, 1, variables=["APCP"])
+        result = process_nldas(bounds, start="2010-01-01", end="2010-01-31", variables=["APCP"])
         assert "APCP" in result
         mock_weights.assert_called_once()
 
@@ -846,7 +893,7 @@ class TestProcessNldas:
             "lon_center": [-83.9375],
             "weight": [1.0],
         })
-        result = process_nldas(bounds, 2010, 1, variables=["APCP"], weights=weights)
+        result = process_nldas(bounds, start="2010-01-01", end="2010-01-31", variables=["APCP"], weights=weights)
         assert "APCP" in result
         # With weight=1.0 on the single cell, values should match raw data
         pd.testing.assert_series_equal(
@@ -986,7 +1033,7 @@ class TestDownloadDatarods:
 
         from met_timeseries.sources.nldas import download_datarods
 
-        result = download_datarods(self._make_bounds(), 2010, 1, variables=["APCP"])
+        result = download_datarods(self._make_bounds(), start="2010-01-01", end="2010-01-31", variables=["APCP"])
 
         assert isinstance(result, dict)
         for key, val in result.items():
@@ -1006,7 +1053,7 @@ class TestDownloadDatarods:
 
         from met_timeseries.sources.nldas import download_datarods
 
-        download_datarods(self._make_bounds(), 2010, 1, variables=["APCP", "TMP"])
+        download_datarods(self._make_bounds(), start="2010-01-01", end="2010-01-31", variables=["APCP", "TMP"])
 
         mock_login.assert_called_once()
         mock_get_token.assert_called_once()
@@ -1025,7 +1072,7 @@ class TestDownloadDatarods:
         from met_timeseries.sources.nldas import download_datarods
 
         variables = ["APCP", "TMP"]
-        result = download_datarods(self._make_bounds(), 2010, 1, variables=variables)
+        result = download_datarods(self._make_bounds(), start="2010-01-01", end="2010-01-31", variables=variables)
 
         n_cells = len(result)
         # Each cell should have all requested variables
@@ -1043,7 +1090,7 @@ class TestDownloadDatarods:
         from met_timeseries.sources.nldas import download_datarods
 
         download_datarods(
-            self._make_bounds(), 2010, 1, variables=["APCP"], cache_dir="/tmp/cache"
+            self._make_bounds(), start="2010-01-01", end="2010-01-31", variables=["APCP"], cache_dir="/tmp/cache"
         )
 
         for call in mock_cache.call_args_list:
@@ -1054,7 +1101,7 @@ class TestDownloadDatarods:
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
     def test_no_month_fetches_yearly_chunks(self, mock_login, mock_get_token, mock_cache, mock_parse):
-        """When month=None, download_datarods should make one request per year (not per month)."""
+        """A date range within one year makes one request (one yearly chunk)."""
         mock_get_token.return_value = {"access_token": "tok"}
         mock_cache.return_value = "raw text"
         mock_parse.return_value = self._make_series()
@@ -1062,7 +1109,7 @@ class TestDownloadDatarods:
         from met_timeseries.sources.nldas import download_datarods
 
         result = download_datarods(
-            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2010,
+            self._make_bounds(), start="2010-01-01", end="2010-12-31", variables=["APCP"],
         )
 
         n_cells = len(result)
@@ -1074,7 +1121,7 @@ class TestDownloadDatarods:
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
     def test_no_month_multi_year(self, mock_login, mock_get_token, mock_cache, mock_parse):
-        """No month with year range 2010-2011 should fetch 2 yearly chunks."""
+        """A date range spanning 2010-2011 should fetch 2 yearly chunks."""
         mock_get_token.return_value = {"access_token": "tok"}
         mock_cache.return_value = "raw text"
         mock_parse.return_value = self._make_series()
@@ -1082,7 +1129,7 @@ class TestDownloadDatarods:
         from met_timeseries.sources.nldas import download_datarods
 
         result = download_datarods(
-            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2011,
+            self._make_bounds(), start="2010-01-01", end="2011-12-31", variables=["APCP"],
         )
 
         n_cells = len(result)
@@ -1118,7 +1165,7 @@ class TestDownloadDatarods:
         from met_timeseries.sources.nldas import download_datarods
 
         result = download_datarods(
-            self._make_bounds(), year=2010, month=None, variables=["APCP"], end_year=2011,
+            self._make_bounds(), start="2010-01-01", end="2011-12-31", variables=["APCP"],
         )
 
         cell_key = (35.0625, -83.9375)
@@ -1130,20 +1177,20 @@ class TestDownloadDatarods:
     @patch("met_timeseries.sources.nldas._cache_giovanni_response")
     @patch("earthaccess.get_edl_token")
     @patch("earthaccess.login")
-    def test_default_year_is_1995(self, mock_login, mock_get_token, mock_cache, mock_parse):
-        """When no year is provided, default should be 1995."""
+    def test_default_start_is_1995(self, mock_login, mock_get_token, mock_cache, mock_parse):
+        """When no start is provided, default should be 1995-01-01."""
         mock_get_token.return_value = {"access_token": "tok"}
         mock_cache.return_value = "raw text"
         mock_parse.return_value = self._make_series()
 
         from met_timeseries.sources.nldas import download_datarods
 
-        # Call with month specified to keep the test simple (single month)
-        download_datarods(self._make_bounds(), month=1, variables=["APCP"])
+        # Call with defaults — start="1995-01-01", end=None (single day)
+        download_datarods(self._make_bounds(), variables=["APCP"])
 
-        # The cache calls should use start_date beginning with 1995
+        # The cache calls should use start_date of exactly 1995-01-01
         for call in mock_cache.call_args_list:
-            assert call.kwargs["start_date"].startswith("1995-")
+            assert call.kwargs["start_date"] == "1995-01-01T00:00:00"
 
 
 class TestComputeWeightedAverages:

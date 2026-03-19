@@ -107,11 +107,10 @@ def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:
 
 def download_datarods(
     bounds: BoundingBox,
-    year: int = 1995,
-    month: int | None = None,
+    start: str = "1995-01-01",
+    end: str | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
-    end_year: int | None = None,
 ) -> dict[tuple[float, float], dict[str, pd.Series]]:
     """Download raw NLDAS-2 per-cell timeseries via Giovanni Time Series API.
 
@@ -120,29 +119,23 @@ def download_datarods(
     once, then fetches hourly timeseries for each cell.  Raw per-cell data
     is optionally cached as CSV files.
 
-    When *month* is ``None`` the data is requested in yearly chunks
-    (one API call per year) rather than monthly, which greatly reduces
+    Data is requested in yearly chunks (one API call per year) to minimise
     the total number of HTTP requests.
 
     Parameters
     ----------
     bounds:
         Spatial bounding box in EPSG:4326 used to select grid cells.
-    year:
-        Start calendar year when *month* is ``None``, or the specific
-        calendar year when *month* is given.  Defaults to ``1995``.
-    month:
-        Calendar month (1–12).  When ``None`` (the default), full years
-        between *year* and *end_year* are downloaded (one request per
-        year) and the per-cell series are concatenated.
+    start:
+        Start date in ``"YYYY-MM-DD"`` format.  Defaults to ``"1995-01-01"``.
+    end:
+        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
+        (the default), only the single day given by *start* is fetched.
     variables:
         NLDAS-2 short variable names to fetch. Defaults to
         ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
     cache_dir:
         Optional directory for per-cell CSV cache files.
-    end_year:
-        Last calendar year (inclusive) when downloading multiple months.
-        Ignored when *month* is specified.  Defaults to the current year.
 
     Returns
     -------
@@ -155,22 +148,24 @@ def download_datarods(
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
-    # Build list of (start_date, end_date) pairs to fetch.
-    # When a single month is specified we make one request for that month;
-    # otherwise we request full years to minimise API calls.
-    if month is not None:
-        _, n_days = calendar.monthrange(year, month)
-        date_ranges = [
-            (f"{year}-{month:02d}-01T00:00:00",
-             f"{year}-{month:02d}-{n_days:02d}T23:00:00"),
-        ]
-    else:
-        if end_year is None:
-            end_year = dt.datetime.now().year
-        date_ranges = [
-            (f"{y}-01-01T00:00:00", f"{y}-12-31T23:00:00")
-            for y in range(year, end_year + 1)
-        ]
+    start_date = dt.date.fromisoformat(start)
+    end_date = dt.date.fromisoformat(end) if end is not None else start_date
+
+    if end_date < start_date:
+        raise ValueError(
+            f"end ({end!r}) must not be before start ({start!r})"
+        )
+
+    # Build list of (start_date, end_date) pairs in yearly chunks to minimise
+    # the total number of API calls.
+    date_ranges: list[tuple[str, str]] = []
+    for y in range(start_date.year, end_date.year + 1):
+        chunk_start = start_date if y == start_date.year else dt.date(y, 1, 1)
+        chunk_end = end_date if y == end_date.year else dt.date(y, 12, 31)
+        date_ranges.append(
+            (f"{chunk_start.isoformat()}T00:00:00",
+             f"{chunk_end.isoformat()}T23:00:00"),
+        )
 
     # Determine NLDAS grid cells that fall within the bounding box
     unique_cells = get_nldas_gridcells(bounds)
@@ -265,13 +260,12 @@ def compute_weighted_averages(
 
 def process_nldas(
     bounds: BoundingBox,
-    year: int = 1995,
-    month: int | None = None,
+    start: str = "1995-01-01",
+    end: str | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
     weights: pd.DataFrame | None = None,
     polygon_id_col: str = "metzone_id",
-    end_year: int | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Download NLDAS-2 data via datarods and compute weighted averages.
 
@@ -285,12 +279,11 @@ def process_nldas(
     ----------
     bounds:
         Spatial bounding box in EPSG:4326.
-    year:
-        Start calendar year when *month* is ``None``, or the specific
-        calendar year when *month* is given.  Defaults to ``1995``.
-    month:
-        Calendar month (1–12).  When ``None`` (the default), all months
-        between *year* and *end_year* are downloaded.
+    start:
+        Start date in ``"YYYY-MM-DD"`` format.  Defaults to ``"1995-01-01"``.
+    end:
+        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
+        (the default), only the single day given by *start* is fetched.
     variables:
         NLDAS-2 short variable names to fetch.  Defaults to
         ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
@@ -304,9 +297,6 @@ def process_nldas(
         Column name in *weights* that identifies each polygon.  When
         weights are auto-derived the single polygon is labelled
         ``"bbox"``.
-    end_year:
-        Last calendar year (inclusive) when downloading multiple months.
-        Ignored when *month* is specified.  Defaults to the current year.
 
     Returns
     -------
@@ -319,11 +309,10 @@ def process_nldas(
 
     cell_data = download_datarods(
         bounds=bounds,
-        year=year,
-        month=month,
+        start=start,
+        end=end,
         variables=variables,
         cache_dir=cache_dir,
-        end_year=end_year,
     )
 
     if weights is None:
@@ -379,19 +368,19 @@ def _open_and_subset_granule(
 
 def _search_nldas_granules(
     bounds: BoundingBox,
-    year: int,
-    month: int,
+    start_date: str,
+    end_date: str,
 ) -> list:
-    """Search for NLDAS-2 granules for a given month via CMR.
+    """Search for NLDAS-2 granules for a given date range via CMR.
 
     Parameters
     ----------
     bounds:
         Spatial bounding box in EPSG:4326.
-    year:
-        Calendar year.
-    month:
-        Calendar month (1–12).
+    start_date:
+        Start of the temporal range in ``"YYYY-MM-DD"`` format.
+    end_date:
+        End of the temporal range in ``"YYYY-MM-DD"`` format (inclusive).
 
     Returns
     -------
@@ -405,45 +394,45 @@ def _search_nldas_granules(
     """
     import earthaccess
 
-    _, n_days = calendar.monthrange(year, month)
-    start = f"{year}-{month:02d}-01"
-    end = f"{year}-{month:02d}-{n_days:02d}"
-
     results = earthaccess.search_data(
         short_name="NLDAS_FORA0125_H",
         version="2.0",
-        temporal=(start, end),
+        temporal=(start_date, end_date),
         bounding_box=(bounds.west, bounds.south, bounds.east, bounds.north),
     )
 
     if not results:
-        raise RuntimeError(f"No NLDAS-2 granules found for {year}-{month:02d}")
+        raise RuntimeError(
+            f"No NLDAS-2 granules found for {start_date} to {end_date}"
+        )
 
-    logger.debug("Found %d NLDAS-2 granules for %d-%02d", len(results), year, month)
+    logger.debug(
+        "Found %d NLDAS-2 granules for %s to %s", len(results), start_date, end_date
+    )
     return results
 
 
-def _fetch_month_granules(
+def _fetch_date_range_granules(
     bounds: BoundingBox,
-    year: int,
-    month: int,
+    start_date: str,
+    end_date: str,
     variables: list[str],
     max_connections: int,
 ) -> xr.Dataset:
-    """Download and subset all granules for a single month, returning a Dataset.
+    """Download and subset all granules for a date range, returning a Dataset.
 
     Opens granules concurrently using :class:`concurrent.futures.ThreadPoolExecutor`.
     Failed granules are skipped with a warning; a :exc:`RuntimeError` is raised
-    only when *all* granules for the month fail.
+    only when *all* granules for the range fail.
 
     Parameters
     ----------
     bounds:
         Spatial bounding box in EPSG:4326.
-    year:
-        Calendar year.
-    month:
-        Calendar month (1–12).
+    start_date:
+        Start of the temporal range in ``"YYYY-MM-DD"`` format.
+    end_date:
+        End of the temporal range in ``"YYYY-MM-DD"`` format (inclusive).
     variables:
         Variable names to include.
     max_connections:
@@ -452,11 +441,11 @@ def _fetch_month_granules(
     Returns
     -------
     xarray.Dataset
-        Monthly Dataset concatenated along the ``time`` dimension.
+        Dataset concatenated along the ``time`` dimension.
     """
     import earthaccess
 
-    results = _search_nldas_granules(bounds, year, month)
+    results = _search_nldas_granules(bounds, start_date, end_date)
 
     file_objs = earthaccess.open(results)
 
@@ -472,13 +461,13 @@ def _fetch_month_granules(
                 granule_datasets.append(future.result())
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "Skipping granule %d for %d-%02d due to error: %s",
-                    idx, year, month, exc,
+                    "Skipping granule %d for %s to %s due to error: %s",
+                    idx, start_date, end_date, exc,
                 )
 
     if not granule_datasets:
         raise RuntimeError(
-            f"All granules failed for {year}-{month:02d}"
+            f"All granules failed for {start_date} to {end_date}"
         )
 
     ds = xr.concat(
@@ -487,11 +476,12 @@ def _fetch_month_granules(
     )
 
     # Some NLDAS-2 granules store time as a numeric offset rather than
-    # datetime64. Reconstruct the coordinate from the known month start if
+    # datetime64. Reconstruct the coordinate from the known range start if
     # the decoded dtype is not already datetime64.
     if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.datetime64):
         n_hours = ds.sizes["time"]
-        start_ts = np.datetime64(dt.datetime(year, month, 1), "ns")
+        start_dt = dt.datetime.fromisoformat(start_date)
+        start_ts = np.datetime64(start_dt, "ns")
         timestamps = [start_ts + np.timedelta64(h, "h") for h in range(n_hours)]
         ds = ds.assign_coords(time=timestamps)
 
@@ -500,11 +490,10 @@ def _fetch_month_granules(
 
 def fetch_nldas_grid(
     bounds: BoundingBox,
-    year: int,
-    month: int | None = None,
+    start: str,
+    end: str | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
-    end_year: int | None = None,
     max_connections: int = 8,
 ) -> xr.Dataset:
     """Fetch NLDAS-2 hourly gridded data for the given bounding box.
@@ -521,20 +510,17 @@ def fetch_nldas_grid(
     ----------
     bounds:
         Spatial bounding box in EPSG:4326.
-    year:
-        Start calendar year (e.g. 2010).
-    month:
-        Calendar month (1–12).  When ``None`` (the default), all months from
-        ``(year, 1)`` through ``(end_year, 12)`` are fetched and concatenated.
+    start:
+        Start date in ``"YYYY-MM-DD"`` format.
+    end:
+        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
+        (the default), only the single day given by *start* is fetched.
     variables:
         NLDAS-2 short variable names to include.  Defaults to ``["APCP",
         "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
     cache_dir:
         If provided, subsetted daily NetCDF files are cached here and
         loaded on subsequent calls for the same days.
-    end_year:
-        Last calendar year to include when ``month=None``.  Defaults to the
-        current year when not specified.
     max_connections:
         Maximum number of concurrent granule downloads.  Defaults to ``8``.
 
@@ -554,42 +540,52 @@ def fetch_nldas_grid(
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
-    # Build list of (year, month) pairs to process
-    if month is not None:
-        ym_pairs = [(year, month)]
-    else:
-        if end_year is None:
-            end_year = dt.datetime.now().year
-        ym_pairs = [
-            (y, m)
-            for y in range(year, end_year + 1)
-            for m in range(1, 13)
-        ]
+    start_date = dt.date.fromisoformat(start)
+    end_date = dt.date.fromisoformat(end) if end is not None else start_date
+
+    if end_date < start_date:
+        raise ValueError(
+            f"end ({end!r}) must not be before start ({start!r})"
+        )
+
+    # Build list of (year, month) pairs spanning the requested date range.
+    ym_pairs: list[tuple[int, int]] = []
+    y, m = start_date.year, start_date.month
+    while (y, m) <= (end_date.year, end_date.month):
+        ym_pairs.append((y, m))
+        if m == 12:
+            y += 1
+            m = 1
+        else:
+            m += 1
 
     logger.info(
-        "Fetching NLDAS-2 data: %d month(s) starting %d-%02d bounds=%r",
-        len(ym_pairs), ym_pairs[0][0], ym_pairs[0][1], bounds,
+        "Fetching NLDAS-2 data: %d month(s) from %s to %s bounds=%r",
+        len(ym_pairs), start, end or start, bounds,
     )
 
     # Compute uncached days per month upfront to avoid duplicate filesystem checks
     # and to determine whether earthaccess authentication is needed.
+    # Only the days within the requested date range are considered for each month.
     month_uncached_days: dict[tuple[int, int], set[int]] = {}
     _needs_download = False
-    if cache_dir is not None:
-        for y, m in ym_pairs:
-            _, n_days = calendar.monthrange(y, m)
+    for y, m in ym_pairs:
+        _, n_days = calendar.monthrange(y, m)
+        day_start = start_date.day if (y == start_date.year and m == start_date.month) else 1
+        day_end = end_date.day if (y == end_date.year and m == end_date.month) else n_days
+        requested_days = set(range(day_start, day_end + 1))
+
+        if cache_dir is not None:
             uncached = {
-                d for d in range(1, n_days + 1)
+                d for d in requested_days
                 if not _daily_cache_path(cache_dir, y, m, d).exists()
             }
-            month_uncached_days[(y, m)] = uncached
-            if uncached:
-                _needs_download = True
-    else:
-        for y, m in ym_pairs:
-            _, n_days = calendar.monthrange(y, m)
-            month_uncached_days[(y, m)] = set(range(1, n_days + 1))
-        _needs_download = True
+        else:
+            uncached = requested_days
+
+        month_uncached_days[(y, m)] = uncached
+        if uncached:
+            _needs_download = True
 
     if _needs_download:
         earthaccess.login()
@@ -597,25 +593,32 @@ def fetch_nldas_grid(
     monthly_datasets: list[xr.Dataset] = []
     for y, m in ym_pairs:
         _, n_days = calendar.monthrange(y, m)
+        day_start = start_date.day if (y == start_date.year and m == start_date.month) else 1
+        day_end = end_date.day if (y == end_date.year and m == end_date.month) else n_days
+        requested_days_for_month = list(range(day_start, day_end + 1))
         uncached_days = month_uncached_days[(y, m)]
 
         if not uncached_days:
-            # All days cached — load from daily cache files
+            # All requested days are cached — load from daily cache files
             logger.debug("Loading NLDAS-2 from daily cache for %d-%02d", y, m)
             day_datasets = [
                 xr.open_dataset(_daily_cache_path(cache_dir, y, m, d))
-                for d in range(1, n_days + 1)
+                for d in requested_days_for_month
             ]
             monthly_datasets.append(xr.concat(day_datasets, dim="time"))
             continue
 
-        # Download full month's granules
-        month_ds = _fetch_month_granules(bounds, y, m, variables, max_connections)
+        # Download the full requested date range for this month
+        fetch_start = f"{y}-{m:02d}-{day_start:02d}"
+        fetch_end = f"{y}-{m:02d}-{day_end:02d}"
+        month_ds = _fetch_date_range_granules(
+            bounds, fetch_start, fetch_end, variables, max_connections
+        )
 
         # Group by day and cache uncached days
         times = pd.DatetimeIndex(month_ds.time.values)
         day_datasets = []
-        for d in range(1, n_days + 1):
+        for d in requested_days_for_month:
             if d not in uncached_days:
                 # Load this day from cache
                 day_datasets.append(
