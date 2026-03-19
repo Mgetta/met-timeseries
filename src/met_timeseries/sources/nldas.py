@@ -562,17 +562,19 @@ def _parse_giovanni_response(text: str) -> pd.Series:
     pandas.Series
         Series with DatetimeIndex and float values.
     """
-    with io.StringIO(text) as f:
-        # First _GIOVANNI_HEADER_LINES lines are metadata key,value pairs; skip them
-        for _ in range(_GIOVANNI_HEADER_LINES):
-            f.readline()
+    lines = text.splitlines()
 
-        # Read the CSV data (has a header row with column names)
-        df = pd.read_csv(
-            f,
-            header=0,
-            parse_dates=[0],
-        )
+    # Find the index where header lines end (first line starting with 'Timestamp')
+    header_end = next(i for i, line in enumerate(lines) if line.startswith("Timestamp"))
+    data_lines = lines[header_end:]
+
+    # Parse the CSV data from the data lines
+    csv_text = "\n".join(data_lines)
+    df = pd.read_csv(
+        io.StringIO(csv_text),
+        header=0,
+        parse_dates=[0],
+    )
 
     # Return as Series with DatetimeIndex
     ts_col = df.columns[0]
