@@ -377,6 +377,52 @@ def _open_and_subset_granule(
     return ds
 
 
+def _search_nldas_granules(
+    bounds: BoundingBox,
+    year: int,
+    month: int,
+) -> list:
+    """Search for NLDAS-2 granules for a given month via CMR.
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    year:
+        Calendar year.
+    month:
+        Calendar month (1–12).
+
+    Returns
+    -------
+    list
+        Granule results from ``earthaccess.search_data``.
+
+    Raises
+    ------
+    RuntimeError
+        If no granules are found.
+    """
+    import earthaccess
+
+    _, n_days = calendar.monthrange(year, month)
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-{n_days:02d}"
+
+    results = earthaccess.search_data(
+        short_name="NLDAS_FORA0125_H",
+        version="2.0",
+        temporal=(start, end),
+        bounding_box=(bounds.west, bounds.south, bounds.east, bounds.north),
+    )
+
+    if not results:
+        raise RuntimeError(f"No NLDAS-2 granules found for {year}-{month:02d}")
+
+    logger.debug("Found %d NLDAS-2 granules for %d-%02d", len(results), year, month)
+    return results
+
+
 def _fetch_month_granules(
     bounds: BoundingBox,
     year: int,
@@ -410,21 +456,7 @@ def _fetch_month_granules(
     """
     import earthaccess
 
-    _, n_days = calendar.monthrange(year, month)
-    start = f"{year}-{month:02d}-01"
-    end = f"{year}-{month:02d}-{n_days:02d}"
-
-    results = earthaccess.search_data(
-        short_name="NLDAS_FORA0125_H",
-        version="2.0",
-        temporal=(start, end),
-        bounding_box=(bounds.west, bounds.south, bounds.east, bounds.north),
-    )
-
-    if not results:
-        raise RuntimeError(f"No NLDAS-2 granules found for {year}-{month:02d}")
-
-    logger.debug("Found %d NLDAS-2 granules for %d-%02d", len(results), year, month)
+    results = _search_nldas_granules(bounds, year, month)
 
     file_objs = earthaccess.open(results)
 
@@ -498,8 +530,8 @@ def fetch_nldas_grid(
         NLDAS-2 short variable names to include.  Defaults to ``["APCP",
         "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
     cache_dir:
-        If provided, a subsetted monthly NetCDF file is cached here and
-        loaded on subsequent calls for the same month.
+        If provided, subsetted daily NetCDF files are cached here and
+        loaded on subsequent calls for the same days.
     end_year:
         Last calendar year to include when ``month=None``.  Defaults to the
         current year when not specified.
@@ -539,14 +571,24 @@ def fetch_nldas_grid(
         len(ym_pairs), ym_pairs[0][0], ym_pairs[0][1], bounds,
     )
 
-    # Authenticate once before any downloads
+    # Compute uncached days per month upfront to avoid duplicate filesystem checks
+    # and to determine whether earthaccess authentication is needed.
+    month_uncached_days: dict[tuple[int, int], set[int]] = {}
     _needs_download = False
     if cache_dir is not None:
         for y, m in ym_pairs:
-            if not _monthly_cache_path(cache_dir, y, m).exists():
+            _, n_days = calendar.monthrange(y, m)
+            uncached = {
+                d for d in range(1, n_days + 1)
+                if not _daily_cache_path(cache_dir, y, m, d).exists()
+            }
+            month_uncached_days[(y, m)] = uncached
+            if uncached:
                 _needs_download = True
-                break
     else:
+        for y, m in ym_pairs:
+            _, n_days = calendar.monthrange(y, m)
+            month_uncached_days[(y, m)] = set(range(1, n_days + 1))
         _needs_download = True
 
     if _needs_download:
@@ -554,25 +596,54 @@ def fetch_nldas_grid(
 
     monthly_datasets: list[xr.Dataset] = []
     for y, m in ym_pairs:
-        # Check cache first
-        if cache_dir is not None:
-            cache_path = _monthly_cache_path(cache_dir, y, m)
-            if cache_path.exists():
-                logger.debug("Loading NLDAS-2 from cache: %s", cache_path)
-                monthly_datasets.append(xr.open_dataset(cache_path))
+        _, n_days = calendar.monthrange(y, m)
+        uncached_days = month_uncached_days[(y, m)]
+
+        if not uncached_days:
+            # All days cached — load from daily cache files
+            logger.debug("Loading NLDAS-2 from daily cache for %d-%02d", y, m)
+            day_datasets = [
+                xr.open_dataset(_daily_cache_path(cache_dir, y, m, d))
+                for d in range(1, n_days + 1)
+            ]
+            monthly_datasets.append(xr.concat(day_datasets, dim="time"))
+            continue
+
+        # Download full month's granules
+        month_ds = _fetch_month_granules(bounds, y, m, variables, max_connections)
+
+        # Group by day and cache uncached days
+        times = pd.DatetimeIndex(month_ds.time.values)
+        day_datasets = []
+        for d in range(1, n_days + 1):
+            if d not in uncached_days:
+                # Load this day from cache
+                day_datasets.append(
+                    xr.open_dataset(_daily_cache_path(cache_dir, y, m, d))
+                )
                 continue
 
-        # Fetch from earthaccess
-        ds = _fetch_month_granules(bounds, y, m, variables, max_connections)
+            day_indices = np.where(times.day == d)[0]
+            if len(day_indices) == 0:
+                logger.warning(
+                    "No granules found for day %d of %d-%02d", d, y, m
+                )
+                continue
 
-        # Save to cache
-        if cache_dir is not None:
-            cache_path = _monthly_cache_path(cache_dir, y, m)
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            ds.to_netcdf(cache_path)
-            logger.debug("Cached NLDAS-2 data to: %s", cache_path)
+            day_ds = month_ds.isel(time=day_indices)
 
-        monthly_datasets.append(ds)
+            if cache_dir is not None:
+                cache_path = _daily_cache_path(cache_dir, y, m, d)
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                day_ds.to_netcdf(cache_path)
+                logger.debug("Cached NLDAS-2 day to: %s", cache_path)
+
+            day_datasets.append(day_ds)
+
+        if not day_datasets:
+            raise RuntimeError(f"No usable granules found for any day in {y}-{m:02d}")
+
+        monthly_datasets.append(xr.concat(day_datasets, dim="time"))
 
     if len(monthly_datasets) == 1:
         return monthly_datasets[0]
@@ -704,8 +775,8 @@ def compute_nldas_weights(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _monthly_cache_path(cache_dir: str, year: int, month: int) -> Path:
-    return Path(cache_dir) / "nldas" / f"{year}{month:02d}.nc"
+def _daily_cache_path(cache_dir: str, year: int, month: int, day: int) -> Path:
+    return Path(cache_dir) / "nldas" / str(year) / f"{year}{month:02d}{day:02d}.nc"
 
 
 def _parse_giovanni_response(text: str) -> pd.Series:
