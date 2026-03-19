@@ -179,15 +179,16 @@ class TestCachingMechanism:
 
         fetch_nldas_grid(bounds, 2010, 1, cache_dir=str(tmp_path))
 
-        cache_file = tmp_path / "nldas" / "201001.nc"
+        cache_file = tmp_path / "nldas" / "2010" / "20100101.nc"
         assert cache_file.exists()
 
     def test_loads_from_cache(self, bounds, tmp_path):
-        # Pre-populate the cache
-        cache_dir = tmp_path / "nldas"
-        cache_dir.mkdir()
-        ds = _make_mock_dataset()
-        ds.to_netcdf(cache_dir / "201001.nc")
+        # Pre-populate all 31 daily cache files for January 2010
+        year_dir = tmp_path / "nldas" / "2010"
+        year_dir.mkdir(parents=True)
+        day_ds = _make_single_granule_dataset("2010-01-01T00:00:00")
+        for d in range(1, 32):
+            day_ds.to_netcdf(year_dir / f"201001{d:02d}.nc")
 
         with patch("earthaccess.login") as mock_login:
             from met_timeseries.sources.nldas import fetch_nldas_grid
@@ -198,8 +199,115 @@ class TestCachingMechanism:
         mock_login.assert_not_called()
         assert "APCP" in result
 
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_daily_cache_partial_month(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
+    ):
+        """Pre-cached days are loaded from cache; uncached days trigger earthaccess."""
+        # Pre-cache only day 1 of January 2010
+        year_dir = tmp_path / "nldas" / "2010"
+        year_dir.mkdir(parents=True)
+        day1_ds = _make_single_granule_dataset("2010-01-01T00:00:00")
+        day1_ds.to_netcdf(year_dir / "20100101.nc")
 
-class TestMultiMonthYearRanges:
+        # Days 2-31 are uncached — mock a fresh granule for day 2
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.return_value = _make_single_granule_dataset("2010-01-02T00:00:00")
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(bounds, 2010, 1, cache_dir=str(tmp_path))
+
+        # Since some days are uncached, login and search must be called
+        mock_login.assert_called_once()
+        mock_search.assert_called_once()
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_daily_cache_creates_year_subdirectory(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
+    ):
+        """Daily cache files are organised under a year subdirectory."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.return_value = _make_single_granule_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(bounds, 2010, 1, cache_dir=str(tmp_path))
+
+        year_dir = tmp_path / "nldas" / "2010"
+        assert year_dir.is_dir()
+
+
+class TestDailyCachePath:
+    """Tests for _daily_cache_path helper."""
+
+    def test_daily_cache_path_format(self):
+        from met_timeseries.sources.nldas import _daily_cache_path
+
+        path = _daily_cache_path("/cache", 2010, 1, 5)
+        assert str(path) == "/cache/nldas/2010/20100105.nc"
+
+    def test_daily_cache_path_year_subdirectory(self):
+        from met_timeseries.sources.nldas import _daily_cache_path
+
+        path = _daily_cache_path("/cache", 2010, 1, 5)
+        assert path.parts[-2] == "2010"
+
+    def test_daily_cache_path_zero_pads_month_and_day(self):
+        from met_timeseries.sources.nldas import _daily_cache_path
+
+        path = _daily_cache_path("/cache", 2010, 3, 7)
+        assert path.name == "20100307.nc"
+
+
+class TestSearchNldasGranules:
+    """Tests for the _search_nldas_granules helper."""
+
+    @patch("earthaccess.search_data")
+    def test_calls_search_data_with_correct_params(self, mock_search, bounds):
+        mock_search.return_value = [MagicMock()]
+
+        from met_timeseries.sources.nldas import _search_nldas_granules
+
+        _search_nldas_granules(bounds, 2010, 1)
+
+        mock_search.assert_called_once_with(
+            short_name="NLDAS_FORA0125_H",
+            version="2.0",
+            temporal=("2010-01-01", "2010-01-31"),
+            bounding_box=(-110.0, 45.0, -109.0, 46.0),
+        )
+
+    @patch("earthaccess.search_data")
+    def test_raises_on_empty(self, mock_search, bounds):
+        mock_search.return_value = []
+
+        from met_timeseries.sources.nldas import _search_nldas_granules
+
+        with pytest.raises(RuntimeError, match="No NLDAS-2 granules found"):
+            _search_nldas_granules(bounds, 2010, 1)
+
+    @patch("earthaccess.search_data")
+    def test_returns_results(self, mock_search, bounds):
+        granules = [MagicMock(), MagicMock()]
+        mock_search.return_value = granules
+
+        from met_timeseries.sources.nldas import _search_nldas_granules
+
+        result = _search_nldas_granules(bounds, 2010, 1)
+
+        assert result is granules
+
+
+
     """Tests for multi-month/year temporal range support."""
 
     @patch("met_timeseries.sources.nldas._open_and_subset_granule")
@@ -297,13 +405,14 @@ class TestMultiMonthYearRanges:
         self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
     ):
         """Cached months are loaded from disk; only uncached months trigger earthaccess."""
-        # Pre-cache January 2010
-        cache_dir = tmp_path / "nldas"
-        cache_dir.mkdir()
+        # Pre-cache all 31 days of January 2010 as daily files
+        year_dir = tmp_path / "nldas" / "2010"
+        year_dir.mkdir(parents=True)
         jan_ds = _make_single_granule_dataset("2010-01-01T00:00:00")
-        jan_ds.to_netcdf(cache_dir / "201001.nc")
+        for d in range(1, 32):
+            jan_ds.to_netcdf(year_dir / f"201001{d:02d}.nc")
 
-        # February is not cached
+        # February through December are not cached
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
         mock_subset.return_value = _make_single_granule_dataset("2010-02-01T00:00:00")
