@@ -31,6 +31,7 @@ Users need a free NASA Earthdata account: https://urs.earthdata.nasa.gov
 from __future__ import annotations
 
 import calendar
+import concurrent.futures
 import datetime as dt
 import io
 import logging
@@ -343,12 +344,136 @@ def process_nldas(
     )
 
 
-def fetch_nldas_grid(
+def _open_and_subset_granule(
+    file_obj: object,
+    variables: list[str],
+    bounds: BoundingBox,
+) -> xr.Dataset:
+    """Open a single NLDAS-2 granule file object and return a spatially subsetted Dataset.
+
+    Parameters
+    ----------
+    file_obj:
+        A file-like object (e.g. from :func:`earthaccess.open`) pointing to an
+        NLDAS-2 hourly NetCDF granule.
+    variables:
+        Variable names to retain.
+    bounds:
+        Spatial bounding box; only data within these bounds is returned.
+
+    Returns
+    -------
+    xarray.Dataset
+        In-memory Dataset containing only *variables* and the spatial extent
+        defined by *bounds*.
+    """
+    ds = xr.open_dataset(file_obj, engine="h5netcdf")
+    ds = ds[variables]
+    ds = ds.sel(
+        lat=slice(bounds.south, bounds.north),
+        lon=slice(bounds.west, bounds.east),
+    )
+    ds = ds.load()
+    return ds
+
+
+def _fetch_month_granules(
     bounds: BoundingBox,
     year: int,
     month: int,
+    variables: list[str],
+    max_connections: int,
+) -> xr.Dataset:
+    """Download and subset all granules for a single month, returning a Dataset.
+
+    Opens granules concurrently using :class:`concurrent.futures.ThreadPoolExecutor`.
+    Failed granules are skipped with a warning; a :exc:`RuntimeError` is raised
+    only when *all* granules for the month fail.
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    year:
+        Calendar year.
+    month:
+        Calendar month (1–12).
+    variables:
+        Variable names to include.
+    max_connections:
+        Maximum concurrent granule downloads.
+
+    Returns
+    -------
+    xarray.Dataset
+        Monthly Dataset concatenated along the ``time`` dimension.
+    """
+    import earthaccess
+
+    _, n_days = calendar.monthrange(year, month)
+    start = f"{year}-{month:02d}-01"
+    end = f"{year}-{month:02d}-{n_days:02d}"
+
+    results = earthaccess.search_data(
+        short_name="NLDAS_FORA0125_H",
+        version="2.0",
+        temporal=(start, end),
+        bounding_box=(bounds.west, bounds.south, bounds.east, bounds.north),
+    )
+
+    if not results:
+        raise RuntimeError(f"No NLDAS-2 granules found for {year}-{month:02d}")
+
+    logger.debug("Found %d NLDAS-2 granules for %d-%02d", len(results), year, month)
+
+    file_objs = earthaccess.open(results)
+
+    granule_datasets: list[xr.Dataset] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_connections) as executor:
+        futures = {
+            executor.submit(_open_and_subset_granule, fobj, variables, bounds): i
+            for i, fobj in enumerate(file_objs)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            try:
+                granule_datasets.append(future.result())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Skipping granule %d for %d-%02d due to error: %s",
+                    idx, year, month, exc,
+                )
+
+    if not granule_datasets:
+        raise RuntimeError(
+            f"All granules failed for {year}-{month:02d}"
+        )
+
+    ds = xr.concat(
+        sorted(granule_datasets, key=lambda d: d["time"].values[0]),
+        dim="time",
+    )
+
+    # Some NLDAS-2 granules store time as a numeric offset rather than
+    # datetime64. Reconstruct the coordinate from the known month start if
+    # the decoded dtype is not already datetime64.
+    if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.datetime64):
+        n_hours = ds.sizes["time"]
+        start_ts = np.datetime64(dt.datetime(year, month, 1), "ns")
+        timestamps = [start_ts + np.timedelta64(h, "h") for h in range(n_hours)]
+        ds = ds.assign_coords(time=timestamps)
+
+    return ds
+
+
+def fetch_nldas_grid(
+    bounds: BoundingBox,
+    year: int,
+    month: int | None = None,
     variables: list[str] | None = None,
     cache_dir: str | None = None,
+    end_year: int | None = None,
+    max_connections: int = 8,
 ) -> xr.Dataset:
     """Fetch NLDAS-2 hourly gridded data for the given bounding box.
 
@@ -365,15 +490,21 @@ def fetch_nldas_grid(
     bounds:
         Spatial bounding box in EPSG:4326.
     year:
-        Calendar year (e.g. 2010).
+        Start calendar year (e.g. 2010).
     month:
-        Calendar month (1–12).
+        Calendar month (1–12).  When ``None`` (the default), all months from
+        ``(year, 1)`` through ``(end_year, 12)`` are fetched and concatenated.
     variables:
         NLDAS-2 short variable names to include.  Defaults to ``["APCP",
         "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
     cache_dir:
         If provided, a subsetted monthly NetCDF file is cached here and
         loaded on subsequent calls for the same month.
+    end_year:
+        Last calendar year to include when ``month=None``.  Defaults to the
+        current year when not specified.
+    max_connections:
+        Maximum number of concurrent granule downloads.  Defaults to ``8``.
 
     Returns
     -------
@@ -384,78 +515,69 @@ def fetch_nldas_grid(
     Raises
     ------
     RuntimeError
-        If no granules are found for the requested period.
+        If no granules are found for a requested period.
     """
     import earthaccess
 
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
-    logger.info("Fetching NLDAS-2 data: year=%d month=%d bounds=%r", year, month, bounds)
+    # Build list of (year, month) pairs to process
+    if month is not None:
+        ym_pairs = [(year, month)]
+    else:
+        if end_year is None:
+            end_year = dt.datetime.now().year
+        ym_pairs = [
+            (y, m)
+            for y in range(year, end_year + 1)
+            for m in range(1, 13)
+        ]
 
-    # Check cache first
+    logger.info(
+        "Fetching NLDAS-2 data: %d month(s) starting %d-%02d bounds=%r",
+        len(ym_pairs), ym_pairs[0][0], ym_pairs[0][1], bounds,
+    )
+
+    # Authenticate once before any downloads
+    _needs_download = False
     if cache_dir is not None:
-        cache_path = _monthly_cache_path(cache_dir, year, month)
-        if cache_path.exists():
-            logger.debug("Loading NLDAS-2 from cache: %s", cache_path)
-            return xr.open_dataset(cache_path)
+        for y, m in ym_pairs:
+            if not _monthly_cache_path(cache_dir, y, m).exists():
+                _needs_download = True
+                break
+    else:
+        _needs_download = True
 
-    # Authenticate with NASA Earthdata
-    earthaccess.login()
+    if _needs_download:
+        earthaccess.login()
 
-    # Temporal range: full month
-    _, n_days = calendar.monthrange(year, month)
-    start = f"{year}-{month:02d}-01"
-    end = f"{year}-{month:02d}-{n_days:02d}"
+    monthly_datasets: list[xr.Dataset] = []
+    for y, m in ym_pairs:
+        # Check cache first
+        if cache_dir is not None:
+            cache_path = _monthly_cache_path(cache_dir, y, m)
+            if cache_path.exists():
+                logger.debug("Loading NLDAS-2 from cache: %s", cache_path)
+                monthly_datasets.append(xr.open_dataset(cache_path))
+                continue
 
-    # Search for NLDAS-2 granules
-    results = earthaccess.search_data(
-        short_name="NLDAS_FORA0125_H",
-        version="2.0",
-        temporal=(start, end),
-        bounding_box=(bounds.west, bounds.south, bounds.east, bounds.north),
-    )
+        # Fetch from earthaccess
+        ds = _fetch_month_granules(bounds, y, m, variables, max_connections)
 
-    if not results:
-        raise RuntimeError(f"No NLDAS-2 granules found for {year}-{month:02d}")
+        # Save to cache
+        if cache_dir is not None:
+            cache_path = _monthly_cache_path(cache_dir, y, m)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            ds.to_netcdf(cache_path)
+            logger.debug("Cached NLDAS-2 data to: %s", cache_path)
 
-    logger.debug("Found %d NLDAS-2 granules", len(results))
+        monthly_datasets.append(ds)
 
-    # Open all granules as fsspec file objects
-    file_objs = earthaccess.open(results)
+    if len(monthly_datasets) == 1:
+        return monthly_datasets[0]
 
-    # Load all granules into a single Dataset
-    ds = xr.open_mfdataset(
-        file_objs,
-        engine="h5netcdf",
-        combine="nested",
-        concat_dim="time",
-    )
-
-    # Subset variables
-    ds = ds[variables]
-
-    # Subset spatial domain
-    ds = ds.sel(
-        lat=slice(bounds.south, bounds.north),
-        lon=slice(bounds.west, bounds.east),
-    )
-
-    # Ensure time coordinate has proper datetime64 values
-    if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.datetime64):
-        n_hours = ds.sizes["time"]
-        start_ts = np.datetime64(dt.datetime(year, month, 1), "ns")
-        timestamps = [start_ts + np.timedelta64(h, "h") for h in range(n_hours)]
-        ds = ds.assign_coords(time=timestamps)
-
-    # Save to cache
-    if cache_dir is not None:
-        cache_path = _monthly_cache_path(cache_dir, year, month)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        ds.to_netcdf(cache_path)
-        logger.debug("Cached NLDAS-2 data to: %s", cache_path)
-
-    return ds
+    return xr.concat(monthly_datasets, dim="time")
 
 
 # ---------------------------------------------------------------------------

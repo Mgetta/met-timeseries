@@ -4,7 +4,8 @@ Tests for met_timeseries.sources.nldas — earthaccess-based implementation.
 
 from __future__ import annotations
 
-from unittest.mock import patch, MagicMock
+import datetime
+from unittest.mock import patch, MagicMock, call
 
 import geopandas as gpd
 import numpy as np
@@ -21,14 +22,14 @@ def bounds():
     return BoundingBox(west=-110.0, east=-109.0, south=45.0, north=46.0)
 
 
-def _make_mock_dataset(variables=("APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD")):
+def _make_mock_dataset(variables=("APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"), n_times=2):
     """Create a small mock xarray Dataset mimicking NLDAS-2 output."""
-    times = pd.date_range("2010-01-01", periods=2, freq="h")
+    times = pd.date_range("2010-01-01", periods=n_times, freq="h")
     lats = np.array([44.9375, 45.0625, 45.9375, 46.0625])
     lons = np.array([-110.0625, -109.9375, -109.0625, -108.9375])
 
     data_vars = {
-        var: (["time", "lat", "lon"], np.ones((2, 4, 4), dtype=np.float32))
+        var: (["time", "lat", "lon"], np.ones((n_times, 4, 4), dtype=np.float32))
         for var in variables
     }
 
@@ -38,17 +39,31 @@ def _make_mock_dataset(variables=("APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD
     )
 
 
+def _make_single_granule_dataset(t="2010-01-01T00:00:00", variables=None):
+    """Create a tiny single-timestep Dataset for granule mocking."""
+    if variables is None:
+        variables = ("APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD")
+    times = pd.DatetimeIndex([t])
+    lats = np.array([44.9375, 45.0625, 45.9375, 46.0625])
+    lons = np.array([-110.0625, -109.9375, -109.0625, -108.9375])
+    data_vars = {
+        var: (["time", "lat", "lon"], np.ones((1, 4, 4), dtype=np.float32))
+        for var in variables
+    }
+    return xr.Dataset(data_vars, coords={"time": times, "lat": lats, "lon": lons})
+
+
 class TestFetchNldasGridCallsEarthaccess:
     """Verify that fetch_nldas_grid calls earthaccess correctly."""
 
-    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
     @patch("earthaccess.search_data")
     @patch("earthaccess.login")
-    def test_calls_login(self, mock_login, mock_search, mock_open, mock_mfdataset, bounds):
+    def test_calls_login(self, mock_login, mock_search, mock_open, mock_subset, bounds):
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_mfdataset.return_value = _make_mock_dataset()
+        mock_subset.return_value = _make_single_granule_dataset()
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
@@ -56,16 +71,16 @@ class TestFetchNldasGridCallsEarthaccess:
 
         mock_login.assert_called_once()
 
-    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
     @patch("earthaccess.search_data")
     @patch("earthaccess.login")
     def test_calls_search_data_with_correct_params(
-        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_mfdataset.return_value = _make_mock_dataset()
+        mock_subset.return_value = _make_single_granule_dataset()
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
@@ -78,17 +93,17 @@ class TestFetchNldasGridCallsEarthaccess:
             bounding_box=(-110.0, 45.0, -109.0, 46.0),
         )
 
-    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
     @patch("earthaccess.search_data")
     @patch("earthaccess.login")
     def test_calls_open_with_search_results(
-        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
         granules = [MagicMock()]
         mock_search.return_value = granules
         mock_open.return_value = [MagicMock()]
-        mock_mfdataset.return_value = _make_mock_dataset()
+        mock_subset.return_value = _make_single_granule_dataset()
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
@@ -106,16 +121,17 @@ class TestFetchNldasGridCallsEarthaccess:
         with pytest.raises(RuntimeError, match="No NLDAS-2 granules found"):
             fetch_nldas_grid(bounds, 2010, 1)
 
-    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
     @patch("earthaccess.search_data")
     @patch("earthaccess.login")
     def test_dataset_has_requested_variables(
-        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_mfdataset.return_value = _make_mock_dataset()
+        # Mock returns only the requested variables (as the real helper would)
+        mock_subset.return_value = _make_single_granule_dataset(variables=("APCP", "TMP"))
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
@@ -125,16 +141,16 @@ class TestFetchNldasGridCallsEarthaccess:
         assert "TMP" in result
         assert "DSWRF" not in result
 
-    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
     @patch("earthaccess.search_data")
     @patch("earthaccess.login")
     def test_dataset_has_time_lat_lon_dims(
-        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_mfdataset.return_value = _make_mock_dataset()
+        mock_subset.return_value = _make_single_granule_dataset()
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
@@ -148,16 +164,16 @@ class TestFetchNldasGridCallsEarthaccess:
 class TestCachingMechanism:
     """Verify that the caching mechanism works correctly."""
 
-    @patch("met_timeseries.sources.nldas.xr.open_mfdataset")
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
     @patch("earthaccess.search_data")
     @patch("earthaccess.login")
     def test_writes_to_cache(
-        self, mock_login, mock_search, mock_open, mock_mfdataset, bounds, tmp_path
+        self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
     ):
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_mfdataset.return_value = _make_mock_dataset()
+        mock_subset.return_value = _make_single_granule_dataset()
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
@@ -181,6 +197,266 @@ class TestCachingMechanism:
         # earthaccess.login must NOT be called when loading from cache
         mock_login.assert_not_called()
         assert "APCP" in result
+
+
+class TestMultiMonthYearRanges:
+    """Tests for multi-month/year temporal range support."""
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_no_month_iterates_months(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """When month=None, search_data is called once per month in the range."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.side_effect = [
+            _make_single_granule_dataset(f"2010-{m:02d}-01T00:00:00")
+            for m in range(1, 13)
+        ]
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(bounds, 2010, month=None, end_year=2010)
+
+        assert mock_search.call_count == 12
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_multi_year(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """year=2010, month=None, end_year=2011 should span 24 months."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+
+        months_2010 = [_make_single_granule_dataset(f"2010-{m:02d}-01T00:00:00") for m in range(1, 13)]
+        months_2011 = [_make_single_granule_dataset(f"2011-{m:02d}-01T00:00:00") for m in range(1, 13)]
+        mock_subset.side_effect = months_2010 + months_2011
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        result = fetch_nldas_grid(bounds, 2010, month=None, end_year=2011)
+
+        assert mock_search.call_count == 24
+        assert len(result["time"]) == 24
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_end_year_defaults_to_current(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """When end_year=None and month=None, range extends to the current year."""
+        current_year = datetime.datetime.now().year
+        expected_months = (current_year - 2010 + 1) * 12
+
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.side_effect = [
+            _make_single_granule_dataset(f"{y}-{m:02d}-01T00:00:00")
+            for y in range(2010, current_year + 1)
+            for m in range(1, 13)
+        ]
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(bounds, 2010, month=None, end_year=None)
+
+        assert mock_search.call_count == expected_months
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_single_month_backward_compatible(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """Calling with month=1 still results in a single search_data call."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.return_value = _make_single_granule_dataset()
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        result = fetch_nldas_grid(bounds, 2010, month=1)
+
+        mock_search.assert_called_once()
+        assert len(result["time"]) == 1
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_multi_month_uses_cache(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
+    ):
+        """Cached months are loaded from disk; only uncached months trigger earthaccess."""
+        # Pre-cache January 2010
+        cache_dir = tmp_path / "nldas"
+        cache_dir.mkdir()
+        jan_ds = _make_single_granule_dataset("2010-01-01T00:00:00")
+        jan_ds.to_netcdf(cache_dir / "201001.nc")
+
+        # February is not cached
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.return_value = _make_single_granule_dataset("2010-02-01T00:00:00")
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(bounds, 2010, month=None, end_year=2010,
+                         cache_dir=str(tmp_path),
+                         variables=["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"])
+
+        # search_data should have been called for each non-cached month (months 2-12)
+        assert mock_search.call_count == 11
+
+
+class TestConcurrentDownloads:
+    """Tests for concurrent granule download behaviour."""
+
+    @patch("met_timeseries.sources.nldas.concurrent.futures.ThreadPoolExecutor")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_uses_thread_pool(
+        self, mock_login, mock_search, mock_open, mock_executor_cls, bounds
+    ):
+        """ThreadPoolExecutor is used when fetching granules."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+
+        # Set up a working executor mock that actually processes futures
+        granule_ds = _make_single_granule_dataset()
+        mock_future = MagicMock()
+        mock_future.result.return_value = granule_ds
+        mock_executor = MagicMock()
+        mock_executor.__enter__ = MagicMock(return_value=mock_executor)
+        mock_executor.__exit__ = MagicMock(return_value=False)
+        mock_executor.submit.return_value = mock_future
+        mock_executor_cls.return_value = mock_executor
+
+        with patch("met_timeseries.sources.nldas.concurrent.futures.as_completed",
+                   return_value=[mock_future]):
+            from met_timeseries.sources.nldas import fetch_nldas_grid
+            fetch_nldas_grid(bounds, 2010, 1)
+
+        mock_executor_cls.assert_called_once()
+
+    @patch("met_timeseries.sources.nldas.concurrent.futures.ThreadPoolExecutor")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_max_connections_parameter(
+        self, mock_login, mock_search, mock_open, mock_executor_cls, bounds
+    ):
+        """max_connections=4 is passed as max_workers to ThreadPoolExecutor."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+
+        granule_ds = _make_single_granule_dataset()
+        mock_future = MagicMock()
+        mock_future.result.return_value = granule_ds
+        mock_executor = MagicMock()
+        mock_executor.__enter__ = MagicMock(return_value=mock_executor)
+        mock_executor.__exit__ = MagicMock(return_value=False)
+        mock_executor.submit.return_value = mock_future
+        mock_executor_cls.return_value = mock_executor
+
+        with patch("met_timeseries.sources.nldas.concurrent.futures.as_completed",
+                   return_value=[mock_future]):
+            from met_timeseries.sources.nldas import fetch_nldas_grid
+            fetch_nldas_grid(bounds, 2010, 1, max_connections=4)
+
+        mock_executor_cls.assert_called_once_with(max_workers=4)
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_granule_subset_before_concat(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """Returned Dataset lat/lon dims only cover requested bounds, not full CONUS."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        # Return dataset already spatially subsetted within the bounds
+        subsetted = xr.Dataset(
+            {"APCP": (["time", "lat", "lon"], np.ones((1, 2, 2), dtype=np.float32))},
+            coords={
+                "time": pd.DatetimeIndex(["2010-01-01"]),
+                "lat": np.array([45.0625, 45.9375]),
+                "lon": np.array([-109.9375, -109.0625]),
+            },
+        )
+        mock_subset.return_value = subsetted
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        result = fetch_nldas_grid(bounds, 2010, 1, variables=["APCP"])
+
+        # lat/lon should only span the bounds, not the full grid
+        assert result["lat"].values.min() >= bounds.south
+        assert result["lat"].values.max() <= bounds.north
+        assert result["lon"].values.min() >= bounds.west
+        assert result["lon"].values.max() <= bounds.east
+
+    def test_open_and_subset_granule_helper(self, bounds):
+        """_open_and_subset_granule subsets variables and spatial extent."""
+        full_ds = xr.Dataset(
+            {
+                "APCP": (["time", "lat", "lon"], np.ones((1, 4, 4), dtype=np.float32)),
+                "TMP": (["time", "lat", "lon"], np.ones((1, 4, 4), dtype=np.float32)),
+                "EXTRA": (["time", "lat", "lon"], np.ones((1, 4, 4), dtype=np.float32)),
+            },
+            coords={
+                "time": pd.DatetimeIndex(["2010-01-01"]),
+                "lat": np.array([44.0, 45.0, 46.0, 47.0]),
+                "lon": np.array([-111.0, -110.0, -109.0, -108.0]),
+            },
+        )
+
+        # Mock the file object — xr.open_dataset is patched to return the full dataset
+        mock_file = MagicMock()
+
+        with patch("met_timeseries.sources.nldas.xr.open_dataset", return_value=full_ds):
+            from met_timeseries.sources.nldas import _open_and_subset_granule
+
+            result = _open_and_subset_granule(mock_file, ["APCP", "TMP"], bounds)
+
+        assert "APCP" in result
+        assert "TMP" in result
+        assert "EXTRA" not in result
+        assert result["lat"].values.min() >= bounds.south
+        assert result["lat"].values.max() <= bounds.north
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_fetch_grid_skips_failed_granule(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds
+    ):
+        """If one granule raises, it is skipped and the rest of the month succeeds."""
+        mock_search.return_value = [MagicMock(), MagicMock()]
+        mock_open.return_value = [MagicMock(), MagicMock()]
+
+        good_ds = _make_single_granule_dataset("2010-01-01T01:00:00")
+        mock_subset.side_effect = [RuntimeError("broken granule"), good_ds]
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        result = fetch_nldas_grid(bounds, 2010, 1)
+
+        # Should succeed and only contain the good granule's data
+        assert "time" in result.dims
+        assert len(result["time"]) == 1
 
 
 class TestParseGiovanniResponse:

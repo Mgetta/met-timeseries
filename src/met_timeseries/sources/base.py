@@ -45,6 +45,6 @@ class FetchFunction(Protocol):
         self,
         bounds: BoundingBox,
         year: int,
-        month: int,
+        month: int | None = None,
         **kwargs: object,
     ) -> xr.Dataset: ...
