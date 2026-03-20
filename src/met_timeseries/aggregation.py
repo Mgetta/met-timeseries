@@ -99,14 +99,12 @@ def aggregate_over_polygon(
     for var in dataset.data_vars:
         arr = dataset[var].values
         if arr.ndim == 2:
-            values = arr[mask]
-            result[str(var)] = float(np.nanmean(values)) if len(values) > 0 else float("nan")
+            weighted_mean = np.nansum(arr * weights) / total_weight
+            result[str(var)] = float(weighted_mean)
         elif arr.ndim == 3:
             # (time, lat, lon) — return one spatial mean per timestep
-            mask_flat = mask.ravel()
-            arr_2d = arr.reshape(arr.shape[0], -1)  # (time, lat*lon)
-            selected = arr_2d[:, mask_flat]          # (time, n_cells)
-            result[str(var)] = np.nanmean(selected, axis=1).tolist()
+            weighted_mean = np.nansum(arr * weights[np.newaxis, :, :], axis=(1, 2)) / total_weight
+            result[str(var)] = weighted_mean.tolist()
         else:
             values = arr.ravel()
             result[str(var)] = float(np.nanmean(values)) if len(values) > 0 else float("nan")

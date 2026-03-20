@@ -143,7 +143,7 @@ class TestAggregateOverPolygon:
         assert result["VAR"] == pytest.approx(4.0)
 
     def test_3d_data_handled(self) -> None:
-        """3-D (time, lat, lon) arrays should produce a scalar mean."""
+        """3-D (time, lat, lon) arrays should produce a list of per-timestep spatial means."""
         from met_timeseries.aggregation import aggregate_over_polygon
 
         lats = np.array([0.0, 0.1, 0.2])
@@ -151,7 +151,9 @@ class TestAggregateOverPolygon:
         ds = _make_dataset_3d(lats, lons, ntimes=5, value=3.0)
         polygon = box(-0.5, -0.5, 0.5, 0.5)
         result = aggregate_over_polygon(ds, polygon)
-        assert result["VAR"] == pytest.approx(3.0, rel=1e-6)
+        assert isinstance(result["VAR"], list)
+        assert len(result["VAR"]) == 5
+        assert all(pytest.approx(v, rel=1e-6) == 3.0 for v in result["VAR"])
 
     def test_partial_overlap_weight_applied(self) -> None:
         """A polygon covering exactly half a single cell should give weight ~0.5."""
