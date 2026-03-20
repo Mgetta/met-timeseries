@@ -53,6 +53,20 @@ def _make_single_granule_dataset(t="2010-01-01T00:00:00", variables=None):
     return xr.Dataset(data_vars, coords={"time": times, "lat": lats, "lon": lons})
 
 
+def _make_day_range_dataset(start: str, end: str, variables=None):
+    """Create a Dataset with one timestamp per day for the given date range."""
+    if variables is None:
+        variables = ("APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD")
+    times = pd.date_range(start, end, freq="D")
+    lats = np.array([44.9375, 45.0625])
+    lons = np.array([-110.0625, -109.9375])
+    data_vars = {
+        var: (["time", "lat", "lon"], np.ones((len(times), 2, 2), dtype=np.float32))
+        for var in variables
+    }
+    return xr.Dataset(data_vars, coords={"time": times, "lat": lats, "lon": lons})
+
+
 class TestFetchNldasGridCallsEarthaccess:
     """Verify that fetch_nldas_grid calls earthaccess correctly."""
 
@@ -317,19 +331,17 @@ class TestSearchNldasGranules:
     def test_fetch_grid_no_month_iterates_months(
         self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
-        """When month=None, search_data is called once per month in the range."""
+        """A full year is fetched as a single contiguous CMR search."""
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_subset.side_effect = [
-            _make_single_granule_dataset(f"2010-{m:02d}-01T00:00:00")
-            for m in range(1, 13)
-        ]
+        mock_subset.return_value = _make_day_range_dataset("2010-01-01", "2010-12-31")
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
-        fetch_nldas_grid(bounds, start="2010-01-01", end="2010-12-31")
+        result = fetch_nldas_grid(bounds, start="2010-01-01", end="2010-12-31")
 
-        assert mock_search.call_count == 12
+        assert mock_search.call_count == 1
+        assert len(result["time"]) == 365
 
     @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
@@ -338,20 +350,17 @@ class TestSearchNldasGranules:
     def test_fetch_grid_multi_year(
         self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
-        """year=2010, month=None, end_year=2011 should span 24 months."""
+        """A two-year span is fetched as a single contiguous CMR search."""
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-
-        months_2010 = [_make_single_granule_dataset(f"2010-{m:02d}-01T00:00:00") for m in range(1, 13)]
-        months_2011 = [_make_single_granule_dataset(f"2011-{m:02d}-01T00:00:00") for m in range(1, 13)]
-        mock_subset.side_effect = months_2010 + months_2011
+        mock_subset.return_value = _make_day_range_dataset("2010-01-01", "2011-12-31")
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
         result = fetch_nldas_grid(bounds, start="2010-01-01", end="2011-12-31")
 
-        assert mock_search.call_count == 24
-        assert len(result["time"]) == 24
+        assert mock_search.call_count == 1
+        assert len(result["time"]) == 365 + 365
 
     @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
@@ -402,7 +411,7 @@ class TestSearchNldasGranules:
     def test_fetch_grid_multi_month_uses_cache(
         self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
     ):
-        """Cached months are loaded from disk; only uncached months trigger earthaccess."""
+        """Cached days are loaded from disk; uncached days trigger a single earthaccess call."""
         # Pre-cache all 31 days of January 2010 as daily files
         year_dir = tmp_path / "nldas" / "2010"
         year_dir.mkdir(parents=True)
@@ -410,10 +419,10 @@ class TestSearchNldasGranules:
         for d in range(1, 32):
             jan_ds.to_netcdf(year_dir / f"201001{d:02d}.nc")
 
-        # February through December are not cached
+        # February through December are not cached; mock returns data for them
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_subset.return_value = _make_single_granule_dataset("2010-02-01T00:00:00")
+        mock_subset.return_value = _make_day_range_dataset("2010-02-01", "2010-12-31")
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
@@ -421,8 +430,8 @@ class TestSearchNldasGranules:
                          cache_dir=str(tmp_path),
                          variables=["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"])
 
-        # search_data should have been called for each non-cached month (months 2-12)
-        assert mock_search.call_count == 11
+        # All uncached days (Feb–Dec) form one contiguous run → one search call
+        assert mock_search.call_count == 1
 
     @patch("met_timeseries.sources.nldas._open_and_subset_granule")
     @patch("earthaccess.open")
@@ -455,23 +464,179 @@ class TestSearchNldasGranules:
     def test_fetch_grid_cross_month_range(
         self, mock_login, mock_search, mock_open, mock_subset, bounds
     ):
-        """Cross-month range triggers two searches with clipped boundary dates."""
+        """A cross-month range is fetched as a single contiguous CMR search."""
         mock_search.return_value = [MagicMock()]
         mock_open.return_value = [MagicMock()]
-        mock_subset.side_effect = [
-            _make_single_granule_dataset("2010-01-15T00:00:00"),
-            _make_single_granule_dataset("2010-02-01T00:00:00"),
-        ]
+        mock_subset.return_value = _make_day_range_dataset("2010-01-15", "2010-02-15")
 
         from met_timeseries.sources.nldas import fetch_nldas_grid
 
         fetch_nldas_grid(bounds, start="2010-01-15", end="2010-02-15")
 
-        # Should search January 15–31 and February 1–15
-        assert mock_search.call_count == 2
-        calls = mock_search.call_args_list
-        assert calls[0].kwargs["temporal"] == ("2010-01-15", "2010-01-31")
-        assert calls[1].kwargs["temporal"] == ("2010-02-01", "2010-02-15")
+        # All days Jan 15–Feb 15 form one contiguous run → one search call
+        mock_search.assert_called_once_with(
+            short_name="NLDAS_FORA0125_H",
+            version="2.0",
+            temporal=("2010-01-15", "2010-02-15"),
+            bounding_box=(-110.0, 45.0, -109.0, 46.0),
+        )
+
+
+class TestGroupContiguousDays:
+    """Tests for the _group_contiguous_days helper."""
+
+    def test_empty_list(self):
+        from met_timeseries.sources.nldas import _group_contiguous_days
+
+        assert _group_contiguous_days([]) == []
+
+    def test_single_date(self):
+        from met_timeseries.sources.nldas import _group_contiguous_days
+        import datetime
+
+        days = [pd.Timestamp("2010-01-15")]
+        result = _group_contiguous_days(days)
+        assert result == [(datetime.date(2010, 1, 15), datetime.date(2010, 1, 15))]
+
+    def test_fully_contiguous_block(self):
+        from met_timeseries.sources.nldas import _group_contiguous_days
+        import datetime
+
+        days = pd.date_range("2010-01-01", "2010-01-05").tolist()
+        result = _group_contiguous_days(days)
+        assert result == [(datetime.date(2010, 1, 1), datetime.date(2010, 1, 5))]
+
+    def test_block_with_gap(self):
+        from met_timeseries.sources.nldas import _group_contiguous_days
+        import datetime
+
+        days = [
+            pd.Timestamp("2010-01-01"),
+            pd.Timestamp("2010-01-02"),
+            pd.Timestamp("2010-01-03"),
+            pd.Timestamp("2010-01-10"),
+            pd.Timestamp("2010-01-11"),
+        ]
+        result = _group_contiguous_days(days)
+        assert result == [
+            (datetime.date(2010, 1, 1), datetime.date(2010, 1, 3)),
+            (datetime.date(2010, 1, 10), datetime.date(2010, 1, 11)),
+        ]
+
+    def test_all_separate_days(self):
+        from met_timeseries.sources.nldas import _group_contiguous_days
+        import datetime
+
+        days = [pd.Timestamp("2010-01-01"), pd.Timestamp("2010-01-03"), pd.Timestamp("2010-01-05")]
+        result = _group_contiguous_days(days)
+        assert result == [
+            (datetime.date(2010, 1, 1), datetime.date(2010, 1, 1)),
+            (datetime.date(2010, 1, 3), datetime.date(2010, 1, 3)),
+            (datetime.date(2010, 1, 5), datetime.date(2010, 1, 5)),
+        ]
+
+    def test_cross_month_boundary(self):
+        from met_timeseries.sources.nldas import _group_contiguous_days
+        import datetime
+
+        days = pd.date_range("2010-01-30", "2010-02-02").tolist()
+        result = _group_contiguous_days(days)
+        assert result == [(datetime.date(2010, 1, 30), datetime.date(2010, 2, 2))]
+
+
+class TestOverwriteCache:
+    """Tests for the overwrite_cache parameter in fetch_nldas_grid."""
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_overwrite_cache_false_loads_from_cache(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
+    ):
+        """With overwrite_cache=False (default), cached days are loaded without calling earthaccess."""
+        year_dir = tmp_path / "nldas" / "2010"
+        year_dir.mkdir(parents=True)
+        cached_ds = _make_single_granule_dataset("2010-01-15T00:00:00")
+        cached_ds.to_netcdf(year_dir / "20100115.nc")
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        result = fetch_nldas_grid(
+            bounds,
+            start="2010-01-15",
+            cache_dir=str(tmp_path),
+            overwrite_cache=False,
+        )
+
+        # earthaccess should not be called because the day is cached
+        mock_login.assert_not_called()
+        mock_search.assert_not_called()
+        assert len(result["time"]) == 1
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_overwrite_cache_true_ignores_existing_cache(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
+    ):
+        """With overwrite_cache=True, cached files are ignored and re-downloaded."""
+        year_dir = tmp_path / "nldas" / "2010"
+        year_dir.mkdir(parents=True)
+        old_ds = _make_single_granule_dataset("2010-01-15T00:00:00")
+        cache_file = year_dir / "20100115.nc"
+        old_ds.to_netcdf(cache_file)
+        old_mtime = cache_file.stat().st_mtime
+
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.return_value = _make_single_granule_dataset("2010-01-15T00:00:00")
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        import time as _time
+        _time.sleep(0.01)  # ensure mtime changes on fast filesystems
+
+        fetch_nldas_grid(
+            bounds,
+            start="2010-01-15",
+            cache_dir=str(tmp_path),
+            overwrite_cache=True,
+        )
+
+        # earthaccess should have been called to re-download
+        mock_login.assert_called_once()
+        mock_search.assert_called_once()
+        # Cache file should have been overwritten (newer mtime)
+        assert cache_file.exists()
+        assert cache_file.stat().st_mtime > old_mtime
+
+    @patch("met_timeseries.sources.nldas._open_and_subset_granule")
+    @patch("earthaccess.open")
+    @patch("earthaccess.search_data")
+    @patch("earthaccess.login")
+    def test_overwrite_cache_true_with_no_existing_cache(
+        self, mock_login, mock_search, mock_open, mock_subset, bounds, tmp_path
+    ):
+        """overwrite_cache=True downloads and caches data even when cache is empty."""
+        mock_search.return_value = [MagicMock()]
+        mock_open.return_value = [MagicMock()]
+        mock_subset.return_value = _make_single_granule_dataset("2010-01-15T00:00:00")
+
+        from met_timeseries.sources.nldas import fetch_nldas_grid
+
+        fetch_nldas_grid(
+            bounds,
+            start="2010-01-15",
+            cache_dir=str(tmp_path),
+            overwrite_cache=True,
+        )
+
+        mock_login.assert_called_once()
+        mock_search.assert_called_once()
+        cache_file = tmp_path / "nldas" / "2010" / "20100115.nc"
+        assert cache_file.exists()
 
 
 class TestConcurrentDownloads:
