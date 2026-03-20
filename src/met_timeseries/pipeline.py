@@ -8,6 +8,7 @@ Entry point: :func:`run_pipeline`.
 from __future__ import annotations
 
 import logging
+import calendar
 from pathlib import Path
 
 import pandas as pd
@@ -63,7 +64,6 @@ def run_pipeline(config: PipelineConfig) -> None:
             year=year,
             month=month,
             output_dir=config.output_dir,
-            cache_dir=config.cache_dir,
             variables=config.variables,
             ledger_path=config.ledger_path,
         )
@@ -75,7 +75,6 @@ def process_nldas_month(
     year: int,
     month: int,
     output_dir: str,
-    cache_dir: str,
     variables: list[str],
     ledger_path: str,
 ) -> None:
@@ -94,8 +93,6 @@ def process_nldas_month(
         Calendar month (1–12).
     output_dir:
         Root directory for output Parquet files.
-    cache_dir:
-        Directory used to cache downloaded NLDAS files.
     variables:
         NLDAS-2 variable names to process.
     ledger_path:
@@ -117,7 +114,13 @@ def process_nldas_month(
             north=geom.bounds[3],
         )
 
-        raw = fetch_nldas_grid(bounds, year, month, variables=variables, cache_dir=cache_dir)
+        last_day = calendar.monthrange(year, month)[1]
+        raw = fetch_nldas_grid(
+            bounds,
+            start=f"{year}-{month:02d}-01",
+            end=f"{year}-{month:02d}-{last_day:02d}",
+            variables=variables,
+        )
         derived = derive_variables(raw)
 
         for var_name, da in derived.items():

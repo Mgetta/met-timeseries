@@ -83,7 +83,6 @@ class TestProcessNldasMonth:
                 year=2000,
                 month=1,
                 output_dir=str(tmp_path / "output"),
-                cache_dir=str(tmp_path / "cache"),
                 variables=["APCP", "TMP"],
                 ledger_path=ledger,
             )
@@ -105,7 +104,6 @@ class TestProcessNldasMonth:
                 year=2000,
                 month=1,
                 output_dir=str(tmp_path / "output"),
-                cache_dir=str(tmp_path / "cache"),
                 variables=["APCP"],
                 ledger_path=ledger,
             )
@@ -129,7 +127,6 @@ class TestProcessNldasMonth:
                 year=2000,
                 month=3,
                 output_dir=str(output_dir),
-                cache_dir=str(tmp_path / "cache"),
                 variables=["APCP", "TMP"],
                 ledger_path=ledger,
             )
@@ -155,7 +152,6 @@ class TestProcessNldasMonth:
                 year=2000,
                 month=4,
                 output_dir=str(output_dir),
-                cache_dir=str(tmp_path / "cache"),
                 variables=["APCP"],
                 ledger_path=ledger,
             )
@@ -183,7 +179,6 @@ class TestProcessNldasMonth:
                 year=2000,
                 month=5,
                 output_dir=str(output_dir),
-                cache_dir=str(tmp_path / "cache"),
                 variables=["APCP"],
                 ledger_path=ledger,
             )

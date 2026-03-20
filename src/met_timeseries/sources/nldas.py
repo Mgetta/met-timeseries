@@ -487,50 +487,13 @@ def _fetch_date_range_granules(
     return ds
 
 
-def _group_contiguous_days(
-    days: list[pd.Timestamp],
-) -> list[tuple[dt.date, dt.date]]:
-    """Group a sorted list of dates into contiguous ``(start, end)`` runs.
-
-    Parameters
-    ----------
-    days:
-        Sorted list of :class:`pandas.Timestamp` objects.
-
-    Returns
-    -------
-    list of (start, end) tuples
-        Each tuple represents a contiguous run of dates.  For example,
-        ``[Jan 1, Jan 2, Jan 3, Jan 10, Jan 11]`` yields
-        ``[(Jan 1, Jan 3), (Jan 10, Jan 11)]``.
-    """
-    if not days:
-        return []
-
-    runs: list[tuple[dt.date, dt.date]] = []
-    run_start = days[0]
-    run_end = days[0]
-
-    for day in days[1:]:
-        if (day.date() - run_end.date()).days == 1:
-            run_end = day
-        else:
-            runs.append((run_start.date(), run_end.date()))
-            run_start = day
-            run_end = day
-
-    runs.append((run_start.date(), run_end.date()))
-    return runs
-
 
 def fetch_nldas_grid(
     bounds: BoundingBox,
     start: str,
     end: str | None = None,
     variables: list[str] | None = None,
-    cache_dir: str | None = None,
     max_connections: int = 8,
-    overwrite_cache: bool = False,
 ) -> xr.Dataset:
     """Fetch NLDAS-2 hourly gridded data for the given bounding box.
 
@@ -554,15 +517,8 @@ def fetch_nldas_grid(
     variables:
         NLDAS-2 short variable names to include.  Defaults to ``["APCP",
         "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
-    cache_dir:
-        If provided, subsetted daily NetCDF files are cached here and
-        loaded on subsequent calls for the same days.
     max_connections:
         Maximum number of concurrent granule downloads.  Defaults to ``8``.
-    overwrite_cache:
-        When ``True``, ignore existing cache files and re-download all
-        data, overwriting any previously cached daily NetCDF files.
-        Defaults to ``False`` (use cache when available).
 
     Returns
     -------
@@ -588,78 +544,11 @@ def fetch_nldas_grid(
             f"end ({end!r}) must not be before start ({start!r})"
         )
 
-    all_days = pd.date_range(start_date, end_date, freq="D")
+    earthaccess.login()
 
-    logger.info(
-        "Fetching NLDAS-2 data: %d day(s) from %s to %s bounds=%r",
-        len(all_days), start, end or start, bounds,
+    return _fetch_date_range_granules(
+        bounds, str(start_date), str(end_date), variables, max_connections
     )
-
-    # Partition days into cached and to-download in a single pass
-    cached_days: list[pd.Timestamp] = []
-    uncached_days: list[pd.Timestamp] = []
-    for day in all_days:
-        if (
-            cache_dir
-            and _daily_cache_path(cache_dir, day.year, day.month, day.day).exists()
-            and not overwrite_cache
-        ):
-            cached_days.append(day)
-        else:
-            uncached_days.append(day)
-
-    if uncached_days:
-        earthaccess.login()
-
-    # Download each contiguous run of uncached days with a single CMR search
-    downloaded: dict[str, xr.Dataset] = {}
-    for run_start, run_end in _group_contiguous_days(uncached_days):
-        run_ds = _fetch_date_range_granules(
-            bounds, str(run_start), str(run_end), variables, max_connections
-        )
-        times = pd.DatetimeIndex(run_ds.time.values)
-        for day in pd.date_range(run_start, run_end, freq="D"):
-            day_indices = np.where(
-                (times.year == day.year)
-                & (times.month == day.month)
-                & (times.day == day.day)
-            )[0]
-            if len(day_indices) == 0:
-                logger.warning("No granules found for %s", day.date())
-                continue
-
-            day_ds = run_ds.isel(time=day_indices)
-
-            if cache_dir is not None:
-                cache_path = _daily_cache_path(cache_dir, day.year, day.month, day.day)
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                day_ds.to_netcdf(cache_path)
-                logger.debug("Cached NLDAS-2 day to: %s", cache_path)
-
-            downloaded[str(day.date())] = day_ds
-
-    # Load all requested days in order (from cache or just-downloaded).
-    # Days with no downloaded data and no cache file are silently skipped
-    # (a warning was already emitted during the download phase).
-    day_datasets: list[xr.Dataset] = []
-    for day in all_days:
-        key = str(day.date())
-        if key in downloaded:
-            day_datasets.append(downloaded[key])
-        elif cache_dir:
-            cache_path = _daily_cache_path(cache_dir, day.year, day.month, day.day)
-            if cache_path.exists():
-                day_datasets.append(xr.open_dataset(cache_path))
-
-    if not day_datasets:
-        raise RuntimeError(
-            f"No usable granules found for the range {start} to {end or start}"
-        )
-
-    if len(day_datasets) == 1:
-        return day_datasets[0]
-
-    return xr.concat(day_datasets, dim="time")
 
 
 # ---------------------------------------------------------------------------
@@ -785,9 +674,6 @@ def compute_nldas_weights(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-def _daily_cache_path(cache_dir: str, year: int, month: int, day: int) -> Path:
-    return Path(cache_dir) / "nldas" / str(year) / f"{year}{month:02d}{day:02d}.nc"
 
 
 def _parse_giovanni_response(text: str) -> pd.Series:
