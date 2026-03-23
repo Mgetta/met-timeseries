@@ -21,7 +21,7 @@ from met_timeseries.ledger import is_complete, mark_complete, get_incomplete
 from met_timeseries.aggregation import aggregate_over_polygon
 from met_timeseries.io import save_timeseries
 from met_timeseries.sources.nldas import fetch_nldas_grid
-from met_timeseries.sources.prism import fetch_prism
+from met_timeseries.sources.prism import fetch_prism_daily
 from met_timeseries.sources.base import BoundingBox
 from met_timeseries.derivations import derive_variables
 
@@ -156,11 +156,10 @@ def process_prism_month(
     year: int,
     month: int,
     output_dir: str,
-    cache_dir: str,
     variables: list[str] | None,
     ledger_path: str,
 ) -> None:
-    """Fetch PRISM data, aggregate over each metzone, and save outputs.
+    """Fetch PRISM daily data, aggregate over each metzone, and save outputs.
 
     Parameters
     ----------
@@ -174,8 +173,6 @@ def process_prism_month(
         Calendar month (1–12).
     output_dir:
         Root directory for output Parquet files.
-    cache_dir:
-        Directory used to cache downloaded PRISM files.
     variables:
         PRISM variable short-names to process.  Defaults to
         ``["ppt", "tmax", "tmin"]``.
@@ -191,6 +188,8 @@ def process_prism_month(
 
     logger.info("Processing PRISM %d-%02d", year, month)
 
+    last_day = calendar.monthrange(year, month)[1]
+
     for _, row in polygons.iterrows():
         metzone_id = row[metzone_column]
         geom = row.geometry
@@ -201,13 +200,27 @@ def process_prism_month(
             north=geom.bounds[3],
         )
 
-        ds = fetch_prism(bounds, year, month, variables=variables, cache_dir=cache_dir)
+        ds = fetch_prism_daily(
+            bounds,
+            start=f"{year}-{month:02d}-01",
+            end=f"{year}-{month:02d}-{last_day:02d}",
+            variables=variables,
+        )
 
-        for var_name in ds.data_vars:
-            stats = aggregate_over_polygon(ds[[var_name]], geom)
-            row_df = pd.DataFrame(
-                [{"year": year, "month": month, **stats}]
-            )
+        for var_name, da in ds.items():
+            stats = aggregate_over_polygon(xr.Dataset({var_name: da}), geom)
+            values = stats[var_name]
+            if isinstance(values, list):
+                # Daily timeseries: one row per timestep
+                time_coords = da.coords["time"].values if "time" in da.coords else range(len(values))
+                row_df = pd.DataFrame({
+                    "datetime": pd.to_datetime(time_coords),
+                    "year": year,
+                    "month": month,
+                    var_name: values,
+                })
+            else:
+                row_df = pd.DataFrame([{"year": year, "month": month, **stats}])
             save_timeseries(
                 df=row_df,
                 output_dir=output_dir,
