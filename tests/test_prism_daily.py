@@ -76,7 +76,7 @@ def _make_fake_dataarray(
 def _make_mock_fetch_single_day(value: float = 1.0):
     """Return a side_effect callable that produces DataArrays with lat/lon dims."""
 
-    def _side_effect(bounds, date, variable, resolution="4km"):
+    def _side_effect(bounds, date, variable, resolution="4km", cache_dir=None):
         lats = np.array([45.5, 45.0])
         lons = np.array([-110.0, -109.5, -109.0])
         data = np.full((len(lats), len(lons)), value, dtype=np.float32)
@@ -222,6 +222,41 @@ class TestFetchPrismInterface:
 
         # 3 days × 2 variables = 6 calls
         assert mock_fn.call_count == 6
+
+
+# ---------------------------------------------------------------------------
+# Tests for fetch_prism cache_dir parameter
+# ---------------------------------------------------------------------------
+
+class TestFetchPrismCacheDir:
+    """Test that cache_dir is threaded through fetch_prism → _fetch_single_day."""
+
+    def test_cache_dir_passed_to_fetch_single_day(self, bounds, tmp_path):
+        from met_timeseries.sources.prism import fetch_prism
+
+        cache_dir = tmp_path / "prism_cache"
+        mock_fn = MagicMock(side_effect=_make_mock_fetch_single_day())
+
+        with patch("met_timeseries.sources.prism._fetch_single_day", mock_fn), \
+             patch("met_timeseries.sources.prism.time.sleep"):
+            fetch_prism(bounds, start="2020-06-15", variables=["ppt"], cache_dir=cache_dir)
+
+        assert mock_fn.call_count > 0
+        call_kwargs = mock_fn.call_args_list[0]
+        assert call_kwargs.kwargs.get("cache_dir") == cache_dir
+
+    def test_none_cache_dir_passed_to_fetch_single_day(self, bounds):
+        from met_timeseries.sources.prism import fetch_prism
+
+        mock_fn = MagicMock(side_effect=_make_mock_fetch_single_day())
+
+        with patch("met_timeseries.sources.prism._fetch_single_day", mock_fn), \
+             patch("met_timeseries.sources.prism.time.sleep"):
+            fetch_prism(bounds, start="2020-06-15", variables=["ppt"], cache_dir=None)
+
+        assert mock_fn.call_count > 0
+        call_kwargs = mock_fn.call_args_list[0]
+        assert call_kwargs.kwargs.get("cache_dir") is None
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +436,89 @@ class TestDownloadPrismZip:
         assert result.exists()
         assert result.suffix == ".zip"
 
+    def test_no_cache_dir_saves_to_dest_dir(self, tmp_path):
+        from met_timeseries.sources.prism import _download_prism_zip
+
+        def fake_retrieve(url, dest):
+            Path(dest).write_bytes(b"fake zip content")
+
+        with patch("urllib.request.urlretrieve", side_effect=fake_retrieve):
+            result = _download_prism_zip(
+                "http://example.com/ok.zip",
+                tmp_path,
+                variable="ppt",
+                resolution="4km",
+                date="20200615",
+                cache_dir=None,
+            )
+
+        assert result.parent == tmp_path
+        assert result.name == "prism_data.zip"
+
+    def test_cache_dir_saves_with_expected_filename(self, tmp_path):
+        from met_timeseries.sources.prism import _download_prism_zip
+
+        cache_dir = tmp_path / "cache"
+
+        def fake_retrieve(url, dest):
+            Path(dest).write_bytes(b"fake zip content")
+
+        with patch("urllib.request.urlretrieve", side_effect=fake_retrieve):
+            result = _download_prism_zip(
+                "http://example.com/ok.zip",
+                tmp_path,
+                variable="ppt",
+                resolution="4km",
+                date="20200615",
+                cache_dir=cache_dir,
+            )
+
+        assert result.parent == cache_dir
+        assert result.name == "prism_ppt_4km_20200615.zip"
+        assert result.exists()
+
+    def test_cache_dir_created_if_not_exists(self, tmp_path):
+        from met_timeseries.sources.prism import _download_prism_zip
+
+        cache_dir = tmp_path / "new" / "nested" / "cache"
+        assert not cache_dir.exists()
+
+        def fake_retrieve(url, dest):
+            Path(dest).write_bytes(b"fake zip content")
+
+        with patch("urllib.request.urlretrieve", side_effect=fake_retrieve):
+            _download_prism_zip(
+                "http://example.com/ok.zip",
+                tmp_path,
+                variable="tmin",
+                resolution="800m",
+                date="20210101",
+                cache_dir=cache_dir,
+            )
+
+        assert cache_dir.exists()
+
+    def test_cache_dir_accepts_str(self, tmp_path):
+        from met_timeseries.sources.prism import _download_prism_zip
+
+        cache_dir = str(tmp_path / "cache_str")
+
+        def fake_retrieve(url, dest):
+            Path(dest).write_bytes(b"fake zip content")
+
+        with patch("urllib.request.urlretrieve", side_effect=fake_retrieve):
+            result = _download_prism_zip(
+                "http://example.com/ok.zip",
+                tmp_path,
+                variable="tmax",
+                resolution="4km",
+                date="20201231",
+                cache_dir=cache_dir,
+            )
+
+        assert result.name == "prism_tmax_4km_20201231.zip"
+        assert result.exists()
+
 
 # ---------------------------------------------------------------------------
 # Tests for _extract_tif
@@ -432,6 +550,27 @@ class TestExtractTif:
 
         with pytest.raises(RuntimeError, match="No .tif file"):
             _extract_tif(zip_path)
+
+    def test_extract_dir_overrides_zip_parent(self, tmp_path):
+        """When extract_dir is provided, extraction goes there, not zip_path.parent."""
+        from met_timeseries.sources.prism import _extract_tif
+
+        zip_dir = tmp_path / "zipdir"
+        zip_dir.mkdir()
+        extract_dir = tmp_path / "extractdir"
+        extract_dir.mkdir()
+
+        zip_path = zip_dir / "test.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("prism_data.tif", b"FAKE TIF DATA")
+
+        result = _extract_tif(zip_path, extract_dir=extract_dir)
+
+        assert result.suffix == ".tif"
+        assert result.exists()
+        # The tif must be inside extract_dir, not zip_dir
+        assert extract_dir in result.parents
+        assert zip_dir not in result.parents
 
 
 # ---------------------------------------------------------------------------
