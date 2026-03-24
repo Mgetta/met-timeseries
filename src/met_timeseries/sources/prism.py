@@ -38,6 +38,8 @@ AVAILABLE_VARIABLES: list[str] = [
     "vpdmax", # maximum vapour-pressure deficit (hPa)
 ]
 
+
+
 _URL_TEMPLATE = "https://services.nacse.org/prism/data/get/us/{resolution}/{variable}/{date}"
 _RELEASE_DATE_URL_TEMPLATE = "https://services.nacse.org/prism/data/get/releaseDate/us/{resolution}/{variable}/{date}"
 
@@ -45,12 +47,12 @@ VALID_RESOLUTIONS = ("800m", "4km")
 
 
 def fetch_prism(
-    bounds: BoundingBox,
     start: str,
+    cache_dir: Path | str,
+    variables : list[str],
+    bounds: BoundingBox | None = None,
     end: str | None = None,
-    variables: list[str] | None = None,
     resolution: str = "4km",
-    cache_dir: Path | str | None = None,
 ) -> xr.Dataset:
     """Fetch daily PRISM climate data for the given bounding box and date range.
 
@@ -72,11 +74,8 @@ def fetch_prism(
     resolution:
         Grid resolution.  One of ``"800m"`` or ``"4km"``.
     cache_dir:
-        Optional directory in which to persist downloaded zip files.  When
-        ``None`` (the default), zip files are written to a temporary directory
-        and discarded after extraction.  When a path is provided, each zip is
-        saved as ``prism_{variable}_{resolution}_{date}.zip`` under that
-        directory (created automatically if it does not exist).
+        Directory in which to persist downloaded zip files.  Each zip is saved as
+        ``prism_{variable}_{resolution}_{date}.zip`` under that directory (created automatically if it does not exist).
 
     Returns
     -------
@@ -96,17 +95,13 @@ def fetch_prism(
             f"Invalid resolution {resolution!r}; must be one of {VALID_RESOLUTIONS}"
         )
 
-    if variables is None:
-        variables = ["ppt", "tmax", "tmin"]
-
+    # Validate date inputs and construct list of all dates to fetch
     start_date = dt.date.fromisoformat(start)
     end_date = dt.date.fromisoformat(end) if end is not None else start_date
-
     if end_date < start_date:
         raise ValueError(
             f"end ({end!r}) must not be before start ({start!r})"
         )
-
     logger.info(
         "Fetching PRISM daily data: start=%s end=%s variables=%s bounds=%r",
         start_date, end_date, variables, bounds,
@@ -117,18 +112,20 @@ def fetch_prism(
         for i in range((end_date - start_date).days + 1)
     ]
 
-    arrays_by_var: dict[str, list[xr.DataArray]] = {var: [] for var in variables}
-
-    for date in all_days:
-        for var in variables:
-            da = _fetch_single_day(bounds, date, var, resolution, cache_dir=cache_dir)
-            arrays_by_var[var].append(da)
-        time.sleep(2)
-
     time_coords = [
         dt.datetime(d.year, d.month, d.day) for d in all_days
     ]
 
+    # Download each day's raster, clip to bounds, and collect into lists by variable
+    arrays_by_var: dict[str, list[xr.DataArray]] = {var: [] for var in variables}
+    for date in all_days:
+        for var in variables:
+            zip_path = _download(date, var, resolution, cache_dir)
+            da = _load_from_zip(zip_path, var, resolution, date,bounds)
+            arrays_by_var[var].append(da)
+            time.sleep(2)
+
+    # Stack each variable's daily arrays along a new time dimension, and combine into a Dataset
     dataset_vars: dict[str, xr.DataArray] = {}
     for var, day_arrays in arrays_by_var.items():
         stacked = xr.concat(day_arrays, dim="time")
@@ -136,10 +133,6 @@ def fetch_prism(
         dataset_vars[var] = stacked
 
     return xr.Dataset(dataset_vars)
-
-
-# Keep old name as an alias for backwards compatibility
-fetch_prism_daily = fetch_prism
 
 
 def get_release_date(
@@ -202,8 +195,13 @@ def get_release_date(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_single_day(
-    bounds: BoundingBox,
+RESOLUTION_MAP = {
+    "400m": "15s",
+    "800m": "30s",
+    "4km": "25m",
+}
+
+def _download(
     date: dt.date,
     variable: str,
     resolution: str = "4km",
@@ -230,28 +228,43 @@ def _fetch_single_day(
     xarray.DataArray
         2-D DataArray with ``lat`` and ``lon`` dimensions (no ``time`` dim).
     """
-    date_str = date.strftime("%Y%m%d")
-    url = _URL_TEMPLATE.format(
-        resolution=resolution, variable=variable, date=date_str
-    )
-    logger.debug("Fetching PRISM daily %s for %s from %s", variable, date, url)
 
-    zip_path = _download_prism_zip(
+    url = _construct_url(variable, resolution, date)
+    logger.debug("Downloading PRISM daily %s for %s from %s", variable, date, url)
+    
+    zip_path = _download_url(
         url,
         cache_dir,
         variable=variable,
         resolution=resolution,
-        date=date_str,
+        date= date,
     )
+    return zip_path
 
-    tif_path = _extract_tif(zip_path)
 
+def _construct_url(variable: str, resolution: str, date: dt.date) -> str:
+    date_str = date.strftime("%Y%m%d")
+    url = _URL_TEMPLATE.format(
+        resolution=resolution, variable=variable, date=date_str
+    )
+    return url
+
+def _load_from_zip(zip_path: Path, variable: str, resolution: str, date: dt.date, bounds: BoundingBox = None) -> xr.DataArray:
+    # Uses rasterio via xarray's "rasterio" engine, which supports reading from
+    # zip files via vsizip.  This avoids the overhead of extracting the .tif to disk first.
+
+    _resolution = RESOLUTION_MAP[resolution]
+    date_str = date.strftime("%Y%m%d")
+
+    vsi_path = f"/vsizip/{zip_path.as_posix()}/prism_{variable}_us_{_resolution}_{date_str}.tif"
     import rioxarray  # type: ignore[import]
 
-    da = xr.open_dataarray(tif_path, engine="rasterio")
-    da = da.rio.clip_box(
-        minx=bounds.west, miny=bounds.south, maxx=bounds.east, maxy=bounds.north
-    )
+    da = xr.open_dataarray(vsi_path, engine="rasterio")
+
+    if bounds is not None:
+        da = da.rio.clip_box(
+            minx=bounds.west, miny=bounds.south, maxx=bounds.east, maxy=bounds.north
+        )
 
     # Squeeze out the band dimension if present (common with rasterio engine)
     if "band" in da.dims:
@@ -274,12 +287,12 @@ def _fetch_single_day(
     return da
 
 
-def _download_prism_zip(
+def _download_url(
     url: str,
     cache_dir: Path | str,
-    variable: str = "",
-    resolution: str = "",
-    date: str = "",
+    variable: str ,
+    resolution: str ,
+    date: dt.date
     
 ) -> Path:
     """Download a PRISM zip file; return path to the local copy.
@@ -311,10 +324,10 @@ def _download_prism_zip(
     RuntimeError
         If the download fails.
     """
-    if not variable or not resolution or not date:
-        raise ValueError(
-            "variable, resolution, and date are required"
-        )
+    date = date.strftime("%Y%m%d")
+    assert resolution in RESOLUTION_MAP.keys(), f"Invalid resolution {resolution!r}"
+    assert variable in AVAILABLE_VARIABLES, f"Invalid variable {variable!r}"
+
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
     dest = cache_path / f"prism_{variable}_{resolution}_{date}.zip"
@@ -328,36 +341,3 @@ def _download_prism_zip(
         except Exception as exc:
             raise RuntimeError(f"Failed to download PRISM data from {url}: {exc}") from exc
     return dest
-
-
-def _extract_tif(zip_path: Path, extract_dir: Path | None = None) -> Path:
-    """Extract the ``.tif`` file from *zip_path*; return its path.
-
-    Parameters
-    ----------
-    zip_path:
-        Path to the downloaded PRISM zip archive.
-    extract_dir:
-        Directory in which to extract the archive.  Defaults to the parent
-        directory of *zip_path* when ``None``.
-
-    Returns
-    -------
-    Path
-        Path to the extracted ``.tif`` raster file.
-
-    Raises
-    ------
-    RuntimeError
-        If no ``.tif`` file is found inside the archive.
-    """
-    out_dir = (extract_dir if extract_dir is not None else zip_path.parent) / "extracted"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(out_dir)
-
-    tif_files = list(out_dir.glob("*.tif"))
-    if not tif_files:
-        raise RuntimeError(f"No .tif file found in {zip_path}")
-    return tif_files[0]
