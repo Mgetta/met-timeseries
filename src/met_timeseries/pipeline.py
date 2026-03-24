@@ -21,7 +21,7 @@ from met_timeseries.ledger import is_complete, mark_complete, get_incomplete
 from met_timeseries.aggregation import aggregate_over_polygon
 from met_timeseries.io import save_timeseries
 from met_timeseries.sources.nldas import fetch_nldas_grid
-from met_timeseries.sources.prism import fetch_prism_daily
+from met_timeseries.sources.prism import fetch_prism
 from met_timeseries.sources.base import BoundingBox
 from met_timeseries.derivations import derive_variables
 
@@ -200,7 +200,7 @@ def process_prism_month(
             north=geom.bounds[3],
         )
 
-        ds = fetch_prism_daily(
+        ds = fetch_prism(
             bounds,
             start=f"{year}-{month:02d}-01",
             end=f"{year}-{month:02d}-{last_day:02d}",

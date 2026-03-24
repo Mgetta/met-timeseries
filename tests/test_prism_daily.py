@@ -7,6 +7,7 @@ All HTTP downloads are mocked so the tests run without network access.
 from __future__ import annotations
 
 import datetime
+import json
 import sys
 import zipfile
 from pathlib import Path
@@ -39,7 +40,7 @@ def _make_fake_dataarray(
     """Return a tiny DataArray that simulates rasterio engine output.
 
     By default includes a ``band`` dimension and ``y``/``x`` coordinate names
-    to mimic how rioxarray opens a BIL file.
+    to mimic how rioxarray opens a TIF file.
     """
     if lats is None:
         lats = np.array([45.5, 45.0])
@@ -75,7 +76,7 @@ def _make_fake_dataarray(
 def _make_mock_fetch_single_day(value: float = 1.0):
     """Return a side_effect callable that produces DataArrays with lat/lon dims."""
 
-    def _side_effect(bounds, date, variable):
+    def _side_effect(bounds, date, variable, resolution="4km"):
         lats = np.array([45.5, 45.0])
         lons = np.array([-110.0, -109.5, -109.0])
         data = np.full((len(lats), len(lons)), value, dtype=np.float32)
@@ -91,135 +92,195 @@ def _make_mock_fetch_single_day(value: float = 1.0):
 
 
 # ---------------------------------------------------------------------------
-# Tests for fetch_prism_daily
+# Tests for fetch_prism
 # ---------------------------------------------------------------------------
 
-class TestFetchPrismDailyInterface:
-    """Test the public fetch_prism_daily function."""
+class TestFetchPrismInterface:
+    """Test the public fetch_prism function."""
 
     def test_returns_dataset(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-06-15")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-06-15")
 
         assert isinstance(ds, xr.Dataset)
 
     def test_single_day_has_one_time_step(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-06-15")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-06-15")
 
         assert "time" in ds.dims
         assert ds.sizes["time"] == 1
 
     def test_multi_day_range(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-06-01", end="2020-06-05")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-06-01", end="2020-06-05")
 
         assert ds.sizes["time"] == 5
 
     def test_end_same_as_start_gives_one_day(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-01-10", end="2020-01-10")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-01-10", end="2020-01-10")
 
         assert ds.sizes["time"] == 1
 
     def test_has_lat_lon_dims(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-06-01", end="2020-06-03")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-06-01", end="2020-06-03")
 
         assert "lat" in ds.dims
         assert "lon" in ds.dims
 
     def test_time_coords_are_datetime64(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-03-01", end="2020-03-03")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-03-01", end="2020-03-03")
 
         times = ds.coords["time"].values
         assert np.issubdtype(times.dtype, np.datetime64)
 
     def test_time_coords_match_requested_dates(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-03-01", end="2020-03-03")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-03-01", end="2020-03-03")
 
         times = ds.coords["time"].values.astype("datetime64[D]").astype(str).tolist()
         assert times == ["2020-03-01", "2020-03-02", "2020-03-03"]
 
     def test_default_variables(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(bounds, start="2020-06-15")
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-06-15")
 
         assert set(ds.data_vars) == {"ppt", "tmax", "tmin"}
 
     def test_custom_variables(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with patch(
             "met_timeseries.sources.prism._fetch_single_day",
             side_effect=_make_mock_fetch_single_day(),
-        ):
-            ds = fetch_prism_daily(
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(
                 bounds, start="2020-06-15", variables=["ppt", "tmean"]
             )
 
         assert set(ds.data_vars) == {"ppt", "tmean"}
 
     def test_raises_value_error_when_end_before_start(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         with pytest.raises(ValueError, match="end.*before start"):
-            fetch_prism_daily(bounds, start="2020-06-15", end="2020-06-10")
+            fetch_prism(bounds, start="2020-06-15", end="2020-06-10")
 
     def test_calls_fetch_single_day_for_each_day_and_variable(self, bounds):
-        from met_timeseries.sources.prism import fetch_prism_daily
+        from met_timeseries.sources.prism import fetch_prism
 
         mock_fn = MagicMock(side_effect=_make_mock_fetch_single_day())
 
-        with patch("met_timeseries.sources.prism._fetch_single_day", mock_fn):
-            fetch_prism_daily(
+        with patch("met_timeseries.sources.prism._fetch_single_day", mock_fn), \
+             patch("met_timeseries.sources.prism.time.sleep"):
+            fetch_prism(
                 bounds, start="2020-01-01", end="2020-01-03", variables=["ppt", "tmax"]
             )
 
         # 3 days × 2 variables = 6 calls
         assert mock_fn.call_count == 6
+
+
+# ---------------------------------------------------------------------------
+# Tests for fetch_prism resolution validation
+# ---------------------------------------------------------------------------
+
+class TestFetchPrismResolution:
+    """Test resolution parameter validation in fetch_prism."""
+
+    def test_default_resolution_is_4km(self, bounds):
+        from met_timeseries.sources.prism import fetch_prism
+
+        with patch(
+            "met_timeseries.sources.prism._fetch_single_day",
+            side_effect=_make_mock_fetch_single_day(),
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-06-15")
+
+        assert isinstance(ds, xr.Dataset)
+
+    def test_valid_resolution_800m(self, bounds):
+        from met_timeseries.sources.prism import fetch_prism
+
+        with patch(
+            "met_timeseries.sources.prism._fetch_single_day",
+            side_effect=_make_mock_fetch_single_day(),
+        ), patch("met_timeseries.sources.prism.time.sleep"):
+            ds = fetch_prism(bounds, start="2020-06-15", resolution="800m")
+
+        assert isinstance(ds, xr.Dataset)
+
+    def test_invalid_resolution_raises(self, bounds):
+        from met_timeseries.sources.prism import fetch_prism
+
+        with pytest.raises(ValueError):
+            fetch_prism(bounds, start="2020-06-15", resolution="400m")
+
+
+# ---------------------------------------------------------------------------
+# Tests for sleep between requests
+# ---------------------------------------------------------------------------
+
+class TestSleepBetweenRequests:
+    """Test that time.sleep is called between day requests."""
+
+    def test_sleep_called_between_requests(self, bounds):
+        from met_timeseries.sources.prism import fetch_prism
+
+        mock_fetch = MagicMock(side_effect=_make_mock_fetch_single_day())
+        mock_sleep = MagicMock()
+
+        with patch("met_timeseries.sources.prism._fetch_single_day", mock_fetch), \
+             patch("met_timeseries.sources.prism.time.sleep", mock_sleep):
+            fetch_prism(
+                bounds, start="2020-06-01", end="2020-06-03", variables=["ppt"]
+            )
+
+        assert mock_sleep.call_count >= 1
+        mock_sleep.assert_any_call(2)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +311,7 @@ class TestFetchSingleDayCoordNormalization:
 
         with (
             patch("met_timeseries.sources.prism._download_prism_zip", return_value=tmp_path / "z.zip"),
-            patch("met_timeseries.sources.prism._extract_bil", return_value=tmp_path / "f.bil"),
+            patch("met_timeseries.sources.prism._extract_tif", return_value=tmp_path / "f.tif"),
             patch("xarray.open_dataarray", return_value=self._make_open_da_mock(da_yx)),
             patch.dict(sys.modules, {"rioxarray": MagicMock()}),
         ):
@@ -277,7 +338,7 @@ class TestFetchSingleDayCoordNormalization:
 
         with (
             patch("met_timeseries.sources.prism._download_prism_zip", return_value=tmp_path / "z.zip"),
-            patch("met_timeseries.sources.prism._extract_bil", return_value=tmp_path / "f.bil"),
+            patch("met_timeseries.sources.prism._extract_tif", return_value=tmp_path / "f.tif"),
             patch("xarray.open_dataarray", return_value=self._make_open_da_mock(da_with_band)),
             patch.dict(sys.modules, {"rioxarray": MagicMock()}),
         ):
@@ -302,7 +363,7 @@ class TestFetchSingleDayCoordNormalization:
 
         with (
             patch("met_timeseries.sources.prism._download_prism_zip", return_value=tmp_path / "z.zip"),
-            patch("met_timeseries.sources.prism._extract_bil", return_value=tmp_path / "f.bil"),
+            patch("met_timeseries.sources.prism._extract_tif", return_value=tmp_path / "f.tif"),
             patch("xarray.open_dataarray", return_value=self._make_open_da_mock(da_band_yx)),
             patch.dict(sys.modules, {"rioxarray": MagicMock()}),
         ):
@@ -342,35 +403,111 @@ class TestDownloadPrismZip:
 
 
 # ---------------------------------------------------------------------------
-# Tests for _extract_bil
+# Tests for _extract_tif
 # ---------------------------------------------------------------------------
 
-class TestExtractBil:
-    def _make_zip_with_bil(self, tmp_path: Path) -> Path:
-        """Create a minimal zip containing a dummy .bil file."""
+class TestExtractTif:
+    def _make_zip_with_tif(self, tmp_path: Path) -> Path:
+        """Create a minimal zip containing a dummy .tif file."""
         zip_path = tmp_path / "test.zip"
         with zipfile.ZipFile(zip_path, "w") as zf:
-            zf.writestr("prism_data.bil", b"FAKE BIL DATA")
+            zf.writestr("prism_data.tif", b"FAKE TIF DATA")
         return zip_path
 
-    def test_returns_bil_path(self, tmp_path):
-        from met_timeseries.sources.prism import _extract_bil
+    def test_returns_tif_path(self, tmp_path):
+        from met_timeseries.sources.prism import _extract_tif
 
-        zip_path = self._make_zip_with_bil(tmp_path)
-        result = _extract_bil(zip_path)
+        zip_path = self._make_zip_with_tif(tmp_path)
+        result = _extract_tif(zip_path)
 
-        assert result.suffix == ".bil"
+        assert result.suffix == ".tif"
         assert result.exists()
 
-    def test_raises_if_no_bil_in_zip(self, tmp_path):
-        from met_timeseries.sources.prism import _extract_bil
+    def test_raises_if_no_tif_in_zip(self, tmp_path):
+        from met_timeseries.sources.prism import _extract_tif
 
         zip_path = tmp_path / "empty.zip"
         with zipfile.ZipFile(zip_path, "w") as zf:
-            zf.writestr("readme.txt", "no bil here")
+            zf.writestr("readme.txt", "no tif here")
 
-        with pytest.raises(RuntimeError, match="No .bil file"):
-            _extract_bil(zip_path)
+        with pytest.raises(RuntimeError, match="No .tif file"):
+            _extract_tif(zip_path)
+
+
+# ---------------------------------------------------------------------------
+# Tests for get_release_date
+# ---------------------------------------------------------------------------
+
+class TestGetReleaseDate:
+    """Test the get_release_date function."""
+
+    def _mock_urlopen(self, response_dict):
+        """Return a MagicMock that works as a context manager for urlopen."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(response_dict).encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    def test_returns_dict_with_expected_keys(self):
+        from met_timeseries.sources.prism import get_release_date
+
+        payload = {
+            "data_date": "19990101",
+            "release_date": "20000101",
+            "element": "tmin",
+            "grid_count": 1,
+            "data_url": "https://example.com/data",
+        }
+        mock_resp = self._mock_urlopen(payload)
+
+        with patch("met_timeseries.sources.prism.urllib.request.urlopen", return_value=mock_resp):
+            result = get_release_date("tmin", "1999-01-01")
+
+        assert isinstance(result, dict)
+        for key in ("data_date", "release_date", "element", "grid_count", "data_url"):
+            assert key in result
+
+    def test_correct_url_construction(self):
+        from met_timeseries.sources.prism import get_release_date
+
+        payload = {
+            "data_date": "19990101",
+            "release_date": "20000101",
+            "element": "tmin",
+            "grid_count": 1,
+            "data_url": "https://example.com/data",
+        }
+        mock_resp = self._mock_urlopen(payload)
+
+        with patch("met_timeseries.sources.prism.urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+            get_release_date("tmin", "1999-01-01")
+
+        called_url = mock_urlopen.call_args[0][0]
+        assert "releaseDate/us/4km/tmin/19990101" in called_url
+        assert called_url.endswith("?json=true")
+
+    def test_invalid_resolution_raises(self):
+        from met_timeseries.sources.prism import get_release_date
+
+        with pytest.raises(ValueError):
+            get_release_date("tmin", "1999-01-01", resolution="400m")
+
+    def test_invalid_variable_raises(self):
+        from met_timeseries.sources.prism import get_release_date
+
+        with pytest.raises(ValueError):
+            get_release_date("invalid_var", "1999-01-01")
+
+    def test_raises_runtime_error_on_http_failure(self):
+        from met_timeseries.sources.prism import get_release_date
+
+        with patch(
+            "met_timeseries.sources.prism.urllib.request.urlopen",
+            side_effect=OSError("connection refused"),
+        ):
+            with pytest.raises(RuntimeError):
+                get_release_date("tmin", "1999-01-01")
 
 
 # ---------------------------------------------------------------------------
