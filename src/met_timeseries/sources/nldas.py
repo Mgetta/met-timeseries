@@ -81,6 +81,18 @@ _GIOVANNI_VARIABLES: dict[str, str] = {
     "APCP": "NLDAS_FORA0125_H_2_0_Rainf",
     "DSWRF": "NLDAS_FORA0125_H_2_0_SWdown",
 }
+    
+_GRID_VARIABLES: dict[str, str] = {
+    "TMP": "Tair",
+    "SPFH": "Qair",
+    "PRES": "PSurf",
+    "UGRD": "Wind_E",
+    "VGRD": "Wind_N",
+    "DLWRF": "LWdown",
+    "PEVAP": "PotEvap",
+    "APCP": "Rainf",
+    "DSWRF": "SWdown",
+}
 
 #: NLDAS-2 grid resolution in degrees; used as the cell buffer when selecting
 #: grid cells that fall within a bounding box.
@@ -355,8 +367,9 @@ def _open_and_subset_granule(
         In-memory Dataset containing only *variables* and the spatial extent
         defined by *bounds*.
     """
+    variables = [_GRID_VARIABLES[v] for v in variables]
     ds = xr.open_dataset(file_obj, engine="h5netcdf")
-    ds = ds[variables]
+    #ds = ds[variables]
     ds = ds.sel(
         lat=slice(bounds.south, bounds.north),
         lon=slice(bounds.west, bounds.east),
