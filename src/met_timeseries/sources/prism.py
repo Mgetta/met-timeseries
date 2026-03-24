@@ -236,67 +236,62 @@ def _fetch_single_day(
     )
     logger.debug("Fetching PRISM daily %s for %s from %s", variable, date, url)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        zip_path = _download_prism_zip(
-            url,
-            tmp_path,
-            variable=variable,
-            resolution=resolution,
-            date=date_str,
-            cache_dir=cache_dir,
-        )
-        tif_path = _extract_tif(zip_path, extract_dir=tmp_path)
+    zip_path = _download_prism_zip(
+        url,
+        cache_dir,
+        variable=variable,
+        resolution=resolution,
+        date=date_str,
+    )
 
-        import rioxarray  # type: ignore[import]
+    tif_path = _extract_tif(zip_path)
 
-        da = xr.open_dataarray(tif_path, engine="rasterio")
-        da = da.rio.clip_box(
-            minx=bounds.west, miny=bounds.south, maxx=bounds.east, maxy=bounds.north
-        )
+    import rioxarray  # type: ignore[import]
 
-        # Squeeze out the band dimension if present (common with rasterio engine)
-        if "band" in da.dims:
-            da = da.sel(band=1, drop=True)
+    da = xr.open_dataarray(tif_path, engine="rasterio")
+    da = da.rio.clip_box(
+        minx=bounds.west, miny=bounds.south, maxx=bounds.east, maxy=bounds.north
+    )
 
-        # Rename y/x to lat/lon to match NLDAS convention
-        rename_map = {}
-        if "y" in da.dims:
-            rename_map["y"] = "lat"
-        if "x" in da.dims:
-            rename_map["x"] = "lon"
-        if rename_map:
-            da = da.rename(rename_map)
+    # Squeeze out the band dimension if present (common with rasterio engine)
+    if "band" in da.dims:
+        da = da.sel(band=1, drop=True)
 
-        da.name = variable
+    # Rename y/x to lat/lon to match NLDAS convention
+    rename_map = {}
+    if "y" in da.dims:
+        rename_map["y"] = "lat"
+    if "x" in da.dims:
+        rename_map["x"] = "lon"
+    if rename_map:
+        da = da.rename(rename_map)
 
-        # Load into memory before the temp directory is cleaned up
-        da = da.load()
+    da.name = variable
+
+    # Load into memory before the temp directory is cleaned up
+    da = da.load()
 
     return da
 
 
 def _download_prism_zip(
     url: str,
-    dest_dir: Path,
+    cache_dir: Path | str,
     variable: str = "",
     resolution: str = "",
     date: str = "",
-    cache_dir: Path | str | None = None,
+    
 ) -> Path:
     """Download a PRISM zip file; return path to the local copy.
 
     When *cache_dir* is provided the zip is saved there as
     ``prism_{variable}_{resolution}_{date}.zip`` (the directory is created if
-    it does not exist).  When *cache_dir* is ``None`` the zip is written to
-    *dest_dir* as ``prism_data.zip`` (existing behaviour).
+    it does not exist).
 
     Parameters
     ----------
     url:
         Full URL to the PRISM zip file.
-    dest_dir:
-        Fallback directory used when *cache_dir* is ``None``.
     variable:
         PRISM variable short-name; used to build the cached filename.
     resolution:
@@ -304,7 +299,7 @@ def _download_prism_zip(
     date:
         Date string in ``YYYYMMDD`` format; used to build the cached filename.
     cache_dir:
-        Optional persistent cache directory.
+        Persistent cache directory.
 
     Returns
     -------
@@ -316,21 +311,22 @@ def _download_prism_zip(
     RuntimeError
         If the download fails.
     """
-    if cache_dir is not None:
-        if not variable or not resolution or not date:
-            raise ValueError(
-                "variable, resolution, and date are required when cache_dir is provided"
-            )
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        dest = cache_path / f"prism_{variable}_{resolution}_{date}.zip"
+    if not variable or not resolution or not date:
+        raise ValueError(
+            "variable, resolution, and date are required"
+        )
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    dest = cache_path / f"prism_{variable}_{resolution}_{date}.zip"
+
+    if dest.exists():
+        logger.debug("Using cached PRISM zip at %s", dest)
     else:
-        dest = dest_dir / "prism_data.zip"
-    logger.debug("Downloading %s -> %s", url, dest)
-    try:
-        urllib.request.urlretrieve(url, dest)  # noqa: S310
-    except Exception as exc:
-        raise RuntimeError(f"Failed to download PRISM data from {url}: {exc}") from exc
+        logger.debug("Downloading %s -> %s", url, dest)
+        try:
+            urllib.request.urlretrieve(url, dest)  # noqa: S310
+        except Exception as exc:
+            raise RuntimeError(f"Failed to download PRISM data from {url}: {exc}") from exc
     return dest
 
 
