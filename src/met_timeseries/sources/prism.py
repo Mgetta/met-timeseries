@@ -1,20 +1,22 @@
 """
 PRISM climate data source.
 
-The public API is :func:`fetch_prism_daily`, which downloads daily PRISM
+The public API is :func:`fetch_prism`, which downloads daily PRISM
 rasters for a given bounding box and date range, and returns an
 :class:`xarray.Dataset` with ``(time, lat, lon)`` dimensions.
 
 PRISM data are downloaded from the Oregon State PRISM Climate Group HTTP
-server (https://prism.oregonstate.edu).  The 4-km (``4kmD2``) daily product
-is used.
+server (https://services.nacse.org/prism/data/get/).  Both 4-km and 800-m
+daily products are supported.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -36,20 +38,22 @@ AVAILABLE_VARIABLES: list[str] = [
     "vpdmax", # maximum vapour-pressure deficit (hPa)
 ]
 
-_URL_TEMPLATE = (
-    "https://services.nacse.org/prism/data/public/4km/{variable}/{year}{month:02d}{day:02d}"
-)
+_URL_TEMPLATE = "https://services.nacse.org/prism/data/get/us/{resolution}/{variable}/{date}"
+_RELEASE_DATE_URL_TEMPLATE = "https://services.nacse.org/prism/data/get/releaseDate/us/{resolution}/{variable}/{date}"
+
+VALID_RESOLUTIONS = ("800m", "4km")
 
 
-def fetch_prism_daily(
+def fetch_prism(
     bounds: BoundingBox,
     start: str,
     end: str | None = None,
     variables: list[str] | None = None,
+    resolution: str = "4km",
 ) -> xr.Dataset:
     """Fetch daily PRISM climate data for the given bounding box and date range.
 
-    Downloads the 4-km daily PRISM rasters for each variable and returns a
+    Downloads PRISM rasters for each variable and returns a
     spatially-subsetted :class:`xarray.Dataset`.
 
     Parameters
@@ -64,6 +68,8 @@ def fetch_prism_daily(
     variables:
         PRISM variable short-names to download.  Defaults to
         ``["ppt", "tmax", "tmin"]``.
+    resolution:
+        Grid resolution.  One of ``"800m"`` or ``"4km"``.
 
     Returns
     -------
@@ -74,10 +80,15 @@ def fetch_prism_daily(
     Raises
     ------
     ValueError
-        If *end* is before *start*.
+        If *end* is before *start* or *resolution* is invalid.
     RuntimeError
         If a download fails for any requested day.
     """
+    if resolution not in VALID_RESOLUTIONS:
+        raise ValueError(
+            f"Invalid resolution {resolution!r}; must be one of {VALID_RESOLUTIONS}"
+        )
+
     if variables is None:
         variables = ["ppt", "tmax", "tmin"]
 
@@ -103,8 +114,9 @@ def fetch_prism_daily(
 
     for date in all_days:
         for var in variables:
-            da = _fetch_single_day(bounds, date, var)
+            da = _fetch_single_day(bounds, date, var, resolution)
             arrays_by_var[var].append(da)
+        time.sleep(2)
 
     time_coords = [
         dt.datetime(d.year, d.month, d.day) for d in all_days
@@ -119,6 +131,66 @@ def fetch_prism_daily(
     return xr.Dataset(dataset_vars)
 
 
+# Keep old name as an alias for backwards compatibility
+fetch_prism_daily = fetch_prism
+
+
+def get_release_date(
+    variable: str,
+    date: str,
+    resolution: str = "4km",
+) -> dict:
+    """Query the PRISM Release Date web service.
+
+    Parameters
+    ----------
+    variable:
+        PRISM variable short-name (must be in AVAILABLE_VARIABLES).
+    date:
+        Date in ``"YYYY-MM-DD"`` format.
+    resolution:
+        Grid resolution. One of ``"800m"`` or ``"4km"``.
+
+    Returns
+    -------
+    dict
+        Keys: ``data_date``, ``release_date``, ``element``, ``grid_count``, ``data_url``.
+
+    Raises
+    ------
+    ValueError
+        If *resolution* or *variable* is invalid.
+    RuntimeError
+        If the HTTP request fails.
+    """
+    if resolution not in VALID_RESOLUTIONS:
+        raise ValueError(
+            f"Invalid resolution {resolution!r}; must be one of {VALID_RESOLUTIONS}"
+        )
+    if variable not in AVAILABLE_VARIABLES:
+        raise ValueError(
+            f"Invalid variable {variable!r}; must be one of {AVAILABLE_VARIABLES}"
+        )
+
+    date_str = date.replace("-", "")
+    url = (
+        _RELEASE_DATE_URL_TEMPLATE.format(
+            resolution=resolution, variable=variable, date=date_str
+        )
+        + "?json=true"
+    )
+
+    try:
+        with urllib.request.urlopen(url) as resp:  # noqa: S310
+            body = resp.read()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to fetch PRISM release date from {url}: {exc}"
+        ) from exc
+
+    return json.loads(body)
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -127,6 +199,7 @@ def _fetch_single_day(
     bounds: BoundingBox,
     date: dt.date,
     variable: str,
+    resolution: str = "4km",
 ) -> xr.DataArray:
     """Download one day's PRISM raster, clip to *bounds*, and return a DataArray.
 
@@ -138,6 +211,8 @@ def _fetch_single_day(
         The calendar date to fetch.
     variable:
         PRISM variable short-name.
+    resolution:
+        Grid resolution (``"800m"`` or ``"4km"``).
 
     Returns
     -------
@@ -145,17 +220,17 @@ def _fetch_single_day(
         2-D DataArray with ``lat`` and ``lon`` dimensions (no ``time`` dim).
     """
     url = _URL_TEMPLATE.format(
-        variable=variable, year=date.year, month=date.month, day=date.day
+        resolution=resolution, variable=variable, date=date.strftime("%Y%m%d")
     )
     logger.debug("Fetching PRISM daily %s for %s from %s", variable, date, url)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         zip_path = _download_prism_zip(url, Path(tmpdir))
-        bil_path = _extract_bil(zip_path)
+        tif_path = _extract_tif(zip_path)
 
         import rioxarray  # type: ignore[import]
 
-        da = xr.open_dataarray(bil_path, engine="rasterio")
+        da = xr.open_dataarray(tif_path, engine="rasterio")
         da = da.rio.clip_box(
             minx=bounds.west, miny=bounds.south, maxx=bounds.east, maxy=bounds.north
         )
@@ -210,8 +285,8 @@ def _download_prism_zip(url: str, dest_dir: Path) -> Path:
     return dest
 
 
-def _extract_bil(zip_path: Path) -> Path:
-    """Extract the ``.bil`` file from *zip_path*; return its path.
+def _extract_tif(zip_path: Path) -> Path:
+    """Extract the ``.tif`` file from *zip_path*; return its path.
 
     Parameters
     ----------
@@ -221,12 +296,12 @@ def _extract_bil(zip_path: Path) -> Path:
     Returns
     -------
     Path
-        Path to the extracted ``.bil`` raster file.
+        Path to the extracted ``.tif`` raster file.
 
     Raises
     ------
     RuntimeError
-        If no ``.bil`` file is found inside the archive.
+        If no ``.tif`` file is found inside the archive.
     """
     out_dir = zip_path.parent / "extracted"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -234,7 +309,7 @@ def _extract_bil(zip_path: Path) -> Path:
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(out_dir)
 
-    bil_files = list(out_dir.glob("*.bil"))
-    if not bil_files:
-        raise RuntimeError(f"No .bil file found in {zip_path}")
-    return bil_files[0]
+    tif_files = list(out_dir.glob("*.tif"))
+    if not tif_files:
+        raise RuntimeError(f"No .tif file found in {zip_path}")
+    return tif_files[0]
