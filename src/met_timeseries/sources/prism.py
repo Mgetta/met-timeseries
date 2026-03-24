@@ -50,6 +50,7 @@ def fetch_prism(
     end: str | None = None,
     variables: list[str] | None = None,
     resolution: str = "4km",
+    cache_dir: Path | str | None = None,
 ) -> xr.Dataset:
     """Fetch daily PRISM climate data for the given bounding box and date range.
 
@@ -70,6 +71,12 @@ def fetch_prism(
         ``["ppt", "tmax", "tmin"]``.
     resolution:
         Grid resolution.  One of ``"800m"`` or ``"4km"``.
+    cache_dir:
+        Optional directory in which to persist downloaded zip files.  When
+        ``None`` (the default), zip files are written to a temporary directory
+        and discarded after extraction.  When a path is provided, each zip is
+        saved as ``prism_{variable}_{resolution}_{date}.zip`` under that
+        directory (created automatically if it does not exist).
 
     Returns
     -------
@@ -114,7 +121,7 @@ def fetch_prism(
 
     for date in all_days:
         for var in variables:
-            da = _fetch_single_day(bounds, date, var, resolution)
+            da = _fetch_single_day(bounds, date, var, resolution, cache_dir=cache_dir)
             arrays_by_var[var].append(da)
         time.sleep(2)
 
@@ -200,6 +207,7 @@ def _fetch_single_day(
     date: dt.date,
     variable: str,
     resolution: str = "4km",
+    cache_dir: Path | str | None = None,
 ) -> xr.DataArray:
     """Download one day's PRISM raster, clip to *bounds*, and return a DataArray.
 
@@ -213,20 +221,32 @@ def _fetch_single_day(
         PRISM variable short-name.
     resolution:
         Grid resolution (``"800m"`` or ``"4km"``).
+    cache_dir:
+        Optional directory in which to persist the downloaded zip file.
+        When ``None``, the zip is discarded after extraction.
 
     Returns
     -------
     xarray.DataArray
         2-D DataArray with ``lat`` and ``lon`` dimensions (no ``time`` dim).
     """
+    date_str = date.strftime("%Y%m%d")
     url = _URL_TEMPLATE.format(
-        resolution=resolution, variable=variable, date=date.strftime("%Y%m%d")
+        resolution=resolution, variable=variable, date=date_str
     )
     logger.debug("Fetching PRISM daily %s for %s from %s", variable, date, url)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = _download_prism_zip(url, Path(tmpdir))
-        tif_path = _extract_tif(zip_path)
+        tmp_path = Path(tmpdir)
+        zip_path = _download_prism_zip(
+            url,
+            tmp_path,
+            variable=variable,
+            resolution=resolution,
+            date=date_str,
+            cache_dir=cache_dir,
+        )
+        tif_path = _extract_tif(zip_path, extract_dir=tmp_path)
 
         import rioxarray  # type: ignore[import]
 
@@ -256,15 +276,35 @@ def _fetch_single_day(
     return da
 
 
-def _download_prism_zip(url: str, dest_dir: Path) -> Path:
-    """Download a PRISM zip file to *dest_dir*; return path to the local copy.
+def _download_prism_zip(
+    url: str,
+    dest_dir: Path,
+    variable: str = "",
+    resolution: str = "",
+    date: str = "",
+    cache_dir: Path | str | None = None,
+) -> Path:
+    """Download a PRISM zip file; return path to the local copy.
+
+    When *cache_dir* is provided the zip is saved there as
+    ``prism_{variable}_{resolution}_{date}.zip`` (the directory is created if
+    it does not exist).  When *cache_dir* is ``None`` the zip is written to
+    *dest_dir* as ``prism_data.zip`` (existing behaviour).
 
     Parameters
     ----------
     url:
         Full URL to the PRISM zip file.
     dest_dir:
-        Directory in which to save the downloaded zip.
+        Fallback directory used when *cache_dir* is ``None``.
+    variable:
+        PRISM variable short-name; used to build the cached filename.
+    resolution:
+        Grid resolution string; used to build the cached filename.
+    date:
+        Date string in ``YYYYMMDD`` format; used to build the cached filename.
+    cache_dir:
+        Optional persistent cache directory.
 
     Returns
     -------
@@ -276,7 +316,16 @@ def _download_prism_zip(url: str, dest_dir: Path) -> Path:
     RuntimeError
         If the download fails.
     """
-    dest = dest_dir / "prism_data.zip"
+    if cache_dir is not None:
+        if not variable or not resolution or not date:
+            raise ValueError(
+                "variable, resolution, and date are required when cache_dir is provided"
+            )
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        dest = cache_path / f"prism_{variable}_{resolution}_{date}.zip"
+    else:
+        dest = dest_dir / "prism_data.zip"
     logger.debug("Downloading %s -> %s", url, dest)
     try:
         urllib.request.urlretrieve(url, dest)  # noqa: S310
@@ -285,13 +334,16 @@ def _download_prism_zip(url: str, dest_dir: Path) -> Path:
     return dest
 
 
-def _extract_tif(zip_path: Path) -> Path:
+def _extract_tif(zip_path: Path, extract_dir: Path | None = None) -> Path:
     """Extract the ``.tif`` file from *zip_path*; return its path.
 
     Parameters
     ----------
     zip_path:
         Path to the downloaded PRISM zip archive.
+    extract_dir:
+        Directory in which to extract the archive.  Defaults to the parent
+        directory of *zip_path* when ``None``.
 
     Returns
     -------
@@ -303,7 +355,7 @@ def _extract_tif(zip_path: Path) -> Path:
     RuntimeError
         If no ``.tif`` file is found inside the archive.
     """
-    out_dir = zip_path.parent / "extracted"
+    out_dir = (extract_dir if extract_dir is not None else zip_path.parent) / "extracted"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(zip_path) as zf:
