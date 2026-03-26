@@ -120,7 +120,7 @@ def fetch_prism(
     arrays_by_var: dict[str, list[xr.DataArray]] = {var: [] for var in variables}
     for date in all_days:
         for var in variables:
-            zip_path = _download(date, var, resolution, cache_dir)
+            zip_path = download(date, var, resolution, cache_dir)
             da = _load_from_zip(zip_path, var, resolution, date,bounds)
             arrays_by_var[var].append(da)
             time.sleep(2)
@@ -134,6 +134,45 @@ def fetch_prism(
 
     return xr.Dataset(dataset_vars)
 
+def download(
+    date: dt.date,
+    variable: str,
+    resolution: str = "4km",
+    cache_dir: Path | str | None = None,
+) -> xr.DataArray:
+    """Download one day's PRISM raster to  a zip file and return zip file path.
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    date:
+        The calendar date to fetch.
+    variable:
+        PRISM variable short-name.
+    resolution:
+        Grid resolution (``"800m"`` or ``"4km"``).
+    cache_dir:
+        Optional directory in which to persist the downloaded zip file.
+        When ``None``, the zip is discarded after extraction.
+
+    Returns
+    -------
+    xarray.DataArray
+        2-D DataArray with ``lat`` and ``lon`` dimensions (no ``time`` dim).
+    """
+
+    url = _construct_url(variable, resolution, date)
+    logger.debug("Downloading PRISM daily %s for %s from %s", variable, date, url)
+    
+    zip_path = _download_url(
+        url,
+        cache_dir,
+        variable=variable,
+        resolution=resolution,
+        date= date,
+    )
+    return zip_path
 
 def get_release_date(
     variable: str,
@@ -200,47 +239,6 @@ RESOLUTION_MAP = {
     "800m": "30s",
     "4km": "25m",
 }
-
-def _download(
-    date: dt.date,
-    variable: str,
-    resolution: str = "4km",
-    cache_dir: Path | str | None = None,
-) -> xr.DataArray:
-    """Download one day's PRISM raster, clip to *bounds*, and return a DataArray.
-
-    Parameters
-    ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
-    date:
-        The calendar date to fetch.
-    variable:
-        PRISM variable short-name.
-    resolution:
-        Grid resolution (``"800m"`` or ``"4km"``).
-    cache_dir:
-        Optional directory in which to persist the downloaded zip file.
-        When ``None``, the zip is discarded after extraction.
-
-    Returns
-    -------
-    xarray.DataArray
-        2-D DataArray with ``lat`` and ``lon`` dimensions (no ``time`` dim).
-    """
-
-    url = _construct_url(variable, resolution, date)
-    logger.debug("Downloading PRISM daily %s for %s from %s", variable, date, url)
-    
-    zip_path = _download_url(
-        url,
-        cache_dir,
-        variable=variable,
-        resolution=resolution,
-        date= date,
-    )
-    return zip_path
-
 
 def _construct_url(variable: str, resolution: str, date: dt.date) -> str:
     date_str = date.strftime("%Y%m%d")
