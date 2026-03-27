@@ -137,8 +137,8 @@ def fetch_prism(
 def download(
     date: dt.date,
     variable: str,
-    resolution: str = "4km",
-    cache_dir: Path | str | None = None,
+    resolution: str,
+    cache_dir: Path | str,
 ) -> xr.DataArray:
     """Download one day's PRISM raster to  a zip file and return zip file path.
 
@@ -153,8 +153,7 @@ def download(
     resolution:
         Grid resolution (``"800m"`` or ``"4km"``).
     cache_dir:
-        Optional directory in which to persist the downloaded zip file.
-        When ``None``, the zip is discarded after extraction.
+        directory in which to persist the downloaded zip file since the web service must be written to disk regardless
 
     Returns
     -------
