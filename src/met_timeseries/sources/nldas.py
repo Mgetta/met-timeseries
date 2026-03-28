@@ -62,6 +62,8 @@ AVAILABLE_VARIABLES: list[str] = [
     "DSWRF",     # downward shortwave radiation (W/m²)
 ]
 
+_CACHE_PREFIX = "NLDAS_FORA0125_H_"
+
 _GIOVANNI_URL = "https://api.giovanni.earthdata.nasa.gov/timeseries"
 
 #: Number of metadata header lines in a Giovanni Time Series CSV response.
@@ -115,6 +117,380 @@ def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:
     bbox_polygon = _bounds_to_polygon(bounds)
     grid_in_bounds = grid[grid.intersects(bbox_polygon)]
     return grid_in_bounds[["lat_center", "lon_center", "geometry"]].drop_duplicates()
+
+
+
+def fetch_nldas(
+    bounds: BoundingBox,
+    start: str,
+    cache_dir: str,
+    end: str | None = None,
+    variables: list[str] | None = None,
+    max_connections: int = 8,
+) -> xr.Dataset:
+    """Fetch NLDAS-2 hourly gridded data for the given bounding box.
+
+    Downloads full NLDAS-2 gridded NetCDF files via ``earthaccess`` and
+    returns a subsetted :class:`xarray.Dataset`.
+
+    Authentication is handled automatically by :func:`earthaccess.login`,
+    which reads ``~/.netrc``, environment variables (``EARTHDATA_USERNAME`` /
+    ``EARTHDATA_PASSWORD``), or prompts interactively.  A free NASA Earthdata
+    account is required: https://urs.earthdata.nasa.gov
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    start:
+        Start date in ``"YYYY-MM-DD"`` format.
+    end:
+        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
+        (the default), only the single day given by *start* is fetched.
+    variables:
+        NLDAS-2 short variable names to include.  Defaults to ``["APCP",
+        "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
+    max_connections:
+        Maximum number of concurrent granule downloads.  Defaults to ``8``.
+
+    Returns
+    -------
+    xarray.Dataset
+        Hourly Dataset with ``time``, ``lat``, and ``lon`` dimensions.
+        The ``time`` coordinate carries proper ``datetime64`` timestamps.
+
+    Raises
+    ------
+    RuntimeError
+        If no granules are found for a requested period.
+    """
+    import earthaccess
+
+    if variables is None:
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+    start_date = dt.date.fromisoformat(start)
+    end_date = dt.date.fromisoformat(end) if end is not None else start_date
+    if end_date < start_date:
+        raise ValueError(
+            f"end ({end!r}) must not be before start ({start!r})"
+        )
+
+    days = pd.date_range(start=start_date, end=end_date, freq="D")
+
+    earthaccess.login()
+
+    for date in days:
+        cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
+        if cache_path.exists():
+            ds = xr.open_dataset(cache_path)
+        else:
+            ds = _fetch_nldas_granules(
+                bounds, str(date.date()), str(date.date()), variables, max_connections
+            )
+            _cache_dataset(ds, cache_path)
+
+    return ds
+
+
+def _open_file_obj(file_obj: object) -> xr.Dataset:
+    """Open a file-like object as an xarray Dataset. Note that this is an in-memory operation and does not write to disk."""
+    return xr.open_dataset(file_obj, engine="h5netcdf")
+
+
+def _clip_dataset(
+    ds: xr.Dataset,
+    bounds: BoundingBox,
+) -> xr.Dataset:
+    """
+    Clip an xarray Dataset to the given spatial bounding box.
+
+    Parameters
+    ----------
+    ds:
+        An xarray Dataset representing an NLDAS-2 hourly NetCDF granule.
+    bounds:
+        Spatial bounding box; only data within these bounds is returned.
+
+    Returns
+    -------
+    xarray.Dataset
+        In-memory Dataset containing only the spatial extent
+        defined by *bounds*.
+    """
+
+    ds = ds.sel(
+        lat=slice(bounds.south, bounds.north),
+        lon=slice(bounds.west, bounds.east),
+    )
+    ds = ds.load()
+    return ds
+
+
+def _search_nldas_granules(
+    bounds: BoundingBox,
+    start_date: str,
+    end_date: str,
+) -> list:
+    """Search for NLDAS-2 granules for a given date range via CMR.
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    start_date:
+        Start of the temporal range in ``"YYYY-MM-DD"`` format.
+    end_date:
+        End of the temporal range in ``"YYYY-MM-DD"`` format (inclusive).
+
+    Returns
+    -------
+    list
+        Granule results from ``earthaccess.search_data``.
+
+    Raises
+    ------
+    RuntimeError
+        If no granules are found.
+    """
+    import earthaccess
+
+    results = earthaccess.search_data(
+        short_name="NLDAS_FORA0125_H",
+        version="2.0",
+        temporal=(start_date, end_date),
+        bounding_box=(bounds.west, bounds.south, bounds.east, bounds.north),
+    )
+
+    if not results:
+        raise RuntimeError(
+            f"No NLDAS-2 granules found for {start_date} to {end_date}"
+        )
+
+    logger.debug(
+        "Found %d NLDAS-2 granules for %s to %s", len(results), start_date, end_date
+    )
+    return results
+
+
+def _fetch_nldas_granules(
+    bounds: BoundingBox,
+    start_date: str,
+    end_date: str,
+    variables: list[str],
+    max_connections: int,
+    cache_dir: Path = None
+) -> xr.Dataset:
+    """Download and subset all granules for a date range, returning a Dataset.
+
+    Opens granules concurrently using :class:`concurrent.futures.ThreadPoolExecutor`.
+    Failed granules are skipped with a warning; a :exc:`RuntimeError` is raised
+    only when *all* granules for the range fail.
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    start_date:
+        Start of the temporal range in ``"YYYY-MM-DD"`` format.
+    end_date:
+        End of the temporal range in ``"YYYY-MM-DD"`` format (inclusive).
+    variables:
+        Variable names to include.
+    max_connections:
+        Maximum concurrent granule downloads.
+    cache_dir:
+        Directory to cache downloaded granules. If None, caching is disabled.
+    max_connections:
+        Maximum concurrent granule downloads.
+
+    Returns
+    -------
+    xarray.Dataset
+        Dataset concatenated along the ``time`` dimension.
+    """
+    import earthaccess
+
+    results = _search_nldas_granules(bounds, start_date, end_date)
+
+    file_objs = earthaccess.open(results)
+
+    
+    granule_datasets: list[xr.Dataset] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_connections) as executor:
+        futures = {
+            executor.submit(_open_file_obj, fobj): i
+            for i, fobj in enumerate(file_objs)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            idx = futures[future]
+            try:
+                granule_datasets.append(future.result())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Skipping granule %d for %s to %s due to error: %s",
+                    idx, start_date, end_date, exc,
+                )
+
+    if not granule_datasets:
+        raise RuntimeError(
+            f"All granules failed for {start_date} to {end_date}"
+        )
+
+    ds = xr.concat(
+        sorted(granule_datasets, key=lambda d: d["time"].values[0]),
+        dim="time",
+    )
+
+    # Some NLDAS-2 granules store time as a numeric offset rather than
+    # datetime64. Reconstruct the coordinate from the known range start if
+    # the decoded dtype is not already datetime64.
+    if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.datetime64):
+        n_hours = ds.sizes["time"]
+        start_dt = dt.datetime.fromisoformat(start_date)
+        start_ts = np.datetime64(start_dt, "ns")
+        timestamps = [start_ts + np.timedelta64(h, "h") for h in range(n_hours)]
+        ds = ds.assign_coords(time=timestamps)
+
+    return ds
+
+def _cache_dataset(ds: xr.Dataset,cache_path: Path) -> Path:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    encoding = {
+        var: {"zlib": True, "complevel": 4, "dtype": "float32"}
+        for var in ds.data_vars
+    }
+    ds.to_netcdf(cache_path, encoding=encoding)
+    logger.debug("Cached NLDAS data to %s", cache_path)
+    return cache_path
+
+
+# ---------------------------------------------------------------------------
+# Grid generation and weight computation
+# ---------------------------------------------------------------------------
+
+def generate_nldas_grid(
+    west: float = -124.9375,
+    south: float = 25.0625,
+    east: float = -67.0625,
+    north: float = 52.9375,
+    resolution: float = 0.125,
+) -> gpd.GeoDataFrame:
+    """Generate the NLDAS 0.125° grid as a GeoDataFrame.
+
+    Each row represents one grid cell as a polygon, with ``lat_center``
+    and ``lon_center`` columns giving the cell centroid coordinates.
+
+    The default extent covers the CONUS NLDAS-2 domain.
+
+    Parameters
+    ----------
+    west, south, east, north:
+        Grid extent in EPSG:4326 degrees. Defaults to the full NLDAS-2 domain.
+    resolution:
+        Grid cell size in degrees. Default 0.125°.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        GeoDataFrame with columns ``lat_center``, ``lon_center``, ``geometry``
+        in EPSG:4326.
+    """
+    half = resolution / 2.0
+    lons = np.arange(west, east + half, resolution)
+    lats = np.arange(south, north + half, resolution)
+
+    records = []
+    for lon in lons:
+        for lat in lats:
+            cell = box(lon - half, lat - half, lon + half, lat + half)
+            records.append(
+                {
+                    "lon_center": round(lon, 4),
+                    "lat_center": round(lat, 4),
+                    "geometry": cell,
+                }
+            )
+
+    return gpd.GeoDataFrame(records, crs="EPSG:4326")
+
+# Datarods-based NLDAS processing
+
+def process_nldas(
+    bounds: BoundingBox,
+    start: str = "1995-01-01",
+    end: str | None = None,
+    variables: list[str] | None = None,
+    cache_dir: str | None = None,
+    weights: pd.DataFrame | None = None,
+    polygon_id_col: str = "metzone_id",
+) -> dict[str, pd.DataFrame]:
+    """Download NLDAS-2 data via datarods and compute weighted averages.
+
+    This is the main entry point for the datarods-based workflow.  It
+    downloads raw per-cell data with :func:`download_datarods`, then
+    derives area-overlap weights automatically from the bounding box and
+    the NLDAS grid (unless pre-computed *weights* are supplied), and
+    finally applies :func:`compute_weighted_averages`.
+
+    Parameters
+    ----------
+    bounds:
+        Spatial bounding box in EPSG:4326.
+    start:
+        Start date in ``"YYYY-MM-DD"`` format.  Defaults to ``"1995-01-01"``.
+    end:
+        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
+        (the default), only the single day given by *start* is fetched.
+    variables:
+        NLDAS-2 short variable names to fetch.  Defaults to
+        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
+    cache_dir:
+        Optional directory for caching raw per-cell CSV files.
+    weights:
+        Pre-computed weight table (see :func:`compute_nldas_weights`).
+        If ``None`` (default), weights are derived automatically from
+        *bounds* and the NLDAS grid.
+    polygon_id_col:
+        Column name in *weights* that identifies each polygon.  When
+        weights are auto-derived the single polygon is labelled
+        ``"bbox"``.
+
+    Returns
+    -------
+    dict[str, pandas.DataFrame]
+        Mapping from variable name to a DataFrame with a
+        ``DatetimeIndex`` and one column per polygon.
+    """
+    if variables is None:
+        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
+
+    cell_data = download_datarods(
+        bounds=bounds,
+        start=start,
+        end=end,
+        variables=variables,
+        cache_dir=cache_dir,
+    )
+
+    if weights is None:
+        bbox_polygon = _bounds_to_polygon(bounds)
+        polygons_gdf = gpd.GeoDataFrame(
+            {polygon_id_col: ["bbox"], "geometry": [bbox_polygon]},
+            crs="EPSG:4326",
+        )
+        weights = compute_nldas_weights(
+            polygons_gdf, polygon_id_col=polygon_id_col,
+        )
+
+    return compute_weighted_averages(
+        cell_data=cell_data,
+        weights=weights,
+        variables=variables,
+        polygon_id_col=polygon_id_col,
+    )
+
+
 
 def download_datarods(
     bounds: BoundingBox,
@@ -212,476 +588,6 @@ def download_datarods(
 
     return cell_data
 
-
-def compute_weighted_averages(
-    cell_data: dict[tuple[float, float], dict[str, pd.Series]],
-    weights: pd.DataFrame,
-    variables: list[str] | None = None,
-    polygon_id_col: str = "metzone_id",
-) -> dict[str, pd.DataFrame]:
-    """Compute weighted spatial averages from per-cell timeseries data.
-
-    Takes raw per-cell data (as returned by :func:`download_datarods`) and
-    a weight table, and produces one timeseries per polygon per variable.
-    This function is independent of the download method.
-
-    Parameters
-    ----------
-    cell_data:
-        Raw per-cell data as returned by :func:`download_datarods`.
-        Mapping from ``(lat, lon)`` to ``dict[variable_name, pd.Series]``.
-    weights:
-        Weight table with columns ``lat_center``, ``lon_center``,
-        ``{polygon_id_col}``, and ``weight``.  Weights should sum
-        to 1.0 per polygon (as returned by :func:`compute_nldas_weights`).
-    variables:
-        Variable names to process.  If ``None``, uses all variables
-        found in the first cell of *cell_data*.
-    polygon_id_col:
-        Column name in *weights* that identifies each polygon.
-
-    Returns
-    -------
-    dict[str, pandas.DataFrame]
-        Mapping from variable name to a DataFrame with a
-        ``DatetimeIndex`` and one column per polygon.
-    """
-    if variables is None:
-        first_key = next(iter(cell_data))
-        variables = list(cell_data[first_key].keys())
-
-    results: dict[str, pd.DataFrame] = {}
-    for var in variables:
-        polygon_series: dict = {}
-        for polygon_id, grp in weights.groupby(polygon_id_col):
-            first_key = (grp.iloc[0]["lat_center"], grp.iloc[0]["lon_center"])
-            weighted_sum = pd.Series(
-                0.0, index=cell_data[first_key][var].index
-            )
-            for _, wrow in grp.iterrows():
-                key = (wrow["lat_center"], wrow["lon_center"])
-                weighted_sum = weighted_sum.add(
-                    cell_data[key][var] * wrow["weight"], fill_value=0
-                )
-            polygon_series[polygon_id] = weighted_sum
-        results[var] = pd.DataFrame(polygon_series)
-
-    return results
-
-
-def process_nldas(
-    bounds: BoundingBox,
-    start: str = "1995-01-01",
-    end: str | None = None,
-    variables: list[str] | None = None,
-    cache_dir: str | None = None,
-    weights: pd.DataFrame | None = None,
-    polygon_id_col: str = "metzone_id",
-) -> dict[str, pd.DataFrame]:
-    """Download NLDAS-2 data via datarods and compute weighted averages.
-
-    This is the main entry point for the datarods-based workflow.  It
-    downloads raw per-cell data with :func:`download_datarods`, then
-    derives area-overlap weights automatically from the bounding box and
-    the NLDAS grid (unless pre-computed *weights* are supplied), and
-    finally applies :func:`compute_weighted_averages`.
-
-    Parameters
-    ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
-    start:
-        Start date in ``"YYYY-MM-DD"`` format.  Defaults to ``"1995-01-01"``.
-    end:
-        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
-        (the default), only the single day given by *start* is fetched.
-    variables:
-        NLDAS-2 short variable names to fetch.  Defaults to
-        ``["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
-    cache_dir:
-        Optional directory for caching raw per-cell CSV files.
-    weights:
-        Pre-computed weight table (see :func:`compute_nldas_weights`).
-        If ``None`` (default), weights are derived automatically from
-        *bounds* and the NLDAS grid.
-    polygon_id_col:
-        Column name in *weights* that identifies each polygon.  When
-        weights are auto-derived the single polygon is labelled
-        ``"bbox"``.
-
-    Returns
-    -------
-    dict[str, pandas.DataFrame]
-        Mapping from variable name to a DataFrame with a
-        ``DatetimeIndex`` and one column per polygon.
-    """
-    if variables is None:
-        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
-
-    cell_data = download_datarods(
-        bounds=bounds,
-        start=start,
-        end=end,
-        variables=variables,
-        cache_dir=cache_dir,
-    )
-
-    if weights is None:
-        bbox_polygon = _bounds_to_polygon(bounds)
-        polygons_gdf = gpd.GeoDataFrame(
-            {polygon_id_col: ["bbox"], "geometry": [bbox_polygon]},
-            crs="EPSG:4326",
-        )
-        weights = compute_nldas_weights(
-            polygons_gdf, polygon_id_col=polygon_id_col,
-        )
-
-    return compute_weighted_averages(
-        cell_data=cell_data,
-        weights=weights,
-        variables=variables,
-        polygon_id_col=polygon_id_col,
-    )
-
-
-def _open_and_subset_granule(
-    file_obj: object,
-    variables: list[str],
-    bounds: BoundingBox,
-) -> xr.Dataset:
-    """Open a single NLDAS-2 granule file object and return a spatially subsetted Dataset.
-
-    Parameters
-    ----------
-    file_obj:
-        A file-like object (e.g. from :func:`earthaccess.open`) pointing to an
-        NLDAS-2 hourly NetCDF granule.
-    variables:
-        Variable names to retain.
-    bounds:
-        Spatial bounding box; only data within these bounds is returned.
-
-    Returns
-    -------
-    xarray.Dataset
-        In-memory Dataset containing only *variables* and the spatial extent
-        defined by *bounds*.
-    """
-    variables = [_GRID_VARIABLES[v] for v in variables]
-    ds = xr.open_dataset(file_obj, engine="h5netcdf")
-    #ds = ds[variables]
-    ds = ds.sel(
-        lat=slice(bounds.south, bounds.north),
-        lon=slice(bounds.west, bounds.east),
-    )
-    ds = ds.load()
-    return ds
-
-
-def _search_nldas_granules(
-    bounds: BoundingBox,
-    start_date: str,
-    end_date: str,
-) -> list:
-    """Search for NLDAS-2 granules for a given date range via CMR.
-
-    Parameters
-    ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
-    start_date:
-        Start of the temporal range in ``"YYYY-MM-DD"`` format.
-    end_date:
-        End of the temporal range in ``"YYYY-MM-DD"`` format (inclusive).
-
-    Returns
-    -------
-    list
-        Granule results from ``earthaccess.search_data``.
-
-    Raises
-    ------
-    RuntimeError
-        If no granules are found.
-    """
-    import earthaccess
-
-    results = earthaccess.search_data(
-        short_name="NLDAS_FORA0125_H",
-        version="2.0",
-        temporal=(start_date, end_date),
-        bounding_box=(bounds.west, bounds.south, bounds.east, bounds.north),
-    )
-
-    if not results:
-        raise RuntimeError(
-            f"No NLDAS-2 granules found for {start_date} to {end_date}"
-        )
-
-    logger.debug(
-        "Found %d NLDAS-2 granules for %s to %s", len(results), start_date, end_date
-    )
-    return results
-
-
-def _fetch_date_range_granules(
-    bounds: BoundingBox,
-    start_date: str,
-    end_date: str,
-    variables: list[str],
-    max_connections: int,
-) -> xr.Dataset:
-    """Download and subset all granules for a date range, returning a Dataset.
-
-    Opens granules concurrently using :class:`concurrent.futures.ThreadPoolExecutor`.
-    Failed granules are skipped with a warning; a :exc:`RuntimeError` is raised
-    only when *all* granules for the range fail.
-
-    Parameters
-    ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
-    start_date:
-        Start of the temporal range in ``"YYYY-MM-DD"`` format.
-    end_date:
-        End of the temporal range in ``"YYYY-MM-DD"`` format (inclusive).
-    variables:
-        Variable names to include.
-    max_connections:
-        Maximum concurrent granule downloads.
-
-    Returns
-    -------
-    xarray.Dataset
-        Dataset concatenated along the ``time`` dimension.
-    """
-    import earthaccess
-
-    results = _search_nldas_granules(bounds, start_date, end_date)
-
-    file_objs = earthaccess.open(results)
-
-    granule_datasets: list[xr.Dataset] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_connections) as executor:
-        futures = {
-            executor.submit(_open_and_subset_granule, fobj, variables, bounds): i
-            for i, fobj in enumerate(file_objs)
-        }
-        for future in concurrent.futures.as_completed(futures):
-            idx = futures[future]
-            try:
-                granule_datasets.append(future.result())
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Skipping granule %d for %s to %s due to error: %s",
-                    idx, start_date, end_date, exc,
-                )
-
-    if not granule_datasets:
-        raise RuntimeError(
-            f"All granules failed for {start_date} to {end_date}"
-        )
-
-    ds = xr.concat(
-        sorted(granule_datasets, key=lambda d: d["time"].values[0]),
-        dim="time",
-    )
-
-    # Some NLDAS-2 granules store time as a numeric offset rather than
-    # datetime64. Reconstruct the coordinate from the known range start if
-    # the decoded dtype is not already datetime64.
-    if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.datetime64):
-        n_hours = ds.sizes["time"]
-        start_dt = dt.datetime.fromisoformat(start_date)
-        start_ts = np.datetime64(start_dt, "ns")
-        timestamps = [start_ts + np.timedelta64(h, "h") for h in range(n_hours)]
-        ds = ds.assign_coords(time=timestamps)
-
-    return ds
-
-
-
-def fetch_nldas_grid(
-    bounds: BoundingBox,
-    start: str,
-    end: str | None = None,
-    variables: list[str] | None = None,
-    max_connections: int = 8,
-) -> xr.Dataset:
-    """Fetch NLDAS-2 hourly gridded data for the given bounding box.
-
-    Downloads full NLDAS-2 gridded NetCDF files via ``earthaccess`` and
-    returns a subsetted :class:`xarray.Dataset`.
-
-    Authentication is handled automatically by :func:`earthaccess.login`,
-    which reads ``~/.netrc``, environment variables (``EARTHDATA_USERNAME`` /
-    ``EARTHDATA_PASSWORD``), or prompts interactively.  A free NASA Earthdata
-    account is required: https://urs.earthdata.nasa.gov
-
-    Parameters
-    ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
-    start:
-        Start date in ``"YYYY-MM-DD"`` format.
-    end:
-        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
-        (the default), only the single day given by *start* is fetched.
-    variables:
-        NLDAS-2 short variable names to include.  Defaults to ``["APCP",
-        "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
-    max_connections:
-        Maximum number of concurrent granule downloads.  Defaults to ``8``.
-
-    Returns
-    -------
-    xarray.Dataset
-        Hourly Dataset with ``time``, ``lat``, and ``lon`` dimensions.
-        The ``time`` coordinate carries proper ``datetime64`` timestamps.
-
-    Raises
-    ------
-    RuntimeError
-        If no granules are found for a requested period.
-    """
-    import earthaccess
-
-    if variables is None:
-        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
-
-    start_date = dt.date.fromisoformat(start)
-    end_date = dt.date.fromisoformat(end) if end is not None else start_date
-
-    if end_date < start_date:
-        raise ValueError(
-            f"end ({end!r}) must not be before start ({start!r})"
-        )
-
-    earthaccess.login()
-
-    return _fetch_date_range_granules(
-        bounds, str(start_date), str(end_date), variables, max_connections
-    )
-
-
-# ---------------------------------------------------------------------------
-# Grid generation and weight computation
-# ---------------------------------------------------------------------------
-
-def generate_nldas_grid(
-    west: float = -124.9375,
-    south: float = 25.0625,
-    east: float = -67.0625,
-    north: float = 52.9375,
-    resolution: float = 0.125,
-) -> gpd.GeoDataFrame:
-    """Generate the NLDAS 0.125° grid as a GeoDataFrame.
-
-    Each row represents one grid cell as a polygon, with ``lat_center``
-    and ``lon_center`` columns giving the cell centroid coordinates.
-
-    The default extent covers the CONUS NLDAS-2 domain.
-
-    Parameters
-    ----------
-    west, south, east, north:
-        Grid extent in EPSG:4326 degrees. Defaults to the full NLDAS-2 domain.
-    resolution:
-        Grid cell size in degrees. Default 0.125°.
-
-    Returns
-    -------
-    geopandas.GeoDataFrame
-        GeoDataFrame with columns ``lat_center``, ``lon_center``, ``geometry``
-        in EPSG:4326.
-    """
-    half = resolution / 2.0
-    lons = np.arange(west, east + half, resolution)
-    lats = np.arange(south, north + half, resolution)
-
-    records = []
-    for lon in lons:
-        for lat in lats:
-            cell = box(lon - half, lat - half, lon + half, lat + half)
-            records.append(
-                {
-                    "lon_center": round(lon, 4),
-                    "lat_center": round(lat, 4),
-                    "geometry": cell,
-                }
-            )
-
-    return gpd.GeoDataFrame(records, crs="EPSG:4326")
-
-
-def compute_nldas_weights(
-    polygons: gpd.GeoDataFrame,
-    polygon_id_col: str = "metzone_id",
-    nldas_grid: gpd.GeoDataFrame | None = None,
-) -> pd.DataFrame:
-    """Compute area-overlap weights between polygons and the NLDAS grid.
-
-    For each polygon, finds all NLDAS grid cells that intersect it and
-    computes the fractional overlap area. Weights are normalized so they
-    sum to 1.0 per polygon.
-
-    Parameters
-    ----------
-    polygons:
-        GeoDataFrame of user polygons (e.g., dissolved metzones).
-    polygon_id_col:
-        Column name for the polygon identifier.
-    nldas_grid:
-        Pre-generated NLDAS grid GeoDataFrame. If None, generates one
-        clipped to the total bounds of *polygons* (with a small buffer).
-
-    Returns
-    -------
-    pandas.DataFrame
-        Columns: ``[polygon_id_col, "lat_center", "lon_center", "weight"]``.
-        Weights sum to 1.0 per polygon.
-    """
-    if nldas_grid is None:
-        minx, miny, maxx, maxy = polygons.total_bounds
-        buf = 0.25
-        nldas_grid = generate_nldas_grid(
-            west=minx - buf,
-            south=miny - buf,
-            east=maxx + buf,
-            north=maxy + buf,
-        )
-
-    # Ensure matching CRS
-    polygons = polygons.to_crs("EPSG:4326")
-    nldas_grid = nldas_grid.to_crs("EPSG:4326")
-
-    # Compute polygon areas in equal-area projection for accuracy
-    polygons_ea = polygons.to_crs("EPSG:6933")
-    poly_areas = polygons_ea.geometry.area
-
-    # Intersection
-    intersection = gpd.overlay(
-        polygons[[polygon_id_col, "geometry"]],
-        nldas_grid[["lat_center", "lon_center", "geometry"]],
-        how="intersection",
-    )
-
-    # Compute overlap area in equal-area projection
-    intersection_ea = intersection.to_crs("EPSG:6933")
-    intersection["overlap_area"] = intersection_ea.geometry.area
-
-    # Attach polygon area for normalization
-    area_map = dict(zip(polygons[polygon_id_col], poly_areas))
-    intersection["poly_area"] = intersection[polygon_id_col].map(area_map)
-    intersection["weight"] = intersection["overlap_area"] / intersection["poly_area"]
-
-    # Normalize per polygon so weights sum to 1.0
-    weight_sum = intersection.groupby(polygon_id_col)["weight"].transform("sum")
-    intersection["weight"] = intersection["weight"] / weight_sum
-
-    return intersection[[polygon_id_col, "lat_center", "lon_center", "weight"]].reset_index(
-        drop=True
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -878,3 +784,6 @@ def _cache_giovanni_response(
         cache_path.write_text(text)
 
     return text
+
+
+
