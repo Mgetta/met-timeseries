@@ -134,11 +134,30 @@ def fetch_prism(
 
     return xr.Dataset(dataset_vars)
 
+def _compress(zip_path: Path | str) -> Path:
+    logger.debug("Compressing PRISM daily %s for %s", variable, date)
+    zip_path = Path(zip_path)
+    compress_path = zip_path.with_suffix(".nc")
+    if not zip_path.exists():
+        raise FileNotFoundError(f"Zip file not found: {zip_path}")
+    ds = _load_from_zip(zip_path)
+
+    encoding = {
+        var: {"zlib": True, "complevel": 9,"shuffle": True}
+        for var in ds.data_vars
+    }
+
+    ds.to_netcdf(compress_path, encoding=encoding)
+    logger.debug("Cached NLDAS data to %s", compress_path)
+
+
+
 def download(
     date: dt.date,
     variable: str,
     resolution: str,
     cache_dir: Path | str,
+    compress: bool = True
 ) -> xr.DataArray:
     """Download one day's PRISM raster to  a zip file and return zip file path.
 
@@ -162,8 +181,6 @@ def download(
     """
 
     url = _construct_url(variable, resolution, date)
-    logger.debug("Downloading PRISM daily %s for %s from %s", variable, date, url)
-    
     zip_path = _download_url(
         url,
         cache_dir,
@@ -171,7 +188,14 @@ def download(
         resolution=resolution,
         date= date,
     )
-    return zip_path
+    if compress:
+        output_path = _compress(zip_path)
+        # delete the original zip file after compression
+        logger.debug("Deleting original PRISM zip file %s", zip_path)
+        zip_path.unlink()
+    else:
+        output_path = zip_path
+    return output_path
 
 def get_release_date(
     variable: str,
@@ -321,6 +345,8 @@ def _download_url(
     RuntimeError
         If the download fails.
     """
+
+    logger.debug("Downloading PRISM daily %s for %s from %s", variable, date, url)
     date = date.strftime("%Y%m%d")
     assert resolution in RESOLUTION_MAP.keys(), f"Invalid resolution {resolution!r}"
     assert variable in AVAILABLE_VARIABLES, f"Invalid variable {variable!r}"
