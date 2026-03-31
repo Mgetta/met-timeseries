@@ -80,10 +80,10 @@ def dewpoint_from_specific_humidity(
     dp = _mpc_dp(pres_pa, spfh)
 
     return xr.DataArray(
-        dp.to("degF").magnitude,
+        dp.to("degC").magnitude,
         dims=specific_humidity.dims,
         coords=specific_humidity.coords,
-        name="dewpoint_f",
+        name="dewpoint_c",
     )
 
 def kelvin_to_fahrenheit(temp_k: xr.DataArray) -> xr.DataArray:
@@ -205,6 +205,241 @@ def cloud_cover(
     cc = cc.clip(0.0, 1.0)
     cc = cc.where(daytime_mask)
     return cc.rename("cloud_cover_fraction")
+
+
+# ---------------------------------------------------------------------------
+# PET
+# ---------------------------------------------------------------------------
+
+
+def pet_hargreaves(
+    daily_tmin,
+    daily_tmax,
+    lat: float,
+):
+    """Estimate daily PET using the Hargreaves (1985) method.
+
+    Uses ``mettoolbox.utils.radiation`` for extraterrestrial radiation (Ra)
+    computed from latitude and day-of-year.
+
+    Formula:
+        ``PET = 0.0023 × Ra × (T_mean + 17.8) × sqrt(T_max - T_min)``
+
+    where Ra is in MJ/m²/day and PET is in mm/day.
+
+    Parameters
+    ----------
+    daily_tmin:
+        Daily minimum temperature in °C with a daily
+        :class:`~pandas.DatetimeIndex`.
+    daily_tmax:
+        Daily maximum temperature in °C with a daily
+        :class:`~pandas.DatetimeIndex`.
+    lat:
+        Latitude in decimal degrees.
+
+    Returns
+    -------
+    :class:`pandas.Series` named ``pet_hargreaves_mm``.
+    """
+    import pandas as pd
+    from mettoolbox.utils import radiation
+
+    tmean = (daily_tmin + daily_tmax) / 2.0
+    trange = (daily_tmax - daily_tmin).clip(lower=0.0)
+
+    # mettoolbox.utils.radiation expects a Series/DataFrame with a DatetimeIndex
+    ra_df = radiation(tmean.to_frame(name="temp"), lat)
+    ra = ra_df["ra"]
+
+    with np.errstate(invalid="ignore"):
+        pet = 0.0023 * ra * (tmean + 17.8) * np.sqrt(trange)
+
+    pet = pet.fillna(0.0).clip(lower=0.0)
+    pet.name = "pet_hargreaves_mm"
+    return pet
+
+
+def pet_penman_monteith(
+    daily_tmin: xr.DataArray,
+    daily_tmax: xr.DataArray,
+    wind_speed: xr.DataArray,
+    shortwave: xr.DataArray,
+    dewpoint: xr.DataArray,
+    elevation: "xr.DataArray | float",
+) -> xr.DataArray:
+    """Compute FAO-56 Penman-Monteith reference ET at the grid scale.
+
+    Implements the full FAO-56 reference evapotranspiration equation
+    (FAO Irrigation and Drainage Paper 56, Chapter 3):
+
+    .. math::
+
+        ET_0 = \\frac{0.408 \\Delta (R_n - G) + \\gamma
+                      \\frac{900}{T+273} u_2 (e_s - e_a)}
+                     {\\Delta + \\gamma (1 + 0.34 u_2)}
+
+    All intermediate calculations follow FAO-56 exactly.  The function
+    operates on raw gridded ``xr.DataArray`` inputs **before** spatial
+    aggregation so that nonlinear operations (Magnus exponential,
+    Stefan-Boltzmann T⁴, etc.) are applied per grid cell.
+
+    Parameters
+    ----------
+    daily_tmin:
+        Daily minimum air temperature in °C, dims ``(time, lat, lon)``.
+    daily_tmax:
+        Daily maximum air temperature in °C, dims ``(time, lat, lon)``.
+    wind_speed:
+        Wind speed at 2 m height in m/s, dims ``(time, lat, lon)``.
+    shortwave:
+        Incoming shortwave radiation in MJ/m²/day, dims ``(time, lat, lon)``.
+    dewpoint:
+        Dewpoint temperature in °C (used for actual vapour pressure),
+        dims ``(time, lat, lon)``.
+    elevation:
+        Elevation above sea level in metres.  May be a scalar ``float`` or
+        a gridded :class:`~xarray.DataArray` broadcastable to the spatial
+        dimensions of the other inputs.
+
+    Returns
+    -------
+    :class:`xarray.DataArray` named ``pet_penman_monteith_mm`` in mm/day,
+    with the same dims and coords as the input DataArrays.  Values are
+    clipped to ``≥ 0``; NaN cells are filled with ``0.0``.
+    """
+    # -- raw numpy arrays for arithmetic (consistent with other derivations) --
+    tmin = daily_tmin.values.astype(float)
+    tmax = daily_tmax.values.astype(float)
+    u2 = wind_speed.values.astype(float)
+    rs = shortwave.values.astype(float)
+    td = dewpoint.values.astype(float)
+
+    if isinstance(elevation, xr.DataArray):
+        z = elevation.values.astype(float)
+    else:
+        z = float(elevation)
+
+    tmean = (tmin + tmax) / 2.0
+
+    # -- Step 1: Atmospheric pressure (FAO-56 Eq. 7) --
+    pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  # kPa
+
+    # -- Step 2: Psychrometric constant γ (FAO-56 Eq. 8) --
+    gamma = 0.000665 * pressure  # kPa/°C
+
+    # -- Step 3: Saturation vapour pressure eₛ (FAO-56 Eq. 11, 12) --
+    def _magnus(t):
+        return 0.6108 * np.exp(17.27 * t / (t + 237.3))
+
+    es = (_magnus(tmax) + _magnus(tmin)) / 2.0  # kPa
+
+    # -- Step 4: Actual vapour pressure eₐ from dewpoint (FAO-56 Eq. 14) --
+    ea = _magnus(td)  # kPa
+
+    # -- Step 5: Slope of saturation VP curve Δ (FAO-56 Eq. 13) --
+    delta = 4098.0 * _magnus(tmean) / (tmean + 237.3) ** 2  # kPa/°C
+
+    # -- Step 6: Extraterrestrial radiation Ra (FAO-56 Eq. 21-25) --
+    # Latitude comes from the lat coordinate of the input DataArrays.
+    lat_coord = daily_tmin.coords["lat"].values  # degrees
+    lat_rad = np.radians(lat_coord)  # (n_lat,)
+
+    # Day of year from the time coordinate
+    import pandas as pd
+
+    time_values = daily_tmin.coords["time"].values
+    doy = np.array(
+        [pd.Timestamp(t).timetuple().tm_yday for t in time_values], dtype=float
+    )  # (n_time,)
+
+    # Solar declination (rad) and inverse relative distance Earth-Sun
+    # FAO-56 Eq. 24, 23
+    dr = 1.0 + 0.033 * np.cos(2.0 * np.pi / 365.0 * doy)  # (n_time,)
+    dec = 0.409 * np.sin(2.0 * np.pi / 365.0 * doy - 1.39)  # (n_time,)
+
+    # Broadcast to (time, lat, lon) for vectorised computation.
+    # Determine axis positions from the dims of the input array.
+    time_ax = daily_tmin.dims.index("time")
+    lat_ax = daily_tmin.dims.index("lat")
+    lon_ax = daily_tmin.dims.index("lon")
+    ndim = len(daily_tmin.dims)
+
+    def _expand(arr, axis, total_dims):
+        """Insert length-1 axes so *arr* broadcasts to *total_dims* dimensions."""
+        shape = [1] * total_dims
+        shape[axis] = len(arr)
+        return arr.reshape(shape)
+
+    dr_b = _expand(dr, time_ax, ndim)
+    dec_b = _expand(dec, time_ax, ndim)
+    lat_b = _expand(lat_rad, lat_ax, ndim)
+
+    # Sunset hour angle ωs (FAO-56 Eq. 25) — clamp argument to [-1, 1] for
+    # polar latitudes where sun is permanently above/below horizon.
+    ws_arg = np.clip(-np.tan(lat_b) * np.tan(dec_b), -1.0, 1.0)
+    ws = np.arccos(ws_arg)  # (time, lat, 1) broadcastable
+
+    # Ra in MJ/m²/day (FAO-56 Eq. 21)
+    gsc = 0.0820  # solar constant MJ/m²/min
+    ra = (
+        24.0
+        * 60.0
+        / np.pi
+        * gsc
+        * dr_b
+        * (
+            ws * np.sin(lat_b) * np.sin(dec_b)
+            + np.cos(lat_b) * np.cos(dec_b) * np.sin(ws)
+        )
+    )
+    ra = np.broadcast_to(ra, tmin.shape).copy()  # ensure writeable
+
+    # -- Step 7: Clear-sky radiation Rso (FAO-56 Eq. 37) --
+    rso = (0.75 + 2e-5 * z) * ra  # MJ/m²/day
+
+    # -- Step 8: Net shortwave radiation Rns (FAO-56 Eq. 38) --
+    albedo = 0.23
+    rns = (1.0 - albedo) * rs  # MJ/m²/day
+
+    # -- Step 9: Net longwave radiation Rnl (FAO-56 Eq. 39) --
+    sigma = 4.903e-9  # Stefan-Boltzmann MJ/(m²·day·K⁴)
+    tmax_k = tmax + 273.15
+    tmin_k = tmin + 273.15
+    t_term = sigma * (tmax_k**4 + tmin_k**4) / 2.0
+    humidity_term = 0.34 - 0.14 * np.sqrt(np.maximum(ea, 0.0))
+
+    # Cloudiness correction — clip Rs/Rso to [0.25, 1.0] per FAO-56 guidance.
+    # Coefficients 1.35 and 0.35 are empirical (FAO-56 Eq. 39).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs_rso_ratio = np.where(rso > 0.0, rs / rso, 0.25)
+    rs_rso_ratio = np.clip(rs_rso_ratio, 0.25, 1.0)
+    cloud_term = 1.35 * rs_rso_ratio - 0.35
+
+    rnl = t_term * humidity_term * cloud_term  # MJ/m²/day
+
+    # -- Step 10: Net radiation Rn (FAO-56 Eq. 40) --
+    rn = rns - rnl  # MJ/m²/day
+
+    # -- Step 11: Soil heat flux G = 0 for daily timestep --
+    g = 0.0
+
+    # -- Step 12: FAO-56 Penman-Monteith equation --
+    numerator = 0.408 * delta * (rn - g) + gamma * (900.0 / (tmean + 273.0)) * u2 * (es - ea)
+    denominator = delta + gamma * (1.0 + 0.34 * u2)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        et0 = numerator / denominator
+
+    et0 = np.where(np.isfinite(et0), et0, 0.0)
+    et0 = np.clip(et0, 0.0, None)
+
+    return xr.DataArray(
+        et0,
+        dims=daily_tmin.dims,
+        coords=daily_tmin.coords,
+        name="pet_penman_monteith_mm",
+    )
 
 
 # ---------------------------------------------------------------------------
