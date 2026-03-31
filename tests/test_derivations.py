@@ -264,3 +264,129 @@ class TestCloudCover:
         da = _make_da_with_time(300.0, hour=12)
         result = cloud_cover(da, np.array([45.0]), np.array([-110.0]), da.coords["time"].values)
         assert result.name == "cloud_cover_fraction"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for PET tests
+# ---------------------------------------------------------------------------
+
+
+def _make_pet_da(value: float, lat: float = 45.0, lon: float = -110.0, dates=None) -> xr.DataArray:
+    """Build a (time, lat, lon) DataArray for PET input testing."""
+    import pandas as pd
+
+    if dates is None:
+        dates = [pd.Timestamp("2000-07-15")]
+    return xr.DataArray(
+        np.full((len(dates), 1, 1), value, dtype=float),
+        dims=["time", "lat", "lon"],
+        coords={"time": dates, "lat": [lat], "lon": [lon]},
+    )
+
+
+# ---------------------------------------------------------------------------
+# pet_penman_monteith
+# ---------------------------------------------------------------------------
+
+
+class TestPetPenmanMonteith:
+    """Tests for :func:`met_timeseries.derivations.pet_penman_monteith`."""
+
+    def _run(
+        self,
+        tmin=15.0,
+        tmax=30.0,
+        wind=2.0,
+        rs=20.0,
+        td=12.0,
+        elev=100.0,
+        lat=45.0,
+        dates=None,
+    ):
+        from met_timeseries.derivations import pet_penman_monteith
+
+        return pet_penman_monteith(
+            _make_pet_da(tmin, lat=lat, dates=dates),
+            _make_pet_da(tmax, lat=lat, dates=dates),
+            _make_pet_da(wind, lat=lat, dates=dates),
+            _make_pet_da(rs, lat=lat, dates=dates),
+            _make_pet_da(td, lat=lat, dates=dates),
+            elev,
+        )
+
+    def test_positive_pet(self):
+        result = self._run()
+        assert float(result.values.flat[0]) > 0.0
+
+    def test_no_negative_pet(self):
+        """Extreme cold / polar conditions must not produce negative PET."""
+        result = self._run(tmin=-40.0, tmax=-30.0, wind=1.0, rs=2.0, td=-42.0, lat=70.0)
+        assert np.all(result.values >= 0.0)
+
+    def test_reasonable_range(self):
+        result = self._run()
+        val = float(result.values.flat[0])
+        assert 0.0 <= val <= 15.0
+
+    def test_wind_effect(self):
+        """Higher wind speed should increase PET (all else equal)."""
+        low = float(self._run(wind=1.0).values.flat[0])
+        high = float(self._run(wind=5.0).values.flat[0])
+        assert high > low
+
+    def test_humidity_effect(self):
+        """Higher dewpoint (smaller vapour deficit) should decrease PET."""
+        low_td = float(self._run(td=5.0).values.flat[0])
+        high_td = float(self._run(td=20.0).values.flat[0])
+        assert high_td < low_td
+
+    def test_multi_day(self):
+        """3-day input should produce output with 3 time steps."""
+        import pandas as pd
+
+        dates = pd.date_range("2000-07-01", periods=3, freq="D")
+        result = self._run(dates=dates)
+        assert result.shape[0] == 3
+        assert result.dims[0] == "time"
+
+    def test_elevation_effect(self):
+        """Higher elevation (lower pressure) changes PET."""
+        low_elev = float(self._run(elev=0.0).values.flat[0])
+        high_elev = float(self._run(elev=2000.0).values.flat[0])
+        assert low_elev != high_elev
+
+    def test_output_name(self):
+        result = self._run()
+        assert result.name == "pet_penman_monteith_mm"
+
+    def test_output_dims(self):
+        result = self._run()
+        assert result.dims == ("time", "lat", "lon")
+
+
+# ---------------------------------------------------------------------------
+# pet_hargreaves — import location tests
+# ---------------------------------------------------------------------------
+
+
+class TestPetHargreavesImport:
+    def test_hargreaves_importable_from_derivations(self):
+        """pet_hargreaves should be directly importable from derivations."""
+        from met_timeseries.derivations import pet_hargreaves
+
+        assert callable(pet_hargreaves)
+
+    def test_hargreaves_backwards_compat(self):
+        """pet_hargreaves imported from disaggregation should still work."""
+        import pandas as pd
+        from met_timeseries.disaggregation import pet_hargreaves
+
+        idx = pd.date_range("2000-07-01", periods=1, freq="D")
+        result = pet_hargreaves(
+            pd.Series([10.0], index=idx),
+            pd.Series([25.0], index=idx),
+            lat=45.0,
+        )
+        assert result.name == "pet_hargreaves_mm"
+        assert float(result.iloc[0]) > 0.0
+

@@ -414,47 +414,11 @@ def disaggregate_dewpoint_constant(daily_dewpoint: pd.Series) -> pd.Series:
 
 
 def pet_hargreaves(
-    daily_tmin: pd.Series,
-    daily_tmax: pd.Series,
+    daily_tmin,
+    daily_tmax,
     lat: float,
-) -> pd.Series:
-    """Estimate daily PET using the Hargreaves (1985) method.
+):
+    """Backwards-compatible wrapper. See :func:`met_timeseries.derivations.pet_hargreaves`."""
+    from met_timeseries.derivations import pet_hargreaves as _pet
 
-    Uses ``mettoolbox.utils.radiation`` for extraterrestrial radiation (Ra)
-    computed from latitude and day-of-year.
-
-    Formula:
-        ``PET = 0.0023 × Ra × (T_mean + 17.8) × sqrt(T_max - T_min)``
-
-    where Ra is in MJ/m²/day and PET is in mm/day.
-
-    Parameters
-    ----------
-    daily_tmin:
-        Daily minimum temperature in °C with a daily
-        :class:`~pandas.DatetimeIndex`.
-    daily_tmax:
-        Daily maximum temperature in °C with a daily
-        :class:`~pandas.DatetimeIndex`.
-    lat:
-        Latitude in decimal degrees.
-
-    Returns
-    -------
-    :class:`pandas.Series` named ``pet_hargreaves_mm``.
-    """
-    from mettoolbox.utils import radiation
-
-    tmean = (daily_tmin + daily_tmax) / 2.0
-    trange = (daily_tmax - daily_tmin).clip(lower=0.0)
-
-    # mettoolbox.utils.radiation expects a Series/DataFrame with a DatetimeIndex
-    ra_df = radiation(tmean.to_frame(name="temp"), lat)
-    ra = ra_df["ra"]
-
-    with np.errstate(invalid="ignore"):
-        pet = 0.0023 * ra * (tmean + 17.8) * np.sqrt(trange)
-
-    pet = pet.fillna(0.0).clip(lower=0.0)
-    pet.name = "pet_hargreaves_mm"
-    return pet
+    return _pet(daily_tmin, daily_tmax, lat)
