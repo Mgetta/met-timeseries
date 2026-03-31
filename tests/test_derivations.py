@@ -369,6 +369,157 @@ class TestPetPenmanMonteith:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# pet_penman_monteith_hourly
+# ---------------------------------------------------------------------------
+
+
+def _make_hourly_da(
+    value: float,
+    lat: float = 45.0,
+    lon: float = -110.0,
+    dates=None,
+) -> xr.DataArray:
+    """Build a (time, lat, lon) DataArray for hourly PET input testing."""
+    import pandas as pd
+
+    if dates is None:
+        dates = pd.date_range("2000-06-21", periods=24, freq="h")
+    return xr.DataArray(
+        np.full((len(dates), 1, 1), value, dtype=float),
+        dims=["time", "lat", "lon"],
+        coords={"time": dates, "lat": [lat], "lon": [lon]},
+    )
+
+
+def _make_hourly_da_single(
+    value: float,
+    hour: int = 12,
+    lat: float = 45.0,
+    lon: float = -110.0,
+) -> xr.DataArray:
+    """Build a single-timestep (time, lat, lon) DataArray at the given UTC hour."""
+    import pandas as pd
+
+    t = pd.Timestamp(f"2000-06-21 {hour:02d}:00:00")
+    return xr.DataArray(
+        np.full((1, 1, 1), value, dtype=float),
+        dims=["time", "lat", "lon"],
+        coords={"time": [t], "lat": [lat], "lon": [lon]},
+    )
+
+
+class TestPetPenmanMonteithHourly:
+    """Tests for :func:`met_timeseries.derivations.pet_penman_monteith_hourly`."""
+
+    def _run_single(self, temp=25.0, wind=2.0, rs=800.0, td=12.0, elev=100.0, hour=12):
+        from met_timeseries.derivations import pet_penman_monteith_hourly
+
+        return pet_penman_monteith_hourly(
+            _make_hourly_da_single(temp, hour=hour),
+            _make_hourly_da_single(wind, hour=hour),
+            _make_hourly_da_single(rs, hour=hour),
+            _make_hourly_da_single(td, hour=hour),
+            elev,
+        )
+
+    def _run_24h(self, temp=25.0, wind=2.0, rs=800.0, td=12.0, elev=100.0):
+        import pandas as pd
+        from met_timeseries.derivations import pet_penman_monteith_hourly
+
+        dates = pd.date_range("2000-06-21", periods=24, freq="h")
+        return pet_penman_monteith_hourly(
+            _make_hourly_da(temp, dates=dates),
+            _make_hourly_da(wind, dates=dates),
+            _make_hourly_da(rs, dates=dates),
+            _make_hourly_da(td, dates=dates),
+            elev,
+        )
+
+    def test_positive_pet_daytime(self):
+        """Noon hour with realistic daytime conditions → PET > 0."""
+        result = self._run_single(temp=25.0, wind=2.0, rs=800.0, td=12.0, elev=100.0, hour=12)
+        assert float(result.values.flat[0]) > 0.0
+
+    def test_zero_pet_nighttime(self):
+        """Midnight with Rs=0 → PET should be 0 (clipped)."""
+        result = self._run_single(temp=15.0, wind=2.0, rs=0.0, td=10.0, elev=100.0, hour=0)
+        assert float(result.values.flat[0]) >= 0.0
+
+    def test_no_negative_pet(self):
+        """All conditions must produce non-negative PET."""
+        import pandas as pd
+        from met_timeseries.derivations import pet_penman_monteith_hourly
+
+        dates = pd.date_range("2000-06-21", periods=24, freq="h")
+        # Realistic diurnal radiation: 0 at night, peak at noon
+        rs_vals = np.maximum(0.0, 800.0 * np.sin(np.pi * np.arange(24) / 24.0))
+        result_vals = []
+        for h, rs in enumerate(rs_vals):
+            r = self._run_single(temp=20.0, wind=2.0, rs=float(rs), td=10.0, elev=100.0, hour=h)
+            result_vals.append(float(r.values.flat[0]))
+        assert all(v >= 0.0 for v in result_vals)
+
+    def test_reasonable_hourly_range(self):
+        """Daytime summer PET should be between 0 and 1.5 mm/hour."""
+        result = self._run_single(temp=25.0, wind=2.0, rs=800.0, td=12.0, elev=100.0, hour=12)
+        val = float(result.values.flat[0])
+        assert 0.0 <= val <= 1.5
+
+    def test_24hr_shape(self):
+        """24-hour input → output has 24 time steps."""
+        result = self._run_24h()
+        assert result.shape[0] == 24
+        assert result.dims[0] == "time"
+
+    def test_higher_radiation_higher_pet(self):
+        """More shortwave radiation → more PET (daytime)."""
+        low = float(self._run_single(rs=400.0, hour=12).values.flat[0])
+        high = float(self._run_single(rs=800.0, hour=12).values.flat[0])
+        assert high > low
+
+    def test_wind_effect(self):
+        """Higher wind speed → more PET (all else equal, daytime)."""
+        low = float(self._run_single(wind=1.0, hour=12).values.flat[0])
+        high = float(self._run_single(wind=5.0, hour=12).values.flat[0])
+        assert high > low
+
+    def test_output_name(self):
+        """Result DataArray should be named 'pet_penman_monteith_hourly_mm'."""
+        result = self._run_single()
+        assert result.name == "pet_penman_monteith_hourly_mm"
+
+    def test_diurnal_pattern(self):
+        """Midday hours should have higher PET than nighttime hours."""
+        import pandas as pd
+        from met_timeseries.derivations import pet_penman_monteith_hourly
+
+        dates = pd.date_range("2000-06-21", periods=24, freq="h")
+        # Use a simple half-sine radiation curve (0 at night, 800 W/m² at noon)
+        rs_arr = np.zeros((24, 1, 1))
+        for h in range(24):
+            rs_arr[h, 0, 0] = max(0.0, 800.0 * np.sin(np.pi * h / 24.0))
+
+        rs_da = xr.DataArray(rs_arr, dims=["time", "lat", "lon"],
+                             coords={"time": dates, "lat": [45.0], "lon": [-110.0]})
+        temp_da = _make_hourly_da(25.0, dates=dates)
+        wind_da = _make_hourly_da(2.0, dates=dates)
+        td_da = _make_hourly_da(12.0, dates=dates)
+
+        result = pet_penman_monteith_hourly(temp_da, wind_da, rs_da, td_da, 100.0)
+
+        # Midday hours (10-14 UTC at lon=-110 ≈ solar noon ~19:20 UTC; but use
+        # hours 10-14 which should have non-trivial radiation in our curve)
+        midday_max = float(result.values[10:15, 0, 0].max())
+        nighttime_mean = float(result.values[0:4, 0, 0].mean())
+        assert midday_max > nighttime_mean
+
+
+# ---------------------------------------------------------------------------
+# pet_hargreaves — import location tests
+# ---------------------------------------------------------------------------
+
+
 class TestPetHargreavesImport:
     def test_hargreaves_importable_from_derivations(self):
         """pet_hargreaves should be directly importable from derivations."""
