@@ -442,6 +442,228 @@ def pet_penman_monteith(
     )
 
 
+def pet_penman_monteith_hourly(
+    temperature: xr.DataArray,
+    wind_speed: xr.DataArray,
+    shortwave: xr.DataArray,
+    dewpoint: xr.DataArray,
+    elevation: "xr.DataArray | float",
+) -> xr.DataArray:
+    """Compute hourly FAO-56 Penman-Monteith reference ET at the grid scale.
+
+    Implements the hourly FAO-56 reference evapotranspiration equation
+    (FAO Irrigation and Drainage Paper 56, Chapter 4, Eq. 53):
+
+    .. math::
+
+        ET_0 = \\frac{0.408 \\Delta (R_n - G) + \\gamma
+                      \\frac{37}{T+273} u_2 (e^\\circ(T) - e_a)}
+                     {\\Delta + \\gamma (1 + C_d u_2)}
+
+    where :math:`C_d = 0.24` during daytime and :math:`0.96` at night.
+
+    All intermediate calculations follow FAO-56 Chapter 4 exactly.  The
+    function operates on raw gridded ``xr.DataArray`` inputs **before**
+    spatial aggregation so that nonlinear operations are applied per grid
+    cell.
+
+    Parameters
+    ----------
+    temperature:
+        Instantaneous air temperature in °C, dims ``(time, lat, lon)``.
+    wind_speed:
+        Wind speed at 2 m height in m/s, dims ``(time, lat, lon)``.
+    shortwave:
+        Incoming shortwave radiation in **W/m²** (converted internally to
+        MJ/m²/hour via ``× 0.0036``), dims ``(time, lat, lon)``.
+    dewpoint:
+        Dewpoint temperature in °C (used for actual vapour pressure),
+        dims ``(time, lat, lon)``.
+    elevation:
+        Elevation above sea level in metres.  May be a scalar ``float`` or
+        a gridded :class:`~xarray.DataArray` broadcastable to the spatial
+        dimensions of the other inputs.
+
+    Returns
+    -------
+    :class:`xarray.DataArray` named ``pet_penman_monteith_hourly_mm`` in
+    mm/hour, with the same dims and coords as the input DataArrays.  Values
+    are clipped to ``≥ 0``; NaN cells are filled with ``0.0``.
+
+    Notes
+    -----
+    Shortwave radiation is accepted in W/m² (native NLDAS units) and
+    converted to MJ/m²/hour internally (multiply by 0.0036).
+
+    Key differences from the daily version (FAO-56 Chapter 3):
+
+    * Temperature: instantaneous T at each hour (not Tmin/Tmax average).
+    * Saturation VP: single Magnus at hourly T, not (e°(Tmax)+e°(Tmin))/2.
+    * Radiation: MJ/m²/hour (not MJ/m²/day).
+    * Ra: hourly integral using ω₁, ω₂ hour angles (FAO-56 Eq. 28).
+    * Soil heat flux: G = 0.1·Rn daytime, G = 0.5·Rn nighttime.
+    * Wind coefficient Cn = 37 (not 900).
+    * Resistance coefficient Cd = 0.24 daytime, 0.96 nighttime.
+    * Stefan-Boltzmann in MJ/(m²·hour·K⁴) = 2.042e-10.
+    """
+    import pandas as pd
+
+    # -- Empirical constants (FAO-56 Chapter 4) --
+    cn = 37.0           # wind function numerator coefficient (hourly)
+    cd_day = 0.24       # wind function denominator coefficient (daytime)
+    cd_night = 0.96     # wind function denominator coefficient (nighttime)
+    g_frac_day = 0.1    # G = g_frac_day * Rn during daytime
+    g_frac_night = 0.5  # G = g_frac_night * Rn during nighttime
+    albedo = 0.23       # reference crop (grass) albedo (FAO-56 Eq. 38)
+    # Cloudiness correction coefficients (FAO-56 Eq. 39, hourly form)
+    cloud_a = 1.35
+    cloud_b = 0.35
+    # Humidity coefficient for net longwave (FAO-56 Eq. 39)
+    humid_a = 0.34
+    humid_b = 0.14
+
+    # -- raw numpy arrays --
+    t = temperature.values.astype(float)
+    u2 = wind_speed.values.astype(float)
+    rs_wm2 = shortwave.values.astype(float)
+    td = dewpoint.values.astype(float)
+
+    if isinstance(elevation, xr.DataArray):
+        z = elevation.values.astype(float)
+    else:
+        z = float(elevation)
+
+    # Convert shortwave from W/m² to MJ/m²/hour
+    rs = rs_wm2 * 0.0036
+
+    # -- Step 1: Atmospheric pressure (FAO-56 Eq. 7) --
+    pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  # kPa
+
+    # -- Step 2: Psychrometric constant γ (FAO-56 Eq. 8) --
+    gamma = 0.000665 * pressure  # kPa/°C
+
+    # -- Step 3: Magnus formula helper --
+    def _magnus(temp):
+        return 0.6108 * np.exp(17.27 * temp / (temp + 237.3))
+
+    # -- Step 4: Saturation VP at hourly T (FAO-56 Eq. 11) --
+    # For hourly, eₛ = e°(T) directly (not average of Tmax/Tmin)
+    es = _magnus(t)  # kPa
+
+    # -- Step 5: Actual VP from dewpoint (FAO-56 Eq. 14) --
+    ea = _magnus(td)  # kPa
+
+    # -- Step 6: Slope of saturation VP curve Δ (FAO-56 Eq. 13) --
+    delta = 4098.0 * es / (t + 237.3) ** 2  # kPa/°C
+
+    # -- Step 7: Extraterrestrial radiation Ra (FAO-56 Eq. 28) --
+    # Latitude from the DataArray lat coordinate
+    lat_coord = temperature.coords["lat"].values  # degrees
+    lat_rad = np.radians(lat_coord)  # (n_lat,)
+
+    # Longitude from the DataArray lon coordinate
+    lon_coord = temperature.coords["lon"].values  # degrees (n_lon,)
+
+    # Time coordinate — extract UTC hour and day-of-year (vectorised)
+    time_values = temperature.coords["time"].values
+    dti = pd.DatetimeIndex(time_values)
+    hours_utc = (dti.hour + dti.minute / 60.0).to_numpy(dtype=float)  # (n_time,)
+    doy = dti.dayofyear.to_numpy(dtype=float)  # (n_time,)
+
+    # Inverse relative distance Earth-Sun and solar declination
+    # FAO-56 Eq. 23, 24
+    dr = 1.0 + 0.033 * np.cos(2.0 * np.pi / 365.0 * doy)  # (n_time,)
+    dec = 0.409 * np.sin(2.0 * np.pi / 365.0 * doy - 1.39)  # (n_time,) rad
+
+    # Determine axis positions from the dims of the input array
+    time_ax = temperature.dims.index("time")
+    lat_ax = temperature.dims.index("lat")
+    lon_ax = temperature.dims.index("lon")
+    ndim = len(temperature.dims)
+
+    def _expand(arr, axis, total_dims):
+        """Insert length-1 axes so *arr* broadcasts to *total_dims* dimensions."""
+        shape = [1] * total_dims
+        shape[axis] = len(arr)
+        return arr.reshape(shape)
+
+    dr_b = _expand(dr, time_ax, ndim)
+    dec_b = _expand(dec, time_ax, ndim)
+    lat_b = _expand(lat_rad, lat_ax, ndim)
+    lon_b = _expand(lon_coord, lon_ax, ndim)
+    hours_b = _expand(hours_utc, time_ax, ndim)
+
+    # Solar time angle at midpoint of the hour (FAO-56 Eq. 29 simplified for UTC):
+    # ω = π/12 × (hour_utc + 0.5 + lon/15 - 12)
+    omega = np.pi / 12.0 * (hours_b + 0.5 + lon_b / 15.0 - 12.0)  # rad
+    omega1 = omega - np.pi / 24.0  # hour angle at start of period
+    omega2 = omega + np.pi / 24.0  # hour angle at end of period
+
+    # Ra in MJ/m²/hour (FAO-56 Eq. 28)
+    gsc = 0.0820  # solar constant MJ/m²/min
+    ra = (
+        12.0 / np.pi
+        * gsc
+        * dr_b
+        * (
+            (omega2 - omega1) * np.sin(lat_b) * np.sin(dec_b)
+            + np.cos(lat_b) * np.cos(dec_b) * (np.sin(omega2) - np.sin(omega1))
+        )
+    )
+    ra = np.broadcast_to(ra, t.shape).copy()
+    ra = np.clip(ra, 0.0, None)  # nighttime Ra = 0
+
+    # -- Step 8: Clear-sky radiation Rso (FAO-56 Eq. 37) --
+    rso = (0.75 + 2e-5 * z) * ra  # MJ/m²/hour
+
+    # -- Step 9: Net shortwave radiation Rns (FAO-56 Eq. 38) --
+    rns = (1.0 - albedo) * rs  # MJ/m²/hour
+
+    # -- Step 10: Net longwave radiation Rnl (hourly form, FAO-56 Eq. 39) --
+    # Stefan-Boltzmann constant in MJ/(m²·hour·K⁴)
+    sigma_h = 2.042e-10
+    t_k = t + 273.15
+    humidity_term = humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))
+
+    # Cloudiness correction — use Rs/Rso, clip to [0.25, 1.0].
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs_rso_ratio = np.where(rso > 0.0, rs / rso, 0.25)
+    rs_rso_ratio = np.clip(rs_rso_ratio, 0.25, 1.0)
+    cloud_term = cloud_a * rs_rso_ratio - cloud_b
+
+    rnl = sigma_h * (t_k ** 4) * humidity_term * cloud_term  # MJ/m²/hour
+
+    # -- Step 11: Net radiation Rn (FAO-56 Eq. 40) --
+    rn = rns - rnl  # MJ/m²/hour
+
+    # -- Step 12: Daytime/nighttime determination --
+    # Daytime when Rn > 0 (sun above horizon)
+    is_daytime = rn > 0.0
+
+    # -- Step 13: Soil heat flux G (FAO-56 Chapter 4) --
+    g = np.where(is_daytime, g_frac_day * rn, g_frac_night * rn)
+
+    # -- Step 14: Wind resistance coefficient Cd --
+    cd = np.where(is_daytime, cd_day, cd_night)
+
+    # -- Step 15: FAO-56 hourly Penman-Monteith equation (Eq. 53) --
+    numerator = 0.408 * delta * (rn - g) + gamma * (cn / (t + 273.0)) * u2 * (es - ea)
+    denominator = delta + gamma * (1.0 + cd * u2)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        et0 = numerator / denominator
+
+    et0 = np.where(np.isfinite(et0), et0, 0.0)
+    et0 = np.clip(et0, 0.0, None)
+
+    return xr.DataArray(
+        et0,
+        dims=temperature.dims,
+        coords=temperature.coords,
+        name="pet_penman_monteith_hourly_mm",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
