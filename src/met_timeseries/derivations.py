@@ -80,11 +80,25 @@ def dewpoint_from_specific_humidity(
     dp = _mpc_dp(pres_pa, spfh)
 
     return xr.DataArray(
-        dp.to("degC").magnitude,
+        dp.to("degF").magnitude,
         dims=specific_humidity.dims,
         coords=specific_humidity.coords,
-        name="dewpoint_c",
+        name="dewpoint_f",
     )
+
+def kelvin_to_fahrenheit(temp_k: xr.DataArray) -> xr.DataArray:
+    """Convert temperature from Kelvin to Fahrenheit.
+
+    Parameters
+    ----------
+    temp_k:
+        Temperature in Kelvin.
+
+    Returns
+    -------
+    :class:`xarray.DataArray` named ``temp_f`` in degrees Fahrenheit.
+    """
+    return ((temp_k - 273.15) * 9/5 + 32).rename("temp_f")
 
 
 def kelvin_to_celsius(temp_k: xr.DataArray) -> xr.DataArray:
