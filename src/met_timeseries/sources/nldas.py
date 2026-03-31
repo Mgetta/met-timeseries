@@ -274,12 +274,12 @@ def _search_nldas_granules(
 
 
 def _fetch_nldas_granules(
-    bounds: BoundingBox,
     start_date: str,
     end_date: str,
     variables: list[str],
     max_connections: int,
-    cache_dir: Path = None
+    cache_dir: Path = None,
+    bounds: BoundingBox = None
 ) -> xr.Dataset:
     """Download and subset all granules for a date range, returning a Dataset.
 
@@ -342,6 +342,8 @@ def _fetch_nldas_granules(
         dim="time",
     )
 
+    if bounds is not None:
+        ds = _clip_dataset(ds, bounds)
     # Some NLDAS-2 granules store time as a numeric offset rather than
     # datetime64. Reconstruct the coordinate from the known range start if
     # the decoded dtype is not already datetime64.
@@ -357,7 +359,7 @@ def _fetch_nldas_granules(
 def _cache_dataset(ds: xr.Dataset,cache_path: Path) -> Path:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     encoding = {
-        var: {"zlib": True, "complevel": 4, "dtype": "float32"}
+        var: {"zlib": True, "complevel": 9,"shuffle": True}
         for var in ds.data_vars
     }
     ds.to_netcdf(cache_path, encoding=encoding)
