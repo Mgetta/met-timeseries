@@ -24,7 +24,7 @@ from pathlib import Path
 
 import xarray as xr
 
-from met_timeseries.sources.base import MN_BOUNDS, BoundingBox
+from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ def fetch_prism(
         )
 
     if bounds is None:
-        bounds = MN_BOUNDS
+        bounds = CACHE_BOUNDS
 
     # Validate date inputs and construct list of all dates to fetch
     date = dt.date.fromisoformat(date)
@@ -108,11 +108,17 @@ def fetch_prism(
         ds = _load_from_cache(date,resolution,cache_dir)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars:
-            ds_missing = download(date, missing_vars, resolution, cache_dir)
+            ds_missing = download(date = date,
+                                  resolution = resolution, 
+                                  variables = missing_vars, 
+                                  cache_dir = cache_dir)
             ds = xr.merge([ds, ds_missing])
             _cache_dataset(ds,cache_path)
     else:
-        ds = download(date, variables, resolution, cache_dir)
+        ds = download(date = date,
+                      resolution = resolution,
+                      variables = variables,
+                      cache_dir = cache_dir)
         _cache_dataset(ds,cache_path)
 
     ds = _clip_dataset(ds, bounds=bounds)
@@ -162,6 +168,7 @@ def download(
         if not zip_path.exists():
             raise FileNotFoundError(f"Zip file not found: {zip_path}")
         da = _load_from_zip(zip_path, var, resolution, date)
+        zip_path.unlink()
         arrays_by_var[var] = da
         time.sleep(2)
 
@@ -172,8 +179,7 @@ def download(
     #     stacked["time"] = ("time", time_coords)
     #     dataset_vars[var] = stacked
 
-    ds = _clip_dataset(xr.Dataset(arrays_by_var))
-    zip_path.unlink()
+    ds = _clip_dataset(xr.Dataset(arrays_by_var), CACHE_BOUNDS)
     return ds
 
 def get_release_date(
@@ -242,30 +248,17 @@ RESOLUTION_MAP = {
     "4km": "25m",
 }
 
-def _clip_dataset(ds: xr.Dataset) -> xr.Dataset:
+def _clip_dataset(ds: xr.Dataset,bounds: BoundingBox) -> xr.Dataset:
     """
-    Clip an xarray Dataset to the given spatial bounding box using MN_BOUNDS.
+    Clip an xarray Dataset to the given spatial bounding box.
     """
     ds = ds.sel(
-        lat=slice(MN_BOUNDS.south, MN_BOUNDS.north),
-        lon=slice(MN_BOUNDS.west, MN_BOUNDS.east),
+        lat=slice(bounds.south, bounds.north),
+        lon=slice(bounds.west, bounds.east),
     )
     ds = ds.load()
     return ds
 
-
-def _clip_dataarray(
-    da: xr.DataArray,
-) -> xr.DataArray:
-    """
-    Clip an xarray DataArray to the given spatial bounding box using MN_BOUNDS.
-    """
-    da = da.sel(
-        lat=slice(MN_BOUNDS.south, MN_BOUNDS.north),
-        lon=slice(MN_BOUNDS.west, MN_BOUNDS.east),
-    )
-    da = da.load()
-    return da
 
 def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> Path:
     """Construct the expected zip file path for a given PRISM variable, date, and resolution."""
@@ -291,16 +284,6 @@ def _cache_dataset(ds: xr.Dataset, cache_path: Path) -> Path:
     encoding = {var: {"zlib": True, "complevel": 9, "shuffle": True} for var in ds.data_vars}
     ds.to_netcdf(cache_path, encoding=encoding)
     return cache_path
-
-
-def _cache_dataarray(da: xr.DataArray,cache_path: Path) -> Path:
-    logger.debug("Compressing PRISM daily grid %s to %s", da.name, cache_path)
-    encoding = {
-        da.name: {"zlib": True, "complevel": 9,"shuffle": True}
-    }
-    da.to_netcdf(cache_path, encoding=encoding)
-    return cache_path
-    
 
 def _construct_url(variable: str, resolution: str, date: dt.date) -> str:
     date_str = date.strftime("%Y%m%d")

@@ -50,7 +50,7 @@ class BoundingBox:
 #:   South:  43.0   (southern MN border + Iowa/SD headwaters)
 #:   East:  -89.0   (eastern MN border + St. Croix into WI)
 #:   North:  50.0   (northern MN border + Rainy River into Ontario)
-MN_BOUNDS = BoundingBox(west=-97.5, south=43.0, east=-89.0, north=50.0)
+CACHE_BOUNDS = BoundingBox(west=-97.5, south=43.0, east=-89.0, north=50.0)
 
 
 class FetchFunction(Protocol):
