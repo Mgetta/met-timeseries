@@ -13,15 +13,7 @@ import xarray as xr
 
 
 class BoundingBox:
-    """Axis-aligned bounding box in geographic coordinates (EPSG:4326).
-
-    Attributes
-    ----------
-    west, east:
-        Longitude bounds (degrees).
-    south, north:
-        Latitude bounds (degrees).
-    """
+    """Axis-aligned bounding box in geographic coordinates (EPSG:4326)."""
 
     __slots__ = ("west", "south", "east", "north")
 
@@ -31,11 +23,34 @@ class BoundingBox:
         self.east = east
         self.north = north
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def __repr__(self) -> str:
         return (
             f"BoundingBox(west={self.west}, south={self.south}, "
             f"east={self.east}, north={self.north})"
         )
+
+    def contains(self, other: "BoundingBox") -> bool:
+        """Return True if *other* is entirely within this box."""
+        return (
+            self.west <= other.west
+            and self.south <= other.south
+            and self.east >= other.east
+            and self.north >= other.north
+        )
+
+
+
+
+#: Fixed clip boundary encompassing all HUC-8 watersheds that drain to or
+#: from Minnesota.  Used as the download/cache extent for both PRISM and
+#: NLDAS so that cached files are reusable across any metzone within MN.
+#:
+#: Approximate extent (rounded outward to the nearest 0.5°):
+#:   West:  -97.5   (western MN border + Red River basin into ND/SD)
+#:   South:  43.0   (southern MN border + Iowa/SD headwaters)
+#:   East:  -89.0   (eastern MN border + St. Croix into WI)
+#:   North:  50.0   (northern MN border + Rainy River into Ontario)
+MN_BOUNDS = BoundingBox(west=-97.5, south=43.0, east=-89.0, north=50.0)
 
 
 class FetchFunction(Protocol):

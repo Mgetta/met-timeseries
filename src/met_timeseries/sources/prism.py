@@ -17,13 +17,14 @@ import json
 import logging
 import tempfile
 import time
+from typing import List
 import urllib.request
 import zipfile
 from pathlib import Path
 
 import xarray as xr
 
-from met_timeseries.sources.base import BoundingBox
+from met_timeseries.sources.base import MN_BOUNDS, BoundingBox
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +48,10 @@ VALID_RESOLUTIONS = ("800m", "4km")
 
 
 def fetch_prism(
-    start: str,
+    date: str,
     cache_dir: Path | str,
-    variables : list[str],
     bounds: BoundingBox | None = None,
-    end: str | None = None,
+    variables : list[str] = ['ppt', 'tmax', 'tmin'],
     resolution: str = "4km",
 ) -> xr.Dataset:
     """Fetch daily PRISM climate data for the given bounding box and date range.
@@ -61,13 +61,8 @@ def fetch_prism(
 
     Parameters
     ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
-    start:
-        Start date in ``"YYYY-MM-DD"`` format.
-    end:
-        End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
-        (the default), only the single day given by *start* is fetched.
+    date:
+        Date in ``"YYYY-MM-DD"`` format.
     variables:
         PRISM variable short-names to download.  Defaults to
         ``["ppt", "tmax", "tmin"]``.
@@ -95,99 +90,44 @@ def fetch_prism(
             f"Invalid resolution {resolution!r}; must be one of {VALID_RESOLUTIONS}"
         )
 
+    if bounds is None:
+        bounds = MN_BOUNDS
+
     # Validate date inputs and construct list of all dates to fetch
-    start_date = dt.date.fromisoformat(start)
-    end_date = dt.date.fromisoformat(end) if end is not None else start_date
-    if end_date < start_date:
-        raise ValueError(
-            f"end ({end!r}) must not be before start ({start!r})"
-        )
+    date = dt.date.fromisoformat(date)
     logger.info(
-        "Fetching PRISM daily data: start=%s end=%s variables=%s bounds=%r",
-        start_date, end_date, variables, bounds,
+        "Fetching PRISM daily data: date=%s variables=%s",
+        date, variables,
     )
 
-    all_days = [
-        start_date + dt.timedelta(days=i)
-        for i in range((end_date - start_date).days + 1)
-    ]
-
-    time_coords = [
-        dt.datetime(d.year, d.month, d.day) for d in all_days
-    ]
 
     # Download each day's raster, clip to bounds, and collect into lists by variable
-    arrays_by_var: dict[str, list[xr.DataArray]] = {var: [] for var in variables}
-    for date in all_days:
-        for var in variables:
-            try:
-                da = _load_from_cache(date, var, resolution, cache_dir)
-            except FileNotFoundError:
-                cache_path = download(date, var, resolution, cache_dir,compress=True,bounds = bounds)
-                da = _load_from_cache(date, var, resolution, cache_dir)
-            arrays_by_var[var].append(da)
-            time.sleep(2)
+    cache_path = Path(cache_dir) / f"prism_{resolution}_{date.strftime('%Y%m%d')}.nc"
 
-    # Stack each variable's daily arrays along a new time dimension, and combine into a Dataset
-    dataset_vars: dict[str, xr.DataArray] = {}
-    for var, day_arrays in arrays_by_var.items():
-        stacked = xr.concat(day_arrays, dim="time")
-        stacked["time"] = ("time", time_coords)
-        dataset_vars[var] = stacked
+    if cache_path.exists():
+        ds = _load_from_cache(date,resolution,cache_dir)
+        missing_vars = [var for var in variables if var not in ds.data_vars]
+        if missing_vars:
+            ds_missing = download(date, missing_vars, resolution, cache_dir)
+            ds = xr.merge([ds, ds_missing])
+            _cache_dataset(ds,cache_path)
+    else:
+        ds = download(date, variables, resolution, cache_dir)
+        _cache_dataset(ds,cache_path)
 
-    return xr.Dataset(dataset_vars)
-
-def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> Path:
-    """Construct the expected zip file path for a given PRISM variable, date, and resolution."""
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    zip_filename = f"prism_{variable}_{resolution}_{date.strftime('%Y%m%d')}.zip"
-    zip_path = cache_dir / zip_filename
-    if not zip_path.exists():
-        raise FileNotFoundError(f"Zip file not found: {zip_path}")
-    return zip_path
-
-def _load_from_cache(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> xr.DataArray:
-    """Load a PRISM variable from the local cache if it exists."""
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    zip_filename = f"prism_{variable}_{resolution}_{date.strftime('%Y%m%d')}.nc"
-    nc_path = cache_dir / zip_filename
-    if not nc_path.exists():
-        raise FileNotFoundError(f"Zip file not found: {nc_path}")
-    return xr.open_dataset(nc_path)[variable]
-
-
-
-def _compress(zip_path: Path | str, variable: str,resolution: str,date: dt.date,bounds: BoundingBox | None = None) -> Path:
-
-    zip_path = Path(zip_path)
-    compress_path = zip_path.with_suffix(".nc")
-    if not zip_path.exists():
-        raise FileNotFoundError(f"Zip file not found: {zip_path}")
-    da = _load_from_zip(zip_path, variable, resolution, date,bounds)
-    encoding = {
-        da.name: {"zlib": True, "complevel": 9,"shuffle": True}
-    }
-
-    da.to_netcdf(compress_path, encoding=encoding)
-    logger.debug("Cached NLDAS data to %s", compress_path)
-
+    ds = _clip_dataset(ds, bounds=bounds)
+    return ds
 
 def download(
     date: dt.date,
-    variable: str,
     resolution: str,
-    cache_dir: Path | str,
-    compress: bool = True,
-    bounds: BoundingBox | None = None
+    cache_dir: Path | str | None = None,
+    variables: List[str] = ['ppt', 'tmax', 'tmin']
 ) -> xr.DataArray:
     """Download one day's PRISM raster to  a zip file and return zip file path.
 
     Parameters
     ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
     date:
         The calendar date to fetch.
     variable:
@@ -203,23 +143,38 @@ def download(
         2-D DataArray with ``lat`` and ``lon`` dimensions (no ``time`` dim).
     """
 
-    url = _construct_url(variable, resolution, date)
-    zip_path = _download_url(
-        url,
-        cache_dir,
-        variable=variable,
-        resolution=resolution,
-        date= date,
-    )
-    if compress:
-        logger.debug("Compressing PRISM daily grid %s for %s", variable, date)
-        output_path = _compress(zip_path, variable, resolution, date,bounds)
-        # delete the original zip file after compression
-        logger.debug("Deleting original PRISM zip file %s", zip_path)
-        #zip_path.unlink()
+    if cache_dir is None:
+        cache_dir = Path(tempfile.gettempdir()) / "prism_cache"
     else:
-        output_path = zip_path
-    return output_path
+        cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+
+    arrays_by_var: dict[str, xr.DataArray] = {}
+    for var in variables:
+        url = _construct_url(var, resolution, date)
+        zip_path = _download_url(
+            url,
+            cache_dir,
+            variable=var,
+            resolution=resolution,
+            date= date,)
+        if not zip_path.exists():
+            raise FileNotFoundError(f"Zip file not found: {zip_path}")
+        da = _load_from_zip(zip_path, var, resolution, date)
+        arrays_by_var[var] = da
+        time.sleep(2)
+
+    # Stack each variable's daily arrays along a new time dimension, and combine into a Dataset
+    # dataset_vars: dict[str, xr.DataArray] = {}
+    # for var, day_arrays in arrays_by_var.items():
+    #     stacked = xr.concat(day_arrays, dim="time")
+    #     stacked["time"] = ("time", time_coords)
+    #     dataset_vars[var] = stacked
+
+    ds = _clip_dataset(xr.Dataset(arrays_by_var))
+    zip_path.unlink()
+    return ds
 
 def get_release_date(
     variable: str,
@@ -287,6 +242,66 @@ RESOLUTION_MAP = {
     "4km": "25m",
 }
 
+def _clip_dataset(ds: xr.Dataset) -> xr.Dataset:
+    """
+    Clip an xarray Dataset to the given spatial bounding box using MN_BOUNDS.
+    """
+    ds = ds.sel(
+        lat=slice(MN_BOUNDS.south, MN_BOUNDS.north),
+        lon=slice(MN_BOUNDS.west, MN_BOUNDS.east),
+    )
+    ds = ds.load()
+    return ds
+
+
+def _clip_dataarray(
+    da: xr.DataArray,
+) -> xr.DataArray:
+    """
+    Clip an xarray DataArray to the given spatial bounding box using MN_BOUNDS.
+    """
+    da = da.sel(
+        lat=slice(MN_BOUNDS.south, MN_BOUNDS.north),
+        lon=slice(MN_BOUNDS.west, MN_BOUNDS.east),
+    )
+    da = da.load()
+    return da
+
+def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> Path:
+    """Construct the expected zip file path for a given PRISM variable, date, and resolution."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    zip_filename = f"prism_{variable}_{resolution}_{date.strftime('%Y%m%d')}.zip"
+    zip_path = cache_dir / zip_filename
+    if not zip_path.exists():
+        raise FileNotFoundError(f"Zip file not found: {zip_path}")
+    return zip_path
+
+def _load_from_cache(date: dt.date, resolution: str, cache_dir: Path | str) -> xr.DataArray:
+    """Load a PRISM variable from the local cache if it exists."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"prism_{resolution}_{date.strftime('%Y%m%d')}.nc"
+    if not cache_path.exists():
+        raise FileNotFoundError(f"Cache file not found: {cache_path}")
+    return xr.open_dataset(cache_path)
+
+def _cache_dataset(ds: xr.Dataset, cache_path: Path) -> Path:
+    logger.debug("Compressing PRISM daily dataset to %s", cache_path)
+    encoding = {var: {"zlib": True, "complevel": 9, "shuffle": True} for var in ds.data_vars}
+    ds.to_netcdf(cache_path, encoding=encoding)
+    return cache_path
+
+
+def _cache_dataarray(da: xr.DataArray,cache_path: Path) -> Path:
+    logger.debug("Compressing PRISM daily grid %s to %s", da.name, cache_path)
+    encoding = {
+        da.name: {"zlib": True, "complevel": 9,"shuffle": True}
+    }
+    da.to_netcdf(cache_path, encoding=encoding)
+    return cache_path
+    
+
 def _construct_url(variable: str, resolution: str, date: dt.date) -> str:
     date_str = date.strftime("%Y%m%d")
     url = _URL_TEMPLATE.format(
@@ -294,7 +309,7 @@ def _construct_url(variable: str, resolution: str, date: dt.date) -> str:
     )
     return url
 
-def _load_from_zip(zip_path: Path, variable: str, resolution: str, date: dt.date, bounds: BoundingBox = None) -> xr.DataArray:
+def _load_from_zip(zip_path: Path, variable: str, resolution: str, date: dt.date) -> xr.DataArray:
     # Uses rasterio via xarray's "rasterio" engine, which supports reading from
     # zip files via vsizip.  This avoids the overhead of extracting the .tif to disk first.
 
@@ -306,10 +321,6 @@ def _load_from_zip(zip_path: Path, variable: str, resolution: str, date: dt.date
 
     da = xr.open_dataarray(vsi_path, engine="rasterio")
 
-    if bounds is not None:
-        da = da.rio.clip_box(
-            minx=bounds.west, miny=bounds.south, maxx=bounds.east, maxy=bounds.north
-        )
 
     # Squeeze out the band dimension if present (common with rasterio engine)
     if "band" in da.dims:

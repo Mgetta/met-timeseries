@@ -43,7 +43,7 @@ import pandas as pd
 import xarray as xr
 from shapely.geometry import box
 
-from met_timeseries.sources.base import BoundingBox
+from met_timeseries.sources.base import MN_BOUNDS, BoundingBox
 
 logger = logging.getLogger(__name__)
 
@@ -121,11 +121,10 @@ def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:
 
 
 def fetch_nldas(
-    bounds: BoundingBox,
-    start: str,
+    date: str,
     cache_dir: str,
-    end: str | None = None,
-    variables: list[str] | None = None,
+    bounds: BoundingBox | None = None,
+    variables: list[str] = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"],
     max_connections: int = 8,
 ) -> xr.Dataset:
     """Fetch NLDAS-2 hourly gridded data for the given bounding box.
@@ -164,32 +163,34 @@ def fetch_nldas(
     RuntimeError
         If no granules are found for a requested period.
     """
-    import earthaccess
  
-    if variables is None:
-        variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
-    start_date = dt.date.fromisoformat(start)
-    end_date = dt.date.fromisoformat(end) if end is not None else start_date
-    if end_date < start_date:
-        raise ValueError(
-            f"end ({end!r}) must not be before start ({start!r})"
-        )
+    if bounds is None:
+        bounds = MN_BOUNDS
 
-    days = pd.date_range(start=start_date, end=end_date, freq="D")
+    date = dt.date.fromisoformat(date)
+    
+    cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
 
-    earthaccess.login()
-
-    for date in days:
-        cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
-        if cache_path.exists():
-            ds = xr.open_dataset(cache_path)
-        else:
-            ds = _fetch_nldas_granules(
-                 str(date.date()), str(date.date()), variables, max_connections, bounds = bounds
-            )
+    if cache_path.exists():
+        ds = xr.open_dataset(cache_path)
+        missing_vars = [var for var in variables if var not in ds.data_vars]
+        if missing_vars: # Add missing variables to the existing dataset
+            ds_missing = download(str(date.date()), 
+                                  str(date.date()), 
+                                  missing_vars, 
+                                  max_connections)
+            ds = xr.merge([ds, ds_missing])
             _cache_dataset(ds, cache_path)
+    else:
+        ds = download(str(date.date()), 
+                      str(date.date()), 
+                      variables, 
+                      max_connections
+        )
+        _cache_dataset(ds, cache_path)
 
+    ds = _clip_dataset(ds, bounds=bounds)
     return ds
 
 
@@ -200,7 +201,7 @@ def _open_file_obj(file_obj: object) -> xr.Dataset:
 
 def _clip_dataset(
     ds: xr.Dataset,
-    bounds: BoundingBox,
+    bounds: BoundingBox | None = None
 ) -> xr.Dataset:
     """
     Clip an xarray Dataset to the given spatial bounding box.
@@ -218,6 +219,8 @@ def _clip_dataset(
         In-memory Dataset containing only the spatial extent
         defined by *bounds*.
     """
+    if bounds is None:
+        bounds = MN_BOUNDS
 
     ds = ds.sel(
         lat=slice(bounds.south, bounds.north),
@@ -228,9 +231,9 @@ def _clip_dataset(
 
 
 def _search_nldas_granules(
-    bounds: BoundingBox,
     start_date: str,
     end_date: str,
+    bounds: BoundingBox | None = None,
 ) -> list:
     """Search for NLDAS-2 granules for a given date range via CMR.
 
@@ -255,6 +258,10 @@ def _search_nldas_granules(
     """
     import earthaccess
 
+
+    if bounds is None:
+        bounds = MN_BOUNDS
+
     results = earthaccess.search_data(
         short_name="NLDAS_FORA0125_H",
         version="2.0",
@@ -273,13 +280,12 @@ def _search_nldas_granules(
     return results
 
 
-def _fetch_nldas_granules(
+def download(
     start_date: str,
     end_date: str,
     variables: list[str],
     max_connections: int,
-    cache_dir: Path = None,
-    bounds: BoundingBox = None
+    bounds: BoundingBox | None = None,
 ) -> xr.Dataset:
     """Download and subset all granules for a date range, returning a Dataset.
 
@@ -289,8 +295,8 @@ def _fetch_nldas_granules(
 
     Parameters
     ----------
-    bounds:
-        Spatial bounding box in EPSG:4326.
+    bounds: BoundingBox | None = None
+        Spatial bounding box in EPSG:4326. Defaults to MN_BOUNDS if None.
     start_date:
         Start of the temporal range in ``"YYYY-MM-DD"`` format.
     end_date:
@@ -310,12 +316,10 @@ def _fetch_nldas_granules(
         Dataset concatenated along the ``time`` dimension.
     """
     import earthaccess
-
-    results = _search_nldas_granules(bounds, start_date, end_date)
-
+    earthaccess.login()
+    results = _search_nldas_granules(start_date, end_date, bounds)
     file_objs = earthaccess.open(results)
 
-    
     granule_datasets: list[xr.Dataset] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_connections) as executor:
         futures = {
@@ -342,8 +346,7 @@ def _fetch_nldas_granules(
         dim="time",
     )
 
-    if bounds is not None:
-        ds = _clip_dataset(ds, bounds)
+    ds = _clip_dataset(ds,bounds)
     # Some NLDAS-2 granules store time as a numeric offset rather than
     # datetime64. Reconstruct the coordinate from the known range start if
     # the decoded dtype is not already datetime64.
