@@ -120,8 +120,11 @@ def fetch_prism(
     arrays_by_var: dict[str, list[xr.DataArray]] = {var: [] for var in variables}
     for date in all_days:
         for var in variables:
-            zip_path = download(date, var, resolution, cache_dir)
-            da = _load_from_zip(zip_path, var, resolution, date,bounds)
+            try:
+                da = _load_from_cache(date, var, resolution, cache_dir)
+            except FileNotFoundError:
+                cache_path = download(date, var, resolution, cache_dir,compress=True,bounds = bounds)
+                da = _load_from_cache(date, var, resolution, cache_dir)
             arrays_by_var[var].append(da)
             time.sleep(2)
 
@@ -134,22 +137,41 @@ def fetch_prism(
 
     return xr.Dataset(dataset_vars)
 
-def _compress(zip_path: Path | str) -> Path:
-    logger.debug("Compressing PRISM daily %s for %s", variable, date)
+def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> Path:
+    """Construct the expected zip file path for a given PRISM variable, date, and resolution."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    zip_filename = f"prism_{variable}_{resolution}_{date.strftime('%Y%m%d')}.zip"
+    zip_path = cache_dir / zip_filename
+    if not zip_path.exists():
+        raise FileNotFoundError(f"Zip file not found: {zip_path}")
+    return zip_path
+
+def _load_from_cache(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> xr.DataArray:
+    """Load a PRISM variable from the local cache if it exists."""
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    zip_filename = f"prism_{variable}_{resolution}_{date.strftime('%Y%m%d')}.nc"
+    nc_path = cache_dir / zip_filename
+    if not nc_path.exists():
+        raise FileNotFoundError(f"Zip file not found: {nc_path}")
+    return xr.open_dataset(nc_path)[variable]
+
+
+
+def _compress(zip_path: Path | str, variable: str,resolution: str,date: dt.date,bounds: BoundingBox | None = None) -> Path:
+
     zip_path = Path(zip_path)
     compress_path = zip_path.with_suffix(".nc")
     if not zip_path.exists():
         raise FileNotFoundError(f"Zip file not found: {zip_path}")
-    ds = _load_from_zip(zip_path)
-
+    da = _load_from_zip(zip_path, variable, resolution, date,bounds)
     encoding = {
-        var: {"zlib": True, "complevel": 9,"shuffle": True}
-        for var in ds.data_vars
+        da.name: {"zlib": True, "complevel": 9,"shuffle": True}
     }
 
-    ds.to_netcdf(compress_path, encoding=encoding)
+    da.to_netcdf(compress_path, encoding=encoding)
     logger.debug("Cached NLDAS data to %s", compress_path)
-
 
 
 def download(
@@ -157,7 +179,8 @@ def download(
     variable: str,
     resolution: str,
     cache_dir: Path | str,
-    compress: bool = True
+    compress: bool = True,
+    bounds: BoundingBox | None = None
 ) -> xr.DataArray:
     """Download one day's PRISM raster to  a zip file and return zip file path.
 
@@ -189,10 +212,11 @@ def download(
         date= date,
     )
     if compress:
-        output_path = _compress(zip_path)
+        logger.debug("Compressing PRISM daily grid %s for %s", variable, date)
+        output_path = _compress(zip_path, variable, resolution, date,bounds)
         # delete the original zip file after compression
         logger.debug("Deleting original PRISM zip file %s", zip_path)
-        zip_path.unlink()
+        #zip_path.unlink()
     else:
         output_path = zip_path
     return output_path

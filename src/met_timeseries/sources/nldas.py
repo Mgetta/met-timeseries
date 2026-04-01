@@ -165,7 +165,7 @@ def fetch_nldas(
         If no granules are found for a requested period.
     """
     import earthaccess
-
+ 
     if variables is None:
         variables = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]
 
@@ -186,7 +186,7 @@ def fetch_nldas(
             ds = xr.open_dataset(cache_path)
         else:
             ds = _fetch_nldas_granules(
-                bounds, str(date.date()), str(date.date()), variables, max_connections
+                 str(date.date()), str(date.date()), variables, max_connections, bounds = bounds
             )
             _cache_dataset(ds, cache_path)
 
