@@ -172,14 +172,9 @@ def download(
         arrays_by_var[var] = da
         time.sleep(2)
 
-    # Stack each variable's daily arrays along a new time dimension, and combine into a Dataset
-    # dataset_vars: dict[str, xr.DataArray] = {}
-    # for var, day_arrays in arrays_by_var.items():
-    #     stacked = xr.concat(day_arrays, dim="time")
-    #     stacked["time"] = ("time", time_coords)
-    #     dataset_vars[var] = stacked
-
     ds = _clip_dataset(xr.Dataset(arrays_by_var), CACHE_BOUNDS)
+    # Add time dimension
+    ds = ds.expand_dims(time=[dt.datetime(date.year, date.month, date.day)])
     return ds
 
 def get_release_date(
@@ -248,16 +243,33 @@ RESOLUTION_MAP = {
     "4km": "25m",
 }
 
-def _clip_dataset(ds: xr.Dataset,bounds: BoundingBox) -> xr.Dataset:
-    """
-    Clip an xarray Dataset to the given spatial bounding box.
-    """
+
+
+def _clip_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
+    """Clip an xarray Dataset to the given spatial bounding box."""
+    # PRISM lat is descending (north→south); slice must match index order
+    if ds.lat.values[0] > ds.lat.values[-1]:
+        lat_slice = slice(bounds.north, bounds.south)
+    else:
+        lat_slice = slice(bounds.south, bounds.north)
+
     ds = ds.sel(
-        lat=slice(bounds.south, bounds.north),
+        lat=lat_slice,
         lon=slice(bounds.west, bounds.east),
     )
-    ds = ds.load()
-    return ds
+    return ds.load()
+
+# def _clip_dataset(ds: xr.Dataset,bounds: BoundingBox) -> xr.Dataset:
+#     """
+#     Clip an xarray Dataset to the given spatial bounding box.
+#     old method.
+#     """
+#     ds = ds.sel(
+#         lat=slice(bounds.south, bounds.north),
+#         lon=slice(bounds.west, bounds.east),
+#     )
+#     ds = ds.load()
+#     return ds
 
 
 def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> Path:
@@ -302,26 +314,26 @@ def _load_from_zip(zip_path: Path, variable: str, resolution: str, date: dt.date
     vsi_path = f"/vsizip/{zip_path.as_posix()}/prism_{variable}_us_{_resolution}_{date_str}.tif"
     import rioxarray  # type: ignore[import]
 
-    da = xr.open_dataarray(vsi_path, engine="rasterio")
+    with xr.open_dataarray(vsi_path, engine="rasterio") as da:
 
 
-    # Squeeze out the band dimension if present (common with rasterio engine)
-    if "band" in da.dims:
-        da = da.sel(band=1, drop=True)
+        # Squeeze out the band dimension if present (common with rasterio engine)
+        if "band" in da.dims:
+            da = da.sel(band=1, drop=True)
 
-    # Rename y/x to lat/lon to match NLDAS convention
-    rename_map = {}
-    if "y" in da.dims:
-        rename_map["y"] = "lat"
-    if "x" in da.dims:
-        rename_map["x"] = "lon"
-    if rename_map:
-        da = da.rename(rename_map)
+        # Rename y/x to lat/lon to match NLDAS convention
+        rename_map = {}
+        if "y" in da.dims:
+            rename_map["y"] = "lat"
+        if "x" in da.dims:
+            rename_map["x"] = "lon"
+        if rename_map:
+            da = da.rename(rename_map)
 
-    da.name = variable
+        da.name = variable
 
-    # Load into memory before the temp directory is cleaned up
-    da = da.load()
+        # Load into memory before the temp directory is cleaned up
+        da = da.load()
 
     return da
 

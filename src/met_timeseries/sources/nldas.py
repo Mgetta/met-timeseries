@@ -125,15 +125,15 @@ def fetch_nldas(
         ds = xr.open_dataset(cache_path)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars: # Add missing variables to the existing dataset
-            ds_missing = download(str(date.date()), 
-                                  str(date.date()), 
+            ds_missing = download(date, 
+                                  date, 
                                   missing_vars, 
                                   max_connections)
             ds = xr.merge([ds, ds_missing])
             _cache_dataset(ds, cache_path)
     else:
-        ds = download(str(date.date()), 
-                      str(date.date()), 
+        ds = download(date, 
+                      date, 
                       variables, 
                       max_connections
         )
