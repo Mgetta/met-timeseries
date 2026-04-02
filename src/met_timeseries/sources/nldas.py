@@ -48,18 +48,31 @@ from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
 logger = logging.getLogger(__name__)
 
 #: NLDAS-2 variables available via the forcing-A product
+# AVAILABLE_VARIABLES: list[str] = [
+#     "TMP",       # 2-m air temperature (K)
+#     "SPFH",      # 2-m specific humidity (kg/kg)
+#     "PRES",      # surface pressure (Pa)
+#     "UGRD",      # 10-m zonal wind (m/s)
+#     "VGRD",      # 10-m meridional wind (m/s)
+#     "DLWRF",     # downward longwave radiation (W/m²)
+#     "CONVfrac",  # convective fraction (-)
+#     "CAPE",      # convective available potential energy (J/kg)
+#     "PEVAP",     # potential evaporation (kg/m²)
+#     "APCP",      # precipitation hourly total (kg/m²)
+#     "DSWRF",     # downward shortwave radiation (W/m²)
+# ]
 AVAILABLE_VARIABLES: list[str] = [
-    "TMP",       # 2-m air temperature (K)
-    "SPFH",      # 2-m specific humidity (kg/kg)
-    "PRES",      # surface pressure (Pa)
-    "UGRD",      # 10-m zonal wind (m/s)
-    "VGRD",      # 10-m meridional wind (m/s)
-    "DLWRF",     # downward longwave radiation (W/m²)
-    "CONVfrac",  # convective fraction (-)
-    "CAPE",      # convective available potential energy (J/kg)
-    "PEVAP",     # potential evaporation (kg/m²)
-    "APCP",      # precipitation hourly total (kg/m²)
-    "DSWRF",     # downward shortwave radiation (W/m²)
+    'Tair',
+    'Qair',
+    'PSurf',
+    'Wind_E',
+    'Wind_N',
+    'LWdown',
+    'CRainf_frac',
+    'CAPE',
+    'PotEvap',
+    'Rainf',
+    'SWdown'
 ]
 
 _CACHE_PREFIX = "NLDAS_FORA0125_H_"
@@ -73,7 +86,7 @@ def fetch_nldas(
     date: str,
     cache_dir: str,
     bounds: BoundingBox | None = None,
-    variables: list[str] = ["APCP", "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"],
+    variables: list[str] | None = None,
     max_connections: int = 8,
 ) -> xr.Dataset:
     """Fetch NLDAS-2 hourly gridded data for the given bounding box.
@@ -96,8 +109,8 @@ def fetch_nldas(
         End date in ``"YYYY-MM-DD"`` format (inclusive).  When ``None``
         (the default), only the single day given by *start* is fetched.
     variables:
-        NLDAS-2 short variable names to include.  Defaults to ``["APCP",
-        "TMP", "DSWRF", "PEVAP", "UGRD", "VGRD"]``.
+        NLDAS-2 short variable names to include.  Defaults to ``None``, which
+        fetches all available variables.
     max_connections:
         Maximum number of concurrent granule downloads.  Defaults to ``8``.
 
@@ -113,6 +126,8 @@ def fetch_nldas(
         If no granules are found for a requested period.
     """
  
+    if variables is None:
+        variables = AVAILABLE_VARIABLES
 
     if bounds is None:
         bounds = CACHE_BOUNDS
@@ -122,9 +137,10 @@ def fetch_nldas(
     cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
 
     if cache_path.exists():
-        ds = xr.open_dataset(cache_path)
+        ds = _load_from_cache(cache_path)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars: # Add missing variables to the existing dataset
+            print(missing_vars)
             ds_missing = download(date, 
                                   date, 
                                   missing_vars, 
@@ -184,7 +200,7 @@ def download(
     granule_datasets: list[xr.Dataset] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_connections) as executor:
         futures = {
-            executor.submit(_open_file_obj, fobj): i
+            executor.submit(_open_and_clip, fobj): i
             for i, fobj in enumerate(file_objs)
         }
         for future in concurrent.futures.as_completed(futures):
@@ -207,7 +223,6 @@ def download(
         dim="time",
     )
 
-    ds = _clip_dataset(ds,CACHE_BOUNDS)
     # Some NLDAS-2 granules store time as a numeric offset rather than
     # datetime64. Reconstruct the coordinate from the known range start if
     # the decoded dtype is not already datetime64.
@@ -243,16 +258,22 @@ def _cache_dataset(ds: xr.Dataset,cache_path: Path) -> Path:
     logger.debug("Cached NLDAS data to %s", cache_path)
     return cache_path
 
+def _load_from_cache(cache_path: Path) -> xr.Dataset:
+     if not cache_path.exists():
+         raise FileNotFoundError(f"Cache file not found: {cache_path}")
+     ds = xr.open_dataset(cache_path)
+     ds.load()  # Ensure data is read into memory before the file is closed
+     ds.close()
+     return ds
 
 def _bounds_to_polygon(bounds: BoundingBox):
     """Return a Shapely box polygon for *bounds*."""
     return box(bounds.west, bounds.south, bounds.east, bounds.north)
 
-
-def _open_file_obj(file_obj: object) -> xr.Dataset:
-    """Open a file-like object as an xarray Dataset. Note that this is an in-memory operation and does not write to disk."""
-    return xr.open_dataset(file_obj, engine="h5netcdf")
-
+def _open_and_clip(file_obj: object) -> xr.Dataset:
+    """Open a file-like object as an xarray Dataset and clip to bounds."""
+    ds = xr.open_dataset(file_obj, engine="h5netcdf")
+    return _clip_dataset(ds, CACHE_BOUNDS)
 
 def _clip_dataset(
     ds: xr.Dataset,
