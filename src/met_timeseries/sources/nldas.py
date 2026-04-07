@@ -137,7 +137,7 @@ def fetch_nldas(
     cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
 
     if cache_path.exists():
-        ds = _load_from_cache(cache_path)
+        ds = _load_from_cache(cache_path, bounds=bounds)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars: # Add missing variables to the existing dataset
             print(missing_vars)
@@ -258,13 +258,15 @@ def _cache_dataset(ds: xr.Dataset,cache_path: Path) -> Path:
     logger.debug("Cached NLDAS data to %s", cache_path)
     return cache_path
 
-def _load_from_cache(cache_path: Path) -> xr.Dataset:
+def _load_from_cache(cache_path: Path, bounds: BoundingBox | None = None) -> xr.Dataset:
      if not cache_path.exists():
          raise FileNotFoundError(f"Cache file not found: {cache_path}")
      ds = xr.open_dataset(cache_path)
-     ds.load()  # Ensure data is read into memory before the file is closed
-     ds.close()
-     return ds
+     if bounds is None:
+         bounds = CACHE_BOUNDS
+     ds_clipped = _clip_dataset(ds, bounds=bounds)
+     ds.close() #Do I have to close the dataset before loading the clipped version? I think so, otherwise the file handle will remain open until the garbage collector closes it, which could lead to too many open files if many datasets are loaded.
+     return ds_clipped.load()
 
 def _bounds_to_polygon(bounds: BoundingBox):
     """Return a Shapely box polygon for *bounds*."""
@@ -273,7 +275,9 @@ def _bounds_to_polygon(bounds: BoundingBox):
 def _open_and_clip(file_obj: object) -> xr.Dataset:
     """Open a file-like object as an xarray Dataset and clip to bounds."""
     ds = xr.open_dataset(file_obj, engine="h5netcdf")
-    return _clip_dataset(ds, CACHE_BOUNDS)
+    ds_clipped = _clip_dataset(ds, CACHE_BOUNDS).load()
+    ds.close()
+    return ds_clipped
 
 def _clip_dataset(
     ds: xr.Dataset,
@@ -300,7 +304,6 @@ def _clip_dataset(
         lat=slice(bounds.south, bounds.north),
         lon=slice(bounds.west, bounds.east),
     )
-    ds = ds.load()
     return ds
 
 

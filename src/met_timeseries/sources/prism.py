@@ -105,7 +105,7 @@ def fetch_prism(
     cache_path = Path(cache_dir) / f"prism_{resolution}_{date.strftime('%Y%m%d')}.nc"
 
     if cache_path.exists():
-        ds = _load_from_cache(date,resolution,cache_dir)
+        ds = _load_from_cache(date,resolution,cache_dir,bounds)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars:
             ds_missing = download(date = date,
@@ -121,8 +121,8 @@ def fetch_prism(
                       cache_dir = cache_dir)
         _cache_dataset(ds,cache_path)
 
-    ds = _clip_dataset(ds, bounds=bounds)
-    return ds
+    ds_clipped = _clip_dataset(ds, bounds=bounds)
+    return ds_clipped.load()
 
 def download(
     date: dt.date,
@@ -168,13 +168,12 @@ def download(
         if not zip_path.exists():
             raise FileNotFoundError(f"Zip file not found: {zip_path}")
         da = _load_from_zip(zip_path, var, resolution, date)
-        da = _clip_dataarray(da, bounds=CACHE_BOUNDS)
         zip_path.unlink()
         arrays_by_var[var] = da
         time.sleep(2)
 
-    ds = _clip_dataset(xr.Dataset(arrays_by_var), CACHE_BOUNDS)
     # Add time dimension
+    ds = xr.Dataset(arrays_by_var)
     ds = ds.expand_dims(time=[dt.datetime(date.year, date.month, date.day)])
     return ds
 
@@ -257,7 +256,7 @@ def _clip_dataarray(da: xr.DataArray, bounds: BoundingBox) -> xr.DataArray:
         lat=lat_slice,
         lon=slice(bounds.west, bounds.east),
     )
-    return da.load()
+    return da
 
 def _clip_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
     """Clip an xarray Dataset to the given spatial bounding box."""
@@ -271,7 +270,7 @@ def _clip_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
         lat=lat_slice,
         lon=slice(bounds.west, bounds.east),
     )
-    return ds.load()
+    return ds
 
 # def _clip_dataset(ds: xr.Dataset,bounds: BoundingBox) -> xr.Dataset:
 #     """
@@ -296,7 +295,7 @@ def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path
         raise FileNotFoundError(f"Zip file not found: {zip_path}")
     return zip_path
 
-def _load_from_cache(date: dt.date, resolution: str, cache_dir: Path | str) -> xr.DataArray:
+def _load_from_cache(date: dt.date, resolution: str, cache_dir: Path | str,bounds: BoundingBox | None = None) -> xr.DataArray:
     """Load a PRISM variable from the local cache if it exists."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -304,9 +303,11 @@ def _load_from_cache(date: dt.date, resolution: str, cache_dir: Path | str) -> x
     if not cache_path.exists():
         raise FileNotFoundError(f"Cache file not found: {cache_path}")
     ds = xr.open_dataset(cache_path)
-    ds.load()  # Ensure data is read into memory before the file is closed
+    if bounds is None:
+        bounds = CACHE_BOUNDS
+    da_clipped = _clip_dataset(ds, bounds=bounds)
     ds.close()
-    return ds
+    return da_clipped.load()
 
 def _cache_dataset(ds: xr.Dataset, cache_path: Path) -> Path:
     logger.debug("Compressing PRISM daily dataset to %s", cache_path)
@@ -350,9 +351,10 @@ def _load_from_zip(zip_path: Path, variable: str, resolution: str, date: dt.date
         da.name = variable
 
         # Load into memory before the temp directory is cleaned up
-        da = da.load()
+        da_clipped = _clip_dataarray(da, bounds=CACHE_BOUNDS)
+        da_clipped = da_clipped.load()
 
-    return da
+    return da_clipped
 
 
 def _download_url(
