@@ -150,8 +150,116 @@ def compute_weights(
 # High-level aggregation functions
 # ---------------------------------------------------------------------------
 
+def plot_weights(
+    polygon: BaseGeometry,
+    dataset: xr.Dataset,
+    lat_dim: str = "lat",
+    lon_dim: str = "lon",
+    normalize: bool = True,
+) -> "matplotlib.axes.Axes":
+    """Plot the weight grid for a polygon overlaid on the dataset grid."""
+    import matplotlib.pyplot as plt
 
+    w_ds = get_weights(polygon, dataset, lat_dim=lat_dim, lon_dim=lon_dim, normalize=normalize)
 
+    weights = w_ds["weight"].where(w_ds["weight"] > 0)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.set_facecolor("lightgrey")
+
+    weights.plot.pcolormesh(
+        x=lon_dim, y=lat_dim,
+        ax=ax,
+        cmap="YlOrRd",
+        edgecolors="grey",
+        linewidths=0.3,
+        cbar_kwargs={"label": "Weight", "shrink": 0.8},
+    )
+
+    gpd.GeoSeries([polygon], crs="EPSG:4326").boundary.plot(
+        ax=ax, color="blue", linewidth=2, label="Polygon of interest",
+    )
+
+    # extent = union of grid bounds + polygon bounds, with padding
+    lats = dataset[lat_dim].values
+    lons = dataset[lon_dim].values
+    dy = abs(float(lats[1] - lats[0])) / 2
+    dx = abs(float(lons[1] - lons[0])) / 2
+    poly_bounds = polygon.bounds  # (minx, miny, maxx, maxy)
+
+    xmin = min(lons.min() - dx, poly_bounds[0]) - dx
+    xmax = max(lons.max() + dx, poly_bounds[2]) + dx
+    ymin = min(lats.min() - dy, poly_bounds[1]) - dy
+    ymax = max(lats.max() + dy, poly_bounds[3]) + dy
+
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    ax.set_aspect("equal")
+    ax.legend(loc="best")
+    ax.set_title("Grid-Cell Weights")
+
+    return ax
+
+def get_weights(
+    polygon: BaseGeometry,
+    dataset: xr.Dataset,
+    lat_dim: str = "lat",
+    lon_dim: str = "lon",
+    normalize: bool = True,
+) -> xr.Dataset:
+    """Return grid-cell weights as an xarray Dataset aligned to the input grid.
+
+    The returned Dataset has a single variable ``weight`` with the same
+    lat/lon coordinates as *dataset*.
+    """
+    lats = dataset[lat_dim].values
+    lons = dataset[lon_dim].values
+
+    w = compute_weights(
+        polygon,
+        tuple(float(v) for v in lats),
+        tuple(float(v) for v in lons),
+        normalize=normalize,
+    )
+
+    return xr.Dataset(
+        {"weight": xr.DataArray(w, dims=[lat_dim, lon_dim], coords={lat_dim: lats, lon_dim: lons})},
+    )
+
+def get_greid(
+    dataset: xr.Dataset,
+    lat_dim: str = "lat",
+    lon_dim: str = "lon",
+) -> gpd.GeoDataFrame:
+    """Build a GeoDataFrame of grid-cell polygons from an xarray Dataset.
+
+    Columns: lat, lon, row_id, column_id, geometry, test
+    """
+    lats = dataset[lat_dim].values
+    lons = dataset[lon_dim].values
+
+    dy = abs(float(lats[1] - lats[0]))
+    dx = abs(float(lons[1] - lons[0]))
+    half_x = dx / 2.0
+    half_y = dy / 2.0
+
+    records = []
+    for row_id, lat in enumerate(lats):
+        for col_id, lon in enumerate(lons):
+            records.append({
+                "lat": float(lat),
+                "lon": float(lon),
+                "row_id": row_id,
+                "column_id": col_id,
+                "geometry": shapely_box(
+                    lon - half_x, lat - half_y,
+                    lon + half_x, lat + half_y,
+                ),
+            })
+
+    return gpd.GeoDataFrame(records, crs="EPSG:4326")
+
+ 
 def aggregate_over_polygon(
     dataset: xr.Dataset,
     polygon: BaseGeometry,

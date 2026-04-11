@@ -232,7 +232,41 @@ def get_release_date(
 
     return json.loads(body)
 
+def generate_grid(
+    west: float = -125.0208333,
+    south: float = 24.0625,
+    east: float = -66.4791667,
+    north: float = 49.9375,
+    resolution: str = "4km",
+) -> "gpd.GeoDataFrame":
+    """Return the PRISM grid as a GeoDataFrame of cell polygons.
 
+    Columns: lat, lon, row_id, column_id, geometry
+    """
+    import geopandas as gpd
+    from shapely.geometry import box as shapely_box
+
+    res_degrees = {"4km": 1 / 24, "800m": 1 / 120}
+    if resolution not in res_degrees:
+        raise ValueError(f"resolution must be one of {list(res_degrees)}")
+
+    step = res_degrees[resolution]
+    half = step / 2.0
+    lons = np.arange(west, east + half, step)
+    lats = np.arange(south, north + half, step)
+
+    records = []
+    for row_id, lat in enumerate(lats):
+        for col_id, lon in enumerate(lons):
+            records.append({
+                "lat": round(lat, 7),
+                "lon": round(lon, 7),
+                "row_id": row_id,
+                "column_id": col_id,
+                "geometry": shapely_box(lon - half, lat - half, lon + half, lat + half),
+            })
+
+    return gpd.GeoDataFrame(records, crs="EPSG:4326")
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -258,31 +292,29 @@ def _clip_dataarray(da: xr.DataArray, bounds: BoundingBox) -> xr.DataArray:
     )
     return da
 
-def _clip_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
+def _clip_dataset(
+    ds: xr.Dataset,
+    bounds: BoundingBox,
+) -> xr.Dataset:
     """Clip an xarray Dataset to the given spatial bounding box."""
-    # PRISM lat is descending (north→south); slice must match index order
-    if ds.lat.values[0] > ds.lat.values[-1]:
-        lat_slice = slice(bounds.north, bounds.south)
+    lats = ds.lat.values
+    lons = ds.lon.values
+
+    # pad by half a cell so we include cells whose edges overlap the bounds
+    half_dy = abs(float(lats[1] - lats[0])) / 2
+    half_dx = abs(float(lons[1] - lons[0])) / 2
+
+    if lats[0] > lats[-1]:
+        lat_slice = slice(bounds.north + half_dy, bounds.south - half_dy)
     else:
-        lat_slice = slice(bounds.south, bounds.north)
+        lat_slice = slice(bounds.south - half_dy, bounds.north + half_dy)
 
     ds = ds.sel(
         lat=lat_slice,
-        lon=slice(bounds.west, bounds.east),
+        lon=slice(bounds.west - half_dx, bounds.east + half_dx),
     )
     return ds
 
-# def _clip_dataset(ds: xr.Dataset,bounds: BoundingBox) -> xr.Dataset:
-#     """
-#     Clip an xarray Dataset to the given spatial bounding box.
-#     old method.
-#     """
-#     ds = ds.sel(
-#         lat=slice(bounds.south, bounds.north),
-#         lon=slice(bounds.west, bounds.east),
-#     )
-#     ds = ds.load()
-#     return ds
 
 
 def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path | str) -> Path:

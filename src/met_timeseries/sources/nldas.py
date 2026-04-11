@@ -281,28 +281,24 @@ def _open_and_clip(file_obj: object) -> xr.Dataset:
 
 def _clip_dataset(
     ds: xr.Dataset,
-    bounds: BoundingBox
+    bounds: BoundingBox,
 ) -> xr.Dataset:
-    """
-    Clip an xarray Dataset to the given spatial bounding box.
+    """Clip an xarray Dataset to the given spatial bounding box."""
+    lats = ds.lat.values
+    lons = ds.lon.values
 
-    Parameters
-    ----------
-    ds:
-        An xarray Dataset representing an NLDAS-2 hourly NetCDF granule.
-    bounds:
-        Spatial bounding box; only data within these bounds is returned.
+    # pad by half a cell so we include cells whose edges overlap the bounds
+    half_dy = abs(float(lats[1] - lats[0])) / 2
+    half_dx = abs(float(lons[1] - lons[0])) / 2
 
-    Returns
-    -------
-    xarray.Dataset
-        In-memory Dataset containing only the spatial extent
-        defined by *bounds*.
-    """
+    if lats[0] > lats[-1]:
+        lat_slice = slice(bounds.north + half_dy, bounds.south - half_dy)
+    else:
+        lat_slice = slice(bounds.south - half_dy, bounds.north + half_dy)
 
     ds = ds.sel(
-        lat=slice(bounds.south, bounds.north),
-        lon=slice(bounds.west, bounds.east),
+        lat=lat_slice,
+        lon=slice(bounds.west - half_dx, bounds.east + half_dx),
     )
     return ds
 
