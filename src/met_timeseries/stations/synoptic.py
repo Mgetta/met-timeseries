@@ -107,20 +107,20 @@ def search_stations(
     response = Metadata(**kwargs)
     df = response.df().to_pandas()
 
+    lats = df["latitude"].astype(float)
+    lons = df["longitude"].astype(float)
+
     gdf = gpd.GeoDataFrame(
         {
             "stid": df["stid"],
             "name": df["name"],
-            "latitude": df["latitude"].astype(float),
-            "longitude": df["longitude"].astype(float),
+            "latitude": lats,
+            "longitude": lons,
             "elevation": df["elevation"].astype(float),
             "network": df["mnet_shortname"],
             "mnet_id": df["mnet_id"],
         },
-        geometry=[
-            Point(lon, lat)
-            for lon, lat in zip(df["longitude"].astype(float), df["latitude"].astype(float))
-        ],
+        geometry=[Point(lon, lat) for lon, lat in zip(lons, lats)],
         crs="EPSG:4326",
     )
 
