@@ -177,7 +177,7 @@ def _download_day(date: dt.date, cache_dir: Path) -> xr.Dataset:
         try:
             ds_hour = _download_hour(url, date, hour)
             hourly_datasets.append(ds_hour)
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, ValueError, RuntimeError, KeyError) as exc:
             logger.warning(
                 "Skipping MRMS hour %02d for %s due to error: %s",
                 hour,
@@ -225,7 +225,7 @@ def _download_hour(url: str, date: dt.date, hour: int) -> xr.Dataset:
     xarray.Dataset
         Single-timestep Dataset clipped to :data:`CACHE_BOUNDS`.
     """
-    import cfgrib  # noqa: F401 – ensure the engine is registered
+    import cfgrib  # noqa: F401 - ensure the engine is registered
 
     gz_path: Path | None = None
     grib_path: Path | None = None
@@ -307,7 +307,7 @@ def _download_hour(url: str, date: dt.date, hour: int) -> xr.Dataset:
             try:
                 ds_raw.close()
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug("Failed to close raw GRIB2 dataset", exc_info=True)
 
     return result
 
