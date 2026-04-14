@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-
+from dataclasses import dataclass
+from scipy.optimize import minimize
+from scipy.stats import poisson
 
 # ---------------------------------------------------------------------------
 # Private helpers
@@ -97,6 +99,167 @@ def disaggregate_precipitation(
     return _proportional_disaggregate(daily_total, hourly_pattern, name="precip_mm")
 
 
+def _cascade_precipitation(daily_total: pd.Series, hourly_pattern: pd.Series) -> pd.Series:
+    """Distribute daily precipitation using a cascading method.
+
+    For each day, the hourly pattern is sorted from highest to lowest hour.
+    The daily total is allocated sequentially to each hour until the total is
+    exhausted.  This method preserves the rank order of the hourly pattern
+    but not the relative magnitudes.
+
+    Parameters
+    ----------
+    daily_total:
+        Daily precipitation totals in mm with a daily
+        :class:`~pandas.DatetimeIndex`.
+    hourly_pattern:
+        Hourly precipitation pattern (e.g. from NLDAS-2) with an hourly
+        :class:`~pandas.DatetimeIndex`.  Only the rank order matters — absolute
+        magnitudes are ignored.
+    """
+
+    from mettoolbox.melodist.melodist.cascade import CascadeStatistics
+    from mettoolbox.melodist.melodist.precipitation import build_casc, disagg_prec
+
+    # Phase 1: train on observed hourly data (e.g. NLDAS hourly precip)
+    hourly_obs = pd.DataFrame({"precip": hourly_pattern})
+    cascade_stats = build_casc(hourly_obs, months=[np.arange(12) + 1])
+    print(cascade_stats)
+    # Phase 2: disaggregate daily PRISM totals
+    daily_data = pd.DataFrame({"precip": daily_total})
+    hourly_disagg = disagg_prec(daily_data['precip'], method="cascade", cascade_options=cascade_stats[0])
+    return hourly_disagg
+
+  
+@dataclass
+class RainCascadeParams:
+    """Log-Poisson cascade parameters fitted from a precipitation series."""
+    c: float        # log-Poisson shape parameter
+    beta: float     # log-Poisson scale parameter
+    A: float        # derived weight multiplier: exp(c * (1 - beta))
+    tau_obs: np.ndarray  # observed scaling exponents
+
+    @classmethod
+    def fit(cls, precip: np.ndarray) -> "RainCascadeParams":
+        """Fit log-Poisson parameters from a precipitation array.
+
+        Aggregates the series at scales 1, 2, 4, 8, 16, 32 and computes
+        scaling moments. Fits c and beta by minimizing RMSE between
+        observed and predicted tau(q).
+        """
+        n = len(precip)
+        precip = precip[: n - n % 32]
+
+        # build aggregated series at each scale
+        scales = [precip]
+        for _ in range(5):
+            scales.append(scales[-1].reshape(-1, 2).sum(axis=1))
+
+        # compute moments: M(q) = mean(R^q) for q = 0.5, 1.0, ..., 5.0
+        q = np.arange(0.5, 5.5, 0.5)
+        log_lambda = np.log([32, 16, 8, 4, 2, 1])
+        moments = np.zeros((6, len(q)))
+        for s in range(6):
+            for i, qi in enumerate(q):
+                moments[s, i] = np.mean(scales[s] ** qi)
+
+        # tau(q) = negative slope of log(M) vs log(lambda)
+        tau_obs = np.array([
+            -np.polyfit(log_lambda, np.log(moments[:, i]), 1)[0]
+            for i in range(len(q))
+        ])
+
+        # fit c, beta by minimizing RMSE(tau_pred, tau_obs)
+        def objective(params):
+            c, beta = abs(params[0]), abs(params[1])
+            tau_pred = q - c * (q * (1 - beta) + beta**q - 1) / np.log(2)
+            return np.sqrt(np.mean((tau_pred - tau_obs) ** 2))
+
+        result = minimize(objective, x0=[0.4, 0.2], method="Nelder-Mead")
+        c = abs(result.x[0])
+        beta = abs(result.x[1])
+        A = np.exp(c * (1 - beta))
+
+        return cls(c=c, beta=beta, A=A, tau_obs=tau_obs)
+    
+
+
+def _cascade_split(
+    values: np.ndarray,
+    params: RainCascadeParams,
+) -> np.ndarray:
+    """Apply one level of the multiplicative cascade, halving the time step.
+
+    Each value is split into two sub-intervals using random log-Poisson
+    weights with intermittency (Molnar & Burlando, 2005).
+    """
+    n = len(values)
+    out = np.zeros(n * 2)
+
+    # intermittency probability
+    prob_dry = 1.0 - 2 ** (-1.0 + params.tau_obs[0])
+    # adjust for forced reassignment when both are dry
+    prob_dry = prob_dry * (1 + prob_dry)
+
+    for i in range(n):
+        if values[i] == 0:
+            continue
+
+        # draw random weights from log-Poisson distribution
+        W = params.A * (params.beta ** poisson.rvs(1, size=2))
+        W[W < 0] = 0
+
+        # intermittency: bernoulli draws (1 = wet, 0 = dry)
+        wet = np.random.binomial(1, 1 - prob_dry, size=2)
+        # if both dry, randomly assign one as wet
+        if wet[0] == 0 and wet[1] == 0:
+            pick = np.random.randint(2)
+            wet[pick] = 1
+
+        W = W * wet
+        w_sum = W[0] + W[1]
+        if w_sum <= 0:
+            W[:] = 0.5
+            w_sum = 1.0
+
+        out[2 * i] = values[i] * W[0] / w_sum
+        out[2 * i + 1] = values[i] * W[1] / w_sum
+
+    return out
+
+def disaggregate_precipitation_cascade(
+    daily_total: pd.Series,
+    params: RainCascadeParams,
+    n_levels: int = 5,
+) -> pd.Series:
+    """Disaggregate daily precipitation to hourly using a random multiplicative cascade.
+
+    Applies n_levels cascade splits (daily → ~45 min), then converts
+    to hourly using the Güntner et al. (2001) method.
+    """
+    values = daily_total.values.copy()
+
+    # 5 cascade levels: daily → 12h → 6h → 3h → 1.5h → 0.75h
+    for _ in range(n_levels):
+        values = _cascade_split(values, params)
+
+    # convert 45-min to 60-min: divide by 3 → 15-min, sum groups of 4 → 60-min
+    fifteen_min = np.repeat(values / 3.0, 3)
+    hourly = fifteen_min.reshape(-1, 4).sum(axis=1)
+
+    # trim to match expected length (24 hours per day)
+    n_hours = len(daily_total) * 24
+    hourly = hourly[:n_hours]
+
+    hourly_index = pd.date_range(
+        start=daily_total.index[0],
+        periods=n_hours,
+        freq="h",
+    )
+
+    result = pd.Series(hourly, index=hourly_index, dtype=float)
+    result.name = "precip_mm"
+    return result
 # ---------------------------------------------------------------------------
 # Temperature
 # ---------------------------------------------------------------------------
@@ -413,12 +576,4 @@ def disaggregate_dewpoint_constant(daily_dewpoint: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 
-def pet_hargreaves(
-    daily_tmin,
-    daily_tmax,
-    lat: float,
-):
-    """Backwards-compatible wrapper. See :func:`met_timeseries.derivations.pet_hargreaves`."""
-    from met_timeseries.derivations import pet_hargreaves as _pet
 
-    return _pet(daily_tmin, daily_tmax, lat)
