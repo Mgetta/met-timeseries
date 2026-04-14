@@ -968,10 +968,10 @@ class GUI(wx.Frame):
             data = np.repeat(data,3)
             data = np.reshape(data,(int(data.size/4),4)).sum(axis=1)
     
-            df_rmc = df_rmc.resample('1H').bfill()
-            # rmc_df will have 23 fewer data points than data; removing the extra data points from data
-            xtra = int(data.size - df_rmc.index.size)
-            data = data[xtra:]
+            df_rmc = df_rmc.resample('1H').ffill()
+            # cascade produces N*24 values but the hourly index has (N-1)*24+1;
+            # trim surplus from the *end* to keep alignment with the first timestep
+            data = data[:df_rmc.index.size]
             df_rmc['RMC'] = data
             df_rmc.drop([col],inplace=True,axis=1)
     

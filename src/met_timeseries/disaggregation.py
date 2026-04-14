@@ -13,8 +13,14 @@ temporally aligned (same days, consistent index frequency).
 
 from __future__ import annotations
 
+import logging
+import random
+
 import numpy as np
 import pandas as pd
+from scipy.stats import bernoulli, poisson
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -22,11 +28,30 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 
+def _day_labels(hourly_index: pd.DatetimeIndex, day_start_hour: int = 0) -> np.ndarray:
+    """Assign each hourly timestamp to a 'day' label.
+
+    When *day_start_hour* is 0 this is equivalent to
+    ``hourly_index.date``.  For non-zero values the day boundary is
+    shifted so that, e.g., ``day_start_hour=12`` means each day runs
+    from 12:00 on date *d* to 11:00 on date *d+1*, all labelled as
+    date *d+1* (matching the PRISM mid-day-to-mid-day convention).
+
+    Returns an array of :class:`datetime.date` with the same length as
+    *hourly_index*.
+    """
+    if day_start_hour == 0:
+        return hourly_index.date
+    shifted = hourly_index - pd.Timedelta(hours=day_start_hour)
+    return shifted.date
+
+
 def _proportional_disaggregate(
     daily_total: pd.Series,
     hourly_pattern: pd.Series,
     *,
     name: str,
+    day_start_hour: int = 0,
 ) -> pd.Series:
     """Distribute a daily total proportionally based on an hourly pattern.
 
@@ -42,16 +67,21 @@ def _proportional_disaggregate(
         Hourly template values with an hourly :class:`~pandas.DatetimeIndex`.
     name:
         Name to assign to the output :class:`~pandas.Series`.
+    day_start_hour:
+        Hour (0–23) at which each accumulation day begins.  For
+        standard midnight-to-midnight products use ``0`` (default).
+        For PRISM (12 UTC to 12 UTC) pass ``12``.
 
     Returns
     -------
     :class:`pandas.Series` with the same index as *hourly_pattern*, named *name*.
     """
     result = pd.Series(np.nan, index=hourly_pattern.index, dtype=float)
+    labels = _day_labels(hourly_pattern.index, day_start_hour)
 
     for date, daily_value in daily_total.items():
         date_key = pd.Timestamp(date).date()
-        day_mask = hourly_pattern.index.date == date_key
+        day_mask = labels == date_key
         day_hours = hourly_pattern[day_mask]
 
         if len(day_hours) == 0:
@@ -77,6 +107,8 @@ def _proportional_disaggregate(
 def disaggregate_precipitation(
     daily_total: pd.Series,
     hourly_pattern: pd.Series,
+    *,
+    day_start_hour: int = 0,
 ) -> pd.Series:
     """Distribute daily precipitation proportionally using an hourly pattern.
 
@@ -89,12 +121,137 @@ def disaggregate_precipitation(
         Hourly precipitation pattern (e.g. from NLDAS-2) with an hourly
         :class:`~pandas.DatetimeIndex`.  Only the shape matters — absolute
         magnitudes are rescaled to match *daily_total*.
+    day_start_hour:
+        Hour (0–23) at which each accumulation day begins.  Use ``0``
+        for midnight-to-midnight products (default), ``12`` for PRISM
+        (12 UTC to 12 UTC).
 
     Returns
     -------
     :class:`pandas.Series` named ``precip_mm``.
     """
-    return _proportional_disaggregate(daily_total, hourly_pattern, name="precip_mm")
+    return _proportional_disaggregate(
+        daily_total, hourly_pattern, name="precip_mm", day_start_hour=day_start_hour,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Random Multiplicative Cascade (RMC) precipitation disaggregation
+# ---------------------------------------------------------------------------
+
+
+def _cascade_halve(rf: np.ndarray, tau_obs: float, A: float, lp: float) -> np.ndarray:
+    """Split each element of *rf* into two sub-period values.
+
+    Implements the Molnar & Burlando random multiplicative cascade with
+    dry-intermittency correction.
+
+    Parameters
+    ----------
+    rf:
+        Flat array of rainfall values at the current temporal resolution.
+    tau_obs:
+        Observed scaling exponent (from ``ambhas.rain_disagg.RainDisagg``
+        or equivalent).
+    A:
+        Cascade amplitude parameter.
+    lp:
+        Cascade log-Poisson parameter.
+
+    Returns
+    -------
+    numpy.ndarray of length ``2 × len(rf)``.
+    """
+    n = len(rf)
+    out = np.zeros(n * 2)
+    prob = 1.0 - 2 ** (-1.0 + tau_obs)
+    prob = prob * (1 + prob)  # correct for both-dry reassignment
+
+    for i in range(0, n * 2, 2):
+        src = rf[i // 2]
+        if src == 0:
+            continue
+
+        imt = bernoulli.rvs(1 - prob, size=2)
+        W = A * lp ** poisson.rvs(1, size=2)
+        W[W < 0] = 0
+
+        # At least one sub-period must be wet
+        if imt[0] == 0 and imt[1] == 0:
+            imt[0] = random.randint(0, 1)
+            imt[1] = 1 - imt[0]
+
+        W[0] *= imt[0]
+        W[1] *= imt[1]
+
+        if (W[0] + W[1]) <= 0:
+            W[0] = 0.5
+            W[1] = 0.5
+
+        total = W[0] + W[1]
+        out[i] = (W[0] / total) * src
+        out[i + 1] = (W[1] / total) * src
+
+    return out
+
+
+def cascade_disaggregate(
+    daily_total: pd.Series,
+    tau_obs: float,
+    A: float,
+    lp: float,
+    *,
+    n_splits: int = 5,
+) -> pd.Series:
+    """Disaggregate daily precipitation to hourly via random multiplicative cascade.
+
+    Iteratively halves the time step *n_splits* times (daily → 45 min)
+    then converts to 60-min using the Güntner et al. (2001) resampling
+    (45 min → 15 min → 60 min).
+
+    Parameters
+    ----------
+    daily_total:
+        Daily precipitation totals with a daily
+        :class:`~pandas.DatetimeIndex`.
+    tau_obs:
+        Observed scaling exponent (τ).
+    A:
+        Cascade amplitude parameter.
+    lp:
+        Cascade log-Poisson parameter.
+    n_splits:
+        Number of binary splits (default 5: daily → 12 h → 6 h → 3 h
+        → 90 min → 45 min).
+
+    Returns
+    -------
+    :class:`pandas.Series` named ``precip_mm`` with an hourly index
+    aligned to the input daily timestamps.
+    """
+    data = daily_total.values.astype(float)
+
+    for _ in range(n_splits):
+        data = _cascade_halve(data, tau_obs, A, lp)
+
+    # Güntner et al. (2001): 45-min → 15-min → 60-min
+    data = data / 3.0
+    data = np.repeat(data, 3)
+    data = data[: (len(data) // 4) * 4]  # ensure evenly divisible
+    data = data.reshape(-1, 4).sum(axis=1)
+
+    # Build hourly index starting from first daily timestamp
+    hourly_index = pd.date_range(
+        start=daily_total.index[0],
+        periods=len(daily_total) * 24,
+        freq="h",
+    )
+
+    # Trim from the *end* to match lengths (keeps cascade aligned to start)
+    n = min(len(data), len(hourly_index))
+    result = pd.Series(data[:n], index=hourly_index[:n], dtype=float)
+    result.name = "precip_mm"
+    return result
 
 
 # ---------------------------------------------------------------------------
