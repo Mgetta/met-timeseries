@@ -21,7 +21,7 @@ from typing import List
 import urllib.request
 import zipfile
 from pathlib import Path
-
+import numpy as np
 import xarray as xr
 
 from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
@@ -122,6 +122,8 @@ def fetch_prism(
         _cache_dataset(ds,cache_path)
 
     ds_clipped = _clip_dataset(ds, bounds=bounds)
+
+    ds_clipped = _shift_time_coord(ds_clipped)
     return ds_clipped.load()
 
 def download(
@@ -277,6 +279,19 @@ RESOLUTION_MAP = {
     "4km": "25m",
 }
 
+#: Hour (UTC) at which PRISM daily accumulation begins.
+#: PRISM "day d" covers 12:00 UTC day d-1 to 12:00 UTC day d.
+_PRISM_DAY_START_HOUR_UTC: int = 12
+
+def _shift_time_coord(ds: xr.Dataset,) -> xr.Dataset:
+    """Shift PRISM time coordinate by 12 hours to reflect the 12Z–12Z accumulation window.
+
+    PRISM daily values represent accumulations from 12:00 UTC on the
+    previous calendar day to 12:00 UTC on the labelled date.  This
+    function stamps each time step at 12:00 UTC so that downstream
+    midnight-based grouping correctly attributes hours to PRISM days.
+    """
+    return ds.assign_coords(time=ds.time - np.timedelta64(_PRISM_DAY_START_HOUR_UTC, "h"))
 
 def _clip_dataarray(da: xr.DataArray, bounds: BoundingBox) -> xr.DataArray:
     """Clip an xarray DataArray to the given spatial bounding box."""
