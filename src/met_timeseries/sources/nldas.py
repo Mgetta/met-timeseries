@@ -132,7 +132,7 @@ def fetch_nldas(
     date = dt.date.fromisoformat(date)
     cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
     if cache_path.exists():
-        ds = _load_from_cache(cache_path)
+        ds = _read_from_cache(cache_path)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars: # Add missing variables to the existing dataset
             print(missing_vars)
@@ -140,8 +140,10 @@ def fetch_nldas(
                                   date, 
                                   missing_vars, 
                                   max_connections)
-            ds = xr.merge([ds, ds_missing])
-            _write_to_cache(ds, cache_path)
+            ds_cached = ds.load() # read into RAM
+            ds.close() # close the file handle as we will overwrite the cache with the merged dataset
+            ds = xr.merge([ds_cached, ds_missing])
+            _write_to_cache(ds,cache_path)
     else:
         ds = download(date, 
                       date, 
@@ -150,10 +152,10 @@ def fetch_nldas(
         )
         _write_to_cache(ds, cache_path)
 
-    if bounds is None:
-        bounds = CACHE_BOUNDS
-    ds = _clip_dataset(ds, bounds=bounds)
-    return ds
+    if bounds is not None:
+        ds = _clip_dataset(ds, bounds=bounds)
+
+    return ds.load()
 
 
 def download(
@@ -254,7 +256,7 @@ def _write_to_cache(ds: xr.Dataset, cache_path: Path) -> Path:
     logger.debug("Cached NLDAS data to %s", cache_path)
     return cache_path
 
-def _load_from_cache(cache_path: Path) -> xr.Dataset:
+def _read_from_cache(cache_path: Path) -> xr.Dataset:
     if not cache_path.exists():
         raise FileNotFoundError(f"Cache file not found: {cache_path}")
     return xr.open_dataset(cache_path)

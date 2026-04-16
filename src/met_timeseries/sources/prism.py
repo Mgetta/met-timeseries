@@ -107,7 +107,9 @@ def fetch_prism(
                                   resolution = resolution, 
                                   variables = missing_vars, 
                                   cache_dir = cache_dir)
-            ds = xr.merge([ds, ds_missing])
+            ds_cached = ds.load() # read into RAM
+            ds.close() # close the file handle as we will overwrite the cache with the merged dataset
+            ds = xr.merge([ds_cached, ds_missing])
             _write_to_cache(ds,cache_path)
     else:
         ds = download(date = date,
@@ -117,11 +119,10 @@ def fetch_prism(
         _write_to_cache(ds,cache_path)
 
     # Clip to user bounds and shift time coordinate to reflect 12Z–12Z accumulation window
-    if bounds is None:
-        bounds = CACHE_BOUNDS
-    ds_clipped = _clip_dataset(ds, bounds=bounds)
-    ds_clipped = _shift_time_coord(ds_clipped)
-    return ds_clipped.load()
+    if bounds is not None:
+        ds = _clip_dataset(ds, bounds=bounds) 
+    ds = _shift_time_coord(ds)
+    return ds.load()
 
 def download(
     date: dt.date,

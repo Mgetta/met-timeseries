@@ -135,19 +135,18 @@ def fetch_narr(
         if missing:
             logger.info("Cache %s missing variables %s; downloading.", cache_path, missing)
             ds_missing = download(year=year, variables=missing)
-            ds = xr.merge([ds, ds_missing])
-            _write_to_cache(ds, cache_path)
+            ds_cached = ds.load() # read into RAM
+            ds.close() # close the file handle as we will overwrite the cache with the merged dataset
+            ds = xr.merge([ds_cached, ds_missing])
+            _write_to_cache(ds,cache_path)
     else:
         ds = download(year=year, variables=variables)
         _write_to_cache(ds, cache_path)
 
-
-    if bounds is None:
-        bounds = CACHE_BOUNDS
-
-    ds = _clip_dataset(ds, bounds)
-
-    return ds
+    if bounds is not None:
+        ds = _clip_dataset(ds, bounds=bounds)
+        
+    return ds.load()
 
 
 # ---------------------------------------------------------------------------
