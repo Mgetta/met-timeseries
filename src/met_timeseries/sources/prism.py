@@ -85,15 +85,11 @@ def fetch_prism(
     RuntimeError
         If a download fails for any requested day.
     """
+    # Validate date inputs and construct list of all dates to fetch
     if resolution not in VALID_RESOLUTIONS:
         raise ValueError(
             f"Invalid resolution {resolution!r}; must be one of {VALID_RESOLUTIONS}"
         )
-
-    if bounds is None:
-        bounds = CACHE_BOUNDS
-
-    # Validate date inputs and construct list of all dates to fetch
     date = dt.date.fromisoformat(date)
     logger.info(
         "Fetching PRISM daily data: date=%s variables=%s",
@@ -101,11 +97,10 @@ def fetch_prism(
     )
 
 
-    # Download each day's raster, clip to bounds, and collect into lists by variable
+    # Download each day's raster, clip to CACHE_BOUNDS, and collect into lists by variable
     cache_path = Path(cache_dir) / f"prism_{resolution}_{date.strftime('%Y%m%d')}.nc"
-
     if cache_path.exists():
-        ds = _load_from_cache(date,resolution,cache_dir,bounds)
+        ds = _read_from_cache(cache_path)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars:
             ds_missing = download(date = date,
@@ -113,16 +108,18 @@ def fetch_prism(
                                   variables = missing_vars, 
                                   cache_dir = cache_dir)
             ds = xr.merge([ds, ds_missing])
-            _cache_dataset(ds,cache_path)
+            _write_to_cache(ds,cache_path)
     else:
         ds = download(date = date,
                       resolution = resolution,
                       variables = variables,
                       cache_dir = cache_dir)
-        _cache_dataset(ds,cache_path)
+        _write_to_cache(ds,cache_path)
 
+    # Clip to user bounds and shift time coordinate to reflect 12Z–12Z accumulation window
+    if bounds is None:
+        bounds = CACHE_BOUNDS
     ds_clipped = _clip_dataset(ds, bounds=bounds)
-
     ds_clipped = _shift_time_coord(ds_clipped)
     return ds_clipped.load()
 
@@ -342,21 +339,18 @@ def _get_zip_path(date: dt.date, variable: str, resolution: str, cache_dir: Path
         raise FileNotFoundError(f"Zip file not found: {zip_path}")
     return zip_path
 
-def _load_from_cache(date: dt.date, resolution: str, cache_dir: Path | str,bounds: BoundingBox | None = None) -> xr.DataArray:
+def _read_from_cache(cache_path: Path) -> xr.DataArray:
     """Load a PRISM variable from the local cache if it exists."""
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"prism_{resolution}_{date.strftime('%Y%m%d')}.nc"
     if not cache_path.exists():
-        raise FileNotFoundError(f"Cache file not found: {cache_path}")
-    ds = xr.open_dataset(cache_path)
-    if bounds is None:
-        bounds = CACHE_BOUNDS
-    da_clipped = _clip_dataset(ds, bounds=bounds)
-    ds.close()
-    return da_clipped.load()
+        raise FileNotFoundError(f"Cache file not found: {cache_path}")      
+    return xr.open_dataset(cache_path)
+    # if bounds is None:
+    #     bounds = CACHE_BOUNDS
+    # da_clipped = _clip_dataset(ds, bounds=bounds)
+    # ds.close()
+    # return da_clipped.load()
 
-def _cache_dataset(ds: xr.Dataset, cache_path: Path) -> Path:
+def _write_to_cache(ds: xr.Dataset, cache_path: Path) -> Path:
     logger.debug("Compressing PRISM daily dataset to %s", cache_path)
     encoding = {var: {"zlib": True, "complevel": 9, "shuffle": True} for var in ds.data_vars}
     ds.to_netcdf(cache_path, encoding=encoding)

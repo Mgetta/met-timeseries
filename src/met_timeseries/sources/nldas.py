@@ -129,15 +129,10 @@ def fetch_nldas(
     if variables is None:
         variables = AVAILABLE_VARIABLES
 
-    if bounds is None:
-        bounds = CACHE_BOUNDS
-
     date = dt.date.fromisoformat(date)
-    
     cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
-
     if cache_path.exists():
-        ds = _load_from_cache(cache_path, bounds=bounds)
+        ds = _load_from_cache(cache_path)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars: # Add missing variables to the existing dataset
             print(missing_vars)
@@ -146,15 +141,17 @@ def fetch_nldas(
                                   missing_vars, 
                                   max_connections)
             ds = xr.merge([ds, ds_missing])
-            _cache_dataset(ds, cache_path)
+            _write_to_cache(ds, cache_path)
     else:
         ds = download(date, 
                       date, 
                       variables, 
                       max_connections
         )
-        _cache_dataset(ds, cache_path)
+        _write_to_cache(ds, cache_path)
 
+    if bounds is None:
+        bounds = CACHE_BOUNDS
     ds = _clip_dataset(ds, bounds=bounds)
     return ds
 
@@ -194,7 +191,7 @@ def download(
     """
     import earthaccess
     earthaccess.login()
-    results = _search_nldas_granules(start_date, end_date)
+    results = search_nldas_granules(start_date, end_date)
     file_objs = earthaccess.open(results)
 
     granule_datasets: list[xr.Dataset] = []
@@ -247,8 +244,7 @@ def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:
     grid_in_bounds = grid[grid.intersects(bbox_polygon)]
     return grid_in_bounds[["lat_center", "lon_center", "geometry"]].drop_duplicates()
 
-
-def _cache_dataset(ds: xr.Dataset,cache_path: Path) -> Path:
+def _write_to_cache(ds: xr.Dataset, cache_path: Path) -> Path:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     encoding = {
         var: {"zlib": True, "complevel": 9,"shuffle": True}
@@ -258,24 +254,27 @@ def _cache_dataset(ds: xr.Dataset,cache_path: Path) -> Path:
     logger.debug("Cached NLDAS data to %s", cache_path)
     return cache_path
 
-def _load_from_cache(cache_path: Path, bounds: BoundingBox | None = None) -> xr.Dataset:
-     if not cache_path.exists():
-         raise FileNotFoundError(f"Cache file not found: {cache_path}")
-     ds = xr.open_dataset(cache_path)
-     if bounds is None:
-         bounds = CACHE_BOUNDS
-     ds_clipped = _clip_dataset(ds, bounds=bounds)
-     ds.close() #Do I have to close the dataset before loading the clipped version? I think so, otherwise the file handle will remain open until the garbage collector closes it, which could lead to too many open files if many datasets are loaded.
-     return ds_clipped.load()
+def _load_from_cache(cache_path: Path) -> xr.Dataset:
+    if not cache_path.exists():
+        raise FileNotFoundError(f"Cache file not found: {cache_path}")
+    return xr.open_dataset(cache_path)
+    
+    #  if bounds is None:
+    #      bounds = CACHE_BOUNDS
+    #  ds_clipped = _clip_dataset(ds, bounds=bounds)
+    #  ds.close() #Do I have to close the dataset before loading the clipped version? I think so, otherwise the file handle will remain open until the garbage collector closes it, which could lead to too many open files if many datasets are loaded.
+    #  return ds_clipped.load()
 
 def _bounds_to_polygon(bounds: BoundingBox):
     """Return a Shapely box polygon for *bounds*."""
     return box(bounds.west, bounds.south, bounds.east, bounds.north)
 
-def _open_and_clip(file_obj: object) -> xr.Dataset:
+def _open_and_clip(file_obj: object, bounds: BoundingBox | None = None) -> xr.Dataset:
     """Open a file-like object as an xarray Dataset and clip to bounds."""
     ds = xr.open_dataset(file_obj, engine="h5netcdf")
-    ds_clipped = _clip_dataset(ds, CACHE_BOUNDS).load()
+    if bounds is None:
+        bounds = CACHE_BOUNDS
+    ds_clipped = _clip_dataset(ds, bounds=bounds).load()
     ds.close()
     return ds_clipped
 
@@ -303,7 +302,7 @@ def _clip_dataset(
     return ds
 
 
-def _search_nldas_granules(
+def search_nldas_granules(
     start_date: dt.date,
     end_date: dt.date,
     bounds: BoundingBox | None = None,
