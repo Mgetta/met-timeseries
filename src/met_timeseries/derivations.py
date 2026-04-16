@@ -46,6 +46,92 @@ def wind_speed(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     )
 
 
+def adjust_wind_height(
+    wind_speed: xr.DataArray,
+    z_from: float = 10.0,
+    z_to: float = 2.0,
+    method: str = "logarithmic",
+    alpha: float = 1 / 7,
+) -> xr.DataArray:
+    """Adjust wind speed between measurement heights.
+
+    Two methods are available:
+
+    **Logarithmic** (FAO-56 Eq. 47):
+
+    .. math::
+
+        u_{z_{to}} = u_{z_{from}} \\times
+        \\frac{\\ln(67.8\\, z_{to} - 5.42)}{\\ln(67.8\\, z_{from} - 5.42)}
+
+    Derived from Monin-Obukhov similarity theory under neutral stability,
+    with an implicit roughness length of ~0.01 m (short grass).
+    Reference: Allen et al. (1998), FAO Irrigation & Drainage Paper 56.
+
+    **Power law** (Hellman / Davenport):
+
+    .. math::
+
+        u_{z_{to}} = u_{z_{from}} \\times
+        \\left(\\frac{z_{to}}{z_{from}}\\right)^{\\alpha}
+
+    where α is a surface-roughness exponent.  Common values:
+
+    =============================  =====
+    Surface type                   α
+    =============================  =====
+    Open water / ice               0.10
+    Open flat terrain (1/7 rule)   0.143
+    Agricultural crops             0.20
+    Suburban / forest              0.25
+    Urban                          0.35
+    =============================  =====
+
+    Reference: Davenport (1960); Justus & Mikhail (1976).
+
+    Parameters
+    ----------
+    wind_speed:
+        Wind speed in m/s at height ``z_from``.
+    z_from:
+        Source measurement height in metres. Default is 10 m (NLDAS).
+    z_to:
+        Target height in metres. Default is 2 m (FAO-56 standard).
+    method:
+        ``"logarithmic"`` (FAO-56) or ``"power_law"`` (Hellman).
+    alpha:
+        Power-law exponent. Only used when ``method="power_law"``.
+        Default is 1/7 ≈ 0.143 (open flat terrain).
+
+    Returns
+    -------
+    :class:`xarray.DataArray` named ``wind_speed_ms`` adjusted to ``z_to``.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not ``"logarithmic"`` or ``"power_law"``.
+    """
+    if method == "logarithmic":
+        # FAO-56 Eq. 47: u_2 = u_z × 4.87 / ln(67.8z - 5.42)
+        # Generalised for arbitrary z_to:
+        #   u_z_to = u_z_from × ln(67.8·z_to - 5.42) / ln(67.8·z_from - 5.42)
+        factor = np.log(67.8 * z_to - 5.42) / np.log(67.8 * z_from - 5.42)
+        adjusted = wind_speed * factor
+
+    elif method == "power_law":
+        # Hellman / Davenport: u_z_to = u_z_from × (z_to / z_from)^α
+        adjusted = wind_speed * (z_to / z_from) ** alpha
+
+    else:
+        raise ValueError(
+            f"Unknown method '{method}'. Use 'logarithmic' or 'power_law'."
+        )
+
+    return adjusted.rename("wind_speed_ms")
+
+
+
 def dewpoint_from_specific_humidity(
     specific_humidity: xr.DataArray,
     pressure: xr.DataArray | None = None,
@@ -81,6 +167,64 @@ def dewpoint_from_specific_humidity(
 
     return xr.DataArray(
         dp.to("degC").magnitude,
+        dims=specific_humidity.dims,
+        coords=specific_humidity.coords,
+        name="dewpoint_c",
+    )
+
+def dewpoint_from_specific_humidity_cc(
+    specific_humidity: xr.DataArray,
+    pressure: xr.DataArray,
+) -> xr.DataArray:
+    """Compute dewpoint from specific humidity using Clausius-Clapeyron.
+
+    Replicates the methodology from the original MetTool:
+
+    1. Specific humidity → mixing ratio: ``w = q / (1 − q)``
+    2. Mixing ratio → actual vapor pressure: ``eₐ = w / (0.622 + w) × P``
+    3. Clausius-Clapeyron inversion:
+       ``Td = 1 / (1/273.15 − 0.0001844 × ln(eₐ / 0.6113))``
+
+    The constant ``0.0001844`` derives from ``Rᵥ / Lᵥ`` where
+    ``Rᵥ = 461.5 J/(kg·K)`` (specific gas constant for water vapor) and
+    ``Lᵥ ≈ 2.501e6 J/kg`` (latent heat of vaporization at 0°C):
+    ``Rᵥ / Lᵥ = 461.5 / 2501000 ≈ 0.0001844``.
+
+    The reference vapor pressure ``0.6113 kPa`` is the saturation vapor
+    pressure at 0°C (273.15 K) from the Clausius-Clapeyron relation.
+
+    Parameters
+    ----------
+    specific_humidity:
+        Specific humidity in kg/kg.
+    pressure:
+        Atmospheric pressure in Pa.
+
+    Returns
+    -------
+    :class:`xarray.DataArray` named ``dewpoint_c`` in degrees Celsius.
+    """
+    q = specific_humidity.values.astype(float)
+    p_kpa = pressure.values.astype(float) / 1000.0  # Pa → kPa
+
+    # Step 1: specific humidity → mixing ratio
+    w = q / (1.0 - q)
+
+    # Step 2: mixing ratio → actual vapor pressure (kPa)
+    e_a = (w / (0.622 + w)) * p_kpa
+
+    # Step 3: Clausius-Clapeyron inversion → dewpoint (K)
+    REF_VP = 0.6113  # saturation VP at 0°C (kPa)
+    CC_CONST = 0.0001844  # Rv / Lv (K⁻¹)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        td_k = 1.0 / (1.0 / 273.15 - CC_CONST * np.log(e_a / REF_VP))
+
+    # K → °C
+    td_c = td_k - 273.15
+
+    return xr.DataArray(
+        td_c,
         dims=specific_humidity.dims,
         coords=specific_humidity.coords,
         name="dewpoint_c",
