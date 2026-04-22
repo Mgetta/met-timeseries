@@ -1,0 +1,39 @@
+name: met-timeseries
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  # --- Core scientific stack ---
+  - numpy>=1.24
+  - pandas>=2.0
+  - xarray>=2023.1
+  # --- Geospatial ---
+  - geopandas>=0.14
+  - shapely>=2.0
+  - pyproj
+  - rioxarray
+  # --- NetCDF / GRIB I/O ---
+  - h5netcdf>=1.0
+  - netcdf4
+  - cfgrib>=0.9
+  - eccodes
+  # --- Regridding ---
+  - xesmf
+  - esmpy
+  # --- Remote data access ---
+  - earthaccess>=0.9
+  - requests>=2.28
+  # --- Meteorology ---
+  - metpy>=1.5
+  # --- Other ---
+  - pyarrow>=12.0
+  - click>=8.0
+  - matplotlib
+  # --- pip-only packages ---
+  - pip
+  - pip:
+    - mettoolbox>=5.0
+    - SynopticPy>=2023.3
+    # Install the package itself in editable mode
+    - -e .

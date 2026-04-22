@@ -32,6 +32,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+import xesmf as xe
 
 from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
 
@@ -94,6 +95,8 @@ def fetch_narr(
     cache_dir: Path | str,
     bounds: BoundingBox | None = None,
     variables: list[str] | None = None,
+    regrid: bool = True,
+    regrid_resolution: float = 0.3
 ) -> xr.Dataset:
     """Fetch NARR 3-hourly data for a full year.
 
@@ -143,9 +146,15 @@ def fetch_narr(
         ds = download(year=year, variables=variables)
         _write_to_cache(ds, cache_path)
 
+    
+    if regrid:
+        ds = _regrid(ds, CACHE_BOUNDS, regrid_resolution)
+
+
     if bounds is not None:
         ds = _clip_dataset(ds, bounds=bounds)
         
+
     return ds.load()
 
 
@@ -235,6 +244,40 @@ def _internal_varname(file_stem: str) -> str:
 # Cache helpers
 # ---------------------------------------------------------------------------
 
+def _regrid(
+    ds: xr.Dataset,
+    bounds: BoundingBox,
+    resolution: float,
+) -> xr.Dataset:
+    """Regrid NARR from Lambert Conformal (y, x) to rectilinear (lat, lon).
+
+    Builds the target grid from *bounds* and *resolution*, constructs
+    an xesmf bilinear regridder, and applies it.
+
+    Parameters
+    ----------
+    ds:
+        NARR dataset with 2-D ``lat(y, x)`` and ``lon(y, x)`` coordinates.
+    bounds:
+        Target bounding box in EPSG:4326.
+    resolution:
+        Target grid spacing in degrees.
+
+    Returns
+    -------
+    :class:`xarray.Dataset`
+        Dataset with 1-D ``lat`` and ``lon`` dimensions.
+    """
+    import xesmf as xe
+
+    ds_target = xr.Dataset({
+        "lat": (["lat"], np.arange(bounds.south, bounds.north, resolution)),
+        "lon": (["lon"], np.arange(bounds.west, bounds.east, resolution)),
+    })
+
+    regridder = xe.Regridder(ds, ds_target, method="bilinear")
+    return regridder(ds)
+
 
 def _write_to_cache(ds: xr.Dataset, cache_path: Path) -> Path:
     """Write a dataset to disk with compression."""
@@ -259,60 +302,78 @@ def _read_from_cache(cache_path: Path) -> xr.Dataset:
 # ---------------------------------------------------------------------------
 # Spatial subsetting
 # ---------------------------------------------------------------------------
+#: NARR native projection — Lambert Conformal Conic.
+#:
+#: Parameters from the NCEP NARR grid definition (Grid 221):
+#:   - Standard parallels: 50°N (both — tangent case)
+#:   - Central meridian: 107°W
+#:   - Reference latitude: 50°N
+#:   - False easting / northing: derived from the grid origin
+#:   - Resolution: 32.463 km at the standard parallel
+#:   - Datum: WGS84
+_NARR_PROJ4 = (
+    "+proj=lcc "
+    "+lat_1=50 "
+    "+lat_2=50 "
+    "+lat_0=50 "
+    "+lon_0=-107 "
+    "+x_0=5632642.22547 "
+    "+y_0=4612545.65137 "
+    "+datum=WGS84 "
+    "+units=m "
+    "+no_defs"
+)
 
+def _clip_dataset(
+    ds: xr.Dataset,
+    bounds: BoundingBox,
+) -> xr.Dataset:
+    """Clip an xarray Dataset to the given spatial bounding box."""
+    lats = ds.lat.values
+    lons = ds.lon.values
 
-def _clip_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
-    """Subset NARR data to a bounding box using 2-D lat/lon coordinates.
+    # pad by half a cell so we include cells whose edges overlap the bounds
+    half_dy = abs(float(lats[1] - lats[0])) / 2
+    half_dx = abs(float(lons[1] - lons[0])) / 2
 
-    NARR uses a Lambert Conformal Conic projection with 2-D ``lat`` and
-    ``lon`` coordinate variables on ``(y, x)`` dimensions.  This function
-    builds a boolean mask from the bounding box and slices the ``y``/``x``
-    dimensions to the minimal enclosing rectangle, buffered by one cell.
+    if lats[0] > lats[-1]:
+        lat_slice = slice(bounds.north + half_dy, bounds.south - half_dy)
+    else:
+        lat_slice = slice(bounds.south - half_dy, bounds.north + half_dy)
 
-    Parameters
-    ----------
-    ds:
-        NARR dataset with 2-D ``lat`` and ``lon`` variables.
-    bounds:
-        Target bounding box in EPSG:4326.
+    ds = ds.sel(
+        lat=lat_slice,
+        lon=slice(bounds.west - half_dx, bounds.east + half_dx),
+    )
+    return ds
 
-    Returns
-    -------
-    :class:`xarray.Dataset`
-        Spatially subsetted dataset.
+def _clip_conformal_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
+    """Subset NARR data to a bounding box using rioxarray.
+
+    Clips in the native Lambert Conformal projection space, which
+    correctly handles grid rotation and cell overlap at the edges.
     """
-    lat, lon = _get_latlon(ds)
-    if lat is None:
-        logger.warning("No lat/lon found in NARR dataset; skipping spatial subset")
-        return ds
+    import rioxarray  # noqa: F401
 
-    mask = (
-        (lat >= bounds.south)
-        & (lat <= bounds.north)
-        & (lon >= bounds.west)
-        & (lon <= bounds.east)
+    # Ensure CRS is set
+    if ds.rio.crs is None:
+        ds = ds.rio.write_crs(_NARR_PROJ4)
+
+    # Set spatial dims if not already recognized
+    y_dim = "y" if "y" in ds.dims else list(ds.dims)[-2]
+    x_dim = "x" if "x" in ds.dims else list(ds.dims)[-1]
+    ds = ds.rio.set_spatial_dims(x_dim=x_dim, y_dim=y_dim)
+
+    # clip_box reprojects the bounds into the dataset's CRS internally
+    ds = ds.rio.clip_box(
+        minx=bounds.west,
+        miny=bounds.south,
+        maxx=bounds.east,
+        maxy=bounds.north,
+        crs="EPSG:4326",
     )
 
-    y_dim = lat.dims[0]
-    x_dim = lat.dims[1]
-
-    y_any = mask.any(dim=x_dim)
-    x_any = mask.any(dim=y_dim)
-
-    y_indices = np.where(y_any.values)[0]
-    x_indices = np.where(x_any.values)[0]
-
-    if len(y_indices) == 0 or len(x_indices) == 0:
-        logger.warning("No NARR grid cells found within %s", bounds)
-        return ds
-
-    y_min = max(0, int(y_indices.min()) - 1)
-    y_max = min(ds.sizes[y_dim] - 1, int(y_indices.max()) + 1)
-    x_min = max(0, int(x_indices.min()) - 1)
-    x_max = min(ds.sizes[x_dim] - 1, int(x_indices.max()) + 1)
-
-    return ds.isel({y_dim: slice(y_min, y_max + 1), x_dim: slice(x_min, x_max + 1)})
-
+    return ds
 
 def _get_latlon(ds: xr.Dataset):
     """Return (lat, lon) DataArrays from the dataset, or (None, None)."""

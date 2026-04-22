@@ -30,6 +30,25 @@ def _proportional_disaggregate(
     *,
     name: str,
 ) -> pd.Series:
+    """Distribute a daily total proportionally based on an hourly pattern.
+
+    For each day:
+    - If the day's pattern sum is positive: ``hourly = daily_total × (hour / day_sum)``.
+    - If the day's pattern sums to zero: spread equally across hours in the day.
+
+    Parameters
+    ----------
+    daily_total:
+        Daily totals with a daily :class:`~pandas.DatetimeIndex`.
+    hourly_pattern:
+        Hourly template values with an hourly :class:`~pandas.DatetimeIndex`.
+    name:
+        Name to assign to the output :class:`~pandas.Series`.
+
+    Returns
+    -------
+    :class:`pandas.Series` with the same index as *hourly_pattern*, named *name*.
+    """
     result = pd.Series(np.nan, index=hourly_pattern.index, dtype=float)
 
     timestamps = daily_total.index
@@ -57,108 +76,10 @@ def _proportional_disaggregate(
     result.name = name
     return result
 
-# def _proportional_disaggregate(
-#     daily_total: pd.Series,
-#     hourly_pattern: pd.Series,
-#     *,
-#     name: str,
-# ) -> pd.Series:
-#     """Distribute a daily total proportionally based on an hourly pattern.
 
-#     For each day:
-#     - If the day's pattern sum is positive: ``hourly = daily_total × (hour / day_sum)``.
-#     - If the day's pattern sums to zero: spread equally across hours in the day.
-
-#     Parameters
-#     ----------
-#     daily_total:
-#         Daily totals with a daily :class:`~pandas.DatetimeIndex`.
-#     hourly_pattern:
-#         Hourly template values with an hourly :class:`~pandas.DatetimeIndex`.
-#     name:
-#         Name to assign to the output :class:`~pandas.Series`.
-
-#     Returns
-#     -------
-#     :class:`pandas.Series` with the same index as *hourly_pattern*, named *name*.
-#     """
-#     result = pd.Series(np.nan, index=hourly_pattern.index, dtype=float)
-
-#     for date, daily_value in daily_total.items():
-#         date_key = pd.Timestamp(date).date()
-#         day_mask = hourly_pattern.index.date == date_key
-#         day_hours = hourly_pattern[day_mask]
-
-#         if len(day_hours) == 0:
-#             continue
-
-#         day_sum = day_hours.sum()
-#         if day_sum > 0:
-#             fractions = day_hours / day_sum
-#         else:
-#             fractions = pd.Series(1.0 / len(day_hours), index=day_hours.index)
-
-#         result[day_mask] = daily_value * fractions
-
-#     result.name = name
-#     return result
-
-
-def disaggregate_precipitation_hybrid(
-    daily_total: pd.Series,
-    hourly_pattern: pd.Series,
-    cascade_method: str = "molnar_burlando",
-) -> pd.Series:
-    """Disaggregate daily precipitation using PRISM/NLDAS hybrid logic.
-
-    Per-day rules:
-    - PRISM > 0 and NLDAS > 0: proportional disaggregation
-    - PRISM == 0 and NLDAS > 0: use NLDAS hourly values directly
-    - PRISM > 0 and NLDAS == 0: cascade disaggregation
-
-    Parameters
-    ----------
-    daily_total:
-        Daily precipitation totals (e.g. PRISM) in mm with a daily
-        :class:`~pandas.DatetimeIndex`.
-    hourly_pattern:
-        Hourly precipitation (e.g. NLDAS) with an hourly
-        :class:`~pandas.DatetimeIndex`.
-    cascade_method:
-        Cascade method to use when NLDAS is zero. One of
-        ``"molnar_burlando"`` or ``"olsson"``.
-
-    Returns
-    -------
-    :class:`pandas.Series` named ``precip_mm``.
-    """
-    proportional = disaggregate_precipitation(daily_total, hourly_pattern)
-    cascade = disaggregate_precipitation_cascade(daily_total, hourly_pattern, method=cascade_method)
-
-    result = pd.Series(np.nan, index=hourly_pattern.index, dtype=float)
-
-    for date, prism_total in daily_total.items():
-        date_key = pd.Timestamp(date).date()
-        day_mask = hourly_pattern.index.date == date_key
-
-        nldas_sum = hourly_pattern[day_mask].sum()
-
-        if prism_total > 0 and nldas_sum > 0:
-            result[day_mask] = proportional[day_mask]
-        elif prism_total == 0 and nldas_sum > 0:
-            result[day_mask] = hourly_pattern[day_mask]
-        elif prism_total > 0 and nldas_sum == 0:
-            result[day_mask] = cascade[day_mask]
-        else:
-            # both zero — no rain
-            result[day_mask] = 0.0
-
-    result.name = "precip_mm"
-    return result
 # ---------------------------------------------------------------------------
 # Precipitation
 # ---------------------------------------------------------------------------
-
 
 # ---------------------------------------------------------------------------
 # Cascade internal helpers
@@ -300,8 +221,8 @@ def _disaggregate_precipitation_hybrid(
     -------
     :class:`pandas.Series` named ``precip_mm``.
     """
-    proportional = disaggregation.disaggregate_precipitation(daily_total, hourly_pattern, method="proportional")
-    cascade = disaggregation.disaggregate_precipitation(daily_total, hourly_pattern, method=cascade_method)
+    proportional = disaggregate_precipitation(daily_total, hourly_pattern, method="proportional")
+    cascade = disaggregate_precipitation(daily_total, hourly_pattern, method=cascade_method)
 
     result = pd.Series(np.nan, index=hourly_pattern.index, dtype=float)
 
