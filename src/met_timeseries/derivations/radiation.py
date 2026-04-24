@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import pvlib
+from met_timeseries.derivations import constants
 
 from met_timeseries.derivations import constants
 
@@ -198,7 +199,7 @@ def clearsky_radiation_hww(
     Rso.attrs['units'] = 'MJ/m²/day'
     return Rso
 
-def actual_radiation_hww(
+def net_radiation_hww(
     clear_sky_rad: xr.DataArray,
     percent_sunshine: xr.DataArray,
     a_coef: float = 0.22,

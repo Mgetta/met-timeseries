@@ -50,18 +50,14 @@ def relative_humidity_from_specific_humidity(
     )
 
 def relative_humidity(
-    temperature: xr.DataArray,
-    dewpoint: xr.DataArray,
-    pressure: xr.DataArray,
+    temperature: xr.DataArray, # Celsius
+    dewpoint: xr.DataArray, # Celsius
+    pressure: xr.DataArray, # Pa
 ) -> xr.DataArray:
     """Compute relative humidity from specific humidity, pressure, and temperature (°C)."""
     sh = specific_humidity(dewpoint, pressure)
-
-    pressure_kpa = pressure / 1000.0
-    e_s = saturation_vapor_pressure_magnus(temperature)  # kPa
-    e = (sh * pressure_kpa) / (constants.EPSILON + sh)
-    rh = (e / e_s) * 100.0
-
+    rh = relative_humidity_from_specific_humidity(temperature,sh,pressure)
+  
     return xr.DataArray(
         rh.clip(0.0, 100.0),
         dims=temperature.dims,

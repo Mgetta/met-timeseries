@@ -153,7 +153,7 @@ def pet_penman_kohler(
 
     pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
-    return pet_hourly.rename("pevt_penman_kohler_mm_hr").assign_attrs(
+    return pet_hourly.rename("pet_penman_kohler_mm_hr").assign_attrs(
         {"units": "mm/hr", "albedo": albedo}
     )
 
