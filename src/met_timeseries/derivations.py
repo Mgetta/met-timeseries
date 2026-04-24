@@ -20,6 +20,7 @@ import xarray as xr
 import pvlib
 import pyet
 
+
 def wind_speed(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
     """Compute wind speed from U and V components using MetPy.
 
@@ -136,51 +137,6 @@ def adjust_wind_height(
 # ---------------------------------------------------------------------------
 # Humidity
 # ---------------------------------------------------------------------------
-
-def _compute_relative_humidity(
-    temperature: xr.DataArray,  # °C
-    specific_humidity: xr.DataArray,  # kg/kg
-    pressure: xr.DataArray,  # Pa
-) -> xr.DataArray:
-    """Compute relative humidity from specific humidity, pressure, and temperature.
-
-    Parameters
-    ----------
-    temperature:
-        Air temperature in °C.
-    specific_humidity:
-        Specific humidity (dimensionless ratio, kg/kg).
-    pressure:
-        Surface pressure in Pa.
-
-    Returns
-    -------
-    :class:`xarray.DataArray` named ``relative_humidity``.
-        Relative humidity in %.
-    """
-    # Constants
-    epsilon = 0.622  # Ratio of molecular weight of water vapor to dry air
-    A = 17.27
-    B = 237.7  # °C
-
-    # Convert pressure from Pa to hPa
-    pressure_hpa = pressure / 100.0
-
-    # Saturation vapor pressure (e_s) in hPa
-    e_s = 6.112 * np.exp((A * temperature) / (B + temperature))
-
-    # Actual vapor pressure (e) in hPa
-    e = (specific_humidity * pressure_hpa) / (epsilon + specific_humidity)
-
-    # Relative Humidity (RH)
-    rh = (e / e_s) * 100.0
-
-    return xr.DataArray(
-        rh.clip(0.0, 100.0),  # Clamp to [0%, 100%]
-        dims=temperature.dims,
-        coords=temperature.coords,
-        name="relative_humidity",
-    )
 
 def dewpoint_from_specific_humidity(
     specific_humidity: xr.DataArray,
@@ -317,7 +273,7 @@ def dewpoint_august_roche_magnus(
     A = 17.27
     B = 237.7  # °C
 
-    relative_humidity = _compute_relative_humidity(temperature, specific_humidity, pressure)  # Assume sea level pressure
+    relative_humidity = calculate_relative_humidity(temperature, specific_humidity, pressure)  # Assume sea level pressure
 
     # Saturation vapor pressure (e_s) in hPa
     e_s = 6.112 * np.exp((A * temperature) / (B + temperature))
@@ -365,75 +321,6 @@ def kelvin_to_celsius(temp_k: xr.DataArray) -> xr.DataArray:
     """
     return (temp_k - 273.15).rename("temp_c")
 
-def _compute_clearsky_array(
-    shortwave: xr.DataArray,
-    lat: xr.DataArray | np.ndarray,
-    lon: xr.DataArray | np.ndarray,
-    time: xr.DataArray | np.ndarray | None = None,
-    min_solar_elevation: float = 10.0,
-) -> tuple[xr.DataArray, xr.DataArray]:
-    """Build clear-sky radiation and daytime mask arrays using pvlib.
-
-    Uses the Ineichen/Perez clear-sky model with the built-in Linke
-    turbidity climatology.  This accounts for seasonal and geographic
-    variation in atmospheric clarity (aerosols, water vapor) without
-    requiring any inputs beyond lat/lon/time.
-
-    The Linke turbidity climatology is a 0.5° monthly global dataset
-    derived from satellite observations.  At NLDAS resolution (~12 km)
-    the spatial sampling is adequate.  pvlib interpolates between months
-    automatically.
-
-    Parameters
-    ----------
-    shortwave:
-        Observed shortwave, used only for shape/coords.
-    lat, lon:
-        Coordinate arrays in decimal degrees.
-    time:
-        Datetime-like values for solar geometry.
-    min_solar_elevation:
-        Minimum solar elevation angle in degrees.  Default 10°.
-
-    Returns
-    -------
-    (clearsky, daytime_mask)
-    """
-
-    lat_vals = np.asarray(lat)
-    lon_vals = np.asarray(lon)
-
-    if time is not None:
-        times = pd.DatetimeIndex(np.asarray(time))
-    else:
-        times = pd.DatetimeIndex([datetime.datetime(2000, 7, 1, 12, 0, 0)])
-
-    clearsky_values = np.full(shortwave.shape, np.nan, dtype=float)
-    elevation_values = np.full(shortwave.shape, np.nan, dtype=float)
-
-    time_axis = shortwave.dims.index("time") if "time" in shortwave.dims else None
-
-    for i, la in enumerate(lat_vals):
-        for j, lo in enumerate(lon_vals):
-            loc = pvlib.location.Location(latitude=la, longitude=lo)
-
-            # get_solarposition + get_clearsky handles airmass internally
-            solpos = loc.get_solarposition(times)
-            cs = loc.get_clearsky(times, model="ineichen", solar_position=solpos)
-
-            if time_axis is not None:
-                clearsky_values[:, i, j] = cs["ghi"].values
-                elevation_values[:, i, j] = solpos["apparent_elevation"].values
-            else:
-                clearsky_values[i, j] = cs["ghi"].iloc[0]
-                elevation_values[i, j] = solpos["apparent_elevation"].iloc[0]    
-     
-    clearsky = xr.DataArray(clearsky_values, dims=shortwave.dims, coords=shortwave.coords)
-    elevation = xr.DataArray(elevation_values, dims=shortwave.dims, coords=shortwave.coords)
-
-    daytime_mask = elevation >= min_solar_elevation
-    return clearsky, daytime_mask
- 
 
 def cloud_cover_davis(
     shortwave: xr.DataArray,
@@ -492,7 +379,7 @@ def cloud_cover_davis(
     Agricultural Meteorology, 15(3), 355–366.
     """
     # Build the clear-sky radiation array (reuse existing helper)
-    clearsky, daytime_mask = _compute_clearsky_array(shortwave, lat, lon, time,min_solar_elevation=min_clearsky)
+    clearsky, daytime_mask = calculate_clearsky_array(shortwave, lat, lon, time,min_solar_elevation=min_clearsky)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         clearness_index = shortwave / clearsky
@@ -508,6 +395,50 @@ def cloud_cover_davis(
     cc = cc.clip(0.0, 1.0)
     cc = cc.where(daytime_mask)
     return cc.rename("cloud_cover_fraction_davis")
+
+
+def thompson_sky_cover_radiation(
+    clear_sky_rad: xr.DataArray,
+    cloud_cover: xr.DataArray,
+    b_coef: float = 0.3
+) -> xr.DataArray:
+    """
+    Computes actual solar radiation from sky cover based on Thompson (1976).
+    
+    Equation: Rs = Rso * [B + (1 - B) * (1 - N)^0.61]
+    
+    Parameters
+    ----------
+    clear_sky_rad : xr.DataArray
+        Clear-sky solar radiation (Rso).
+    cloud_cover : xr.DataArray
+        Fractional cloud cover (N), valid range is 0.0 to 1.0.
+        If your data is in tenths (0-10) or percent (0-100), convert to 0-1 first.
+    b_coef : float
+        Empirical coefficient for transmission under fully overcast skies.
+        Default is a generic 0.3, but should ideally be calibrated per station.
+        
+    Returns
+    -------
+    xr.DataArray
+        Estimated global solar radiation (Rs).
+    """
+    # Ensure cloud cover is strictly bounded between 0 and 1 to prevent invalid math
+    N = cloud_cover.clip(min=0.0, max=1.0)
+    
+    # Thompson's empirical cloud attenuation factor
+    cloud_factor = b_coef + (1.0 - b_coef) * (1.0 - N)**0.61
+    
+    # Calculate actual surface solar radiation
+    rs = clear_sky_rad * cloud_factor
+    
+    # Preserve metadata cleanly
+    rs.attrs['long_name'] = 'Estimated Global Solar Radiation'
+    rs.attrs['method'] = 'Thompson (1976) Sky Cover Attenuation'
+    if 'units' in clear_sky_rad.attrs:
+        rs.attrs['units'] = clear_sky_rad.attrs['units']
+    
+    return rs
 
 def cloud_cover_thompson(
     shortwave: xr.DataArray,
@@ -563,7 +494,7 @@ def cloud_cover_thompson(
     """
     from numpy.polynomial import polynomial as P
 
-    clearsky, daytime_mask = _compute_clearsky_array(
+    clearsky, daytime_mask = calculate_clearsky_array(
         shortwave, lat, lon, time, min_solar_elevation,
     )
 
@@ -600,7 +531,7 @@ def cloud_cover_linear(
     ``cloud_cover = 1 - observed / clear_sky``, clamped to [0, 1].
     Nighttime pixels are NaN.
     """
-    clearsky, daytime_mask = _compute_clearsky_array(shortwave, lat, lon, time,min_solar_elevation=min_clearsky)
+    clearsky, daytime_mask = calculate_clearsky_array(shortwave, lat, lon, time,min_solar_elevation=min_clearsky)
 
 
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -609,6 +540,106 @@ def cloud_cover_linear(
     cc = cc.clip(0.0, 1.0)
     cc = cc.where(daytime_mask)
     return cc.rename("cloud_cover_fraction")
+
+def hamon_weiss_wilson_clearsky(
+    day_of_year: xr.DataArray,
+    latitude: xr.DataArray
+) -> xr.DataArray:
+    """
+    Computes daily clear-sky solar radiation (Rso) approximating the 
+    Hamon, Weiss, and Wilson (1954) latitude and seasonal curves.
+    
+    Parameters
+    ----------
+    day_of_year : xr.DataArray
+        Day of the year (1-366).
+    latitude : xr.DataArray
+        Latitude in decimal degrees.
+        
+    Returns
+    -------
+    xr.DataArray
+        Clear-sky solar radiation (Rso) in Langleys/day 
+        (the standard historical unit used in the 1954 paper).
+    """
+    # Convert latitude to radians
+    phi = np.radians(latitude)
+    
+    # Fractional year in radians
+    theta = 2.0 * np.pi * day_of_year / 365.0
+    
+    # Solar declination angle (delta) in radians
+    delta = 0.006918 - 0.399912 * np.cos(theta) + 0.070257 * np.sin(theta) \
+            - 0.006758 * np.cos(2 * theta) + 0.000907 * np.sin(2 * theta) \
+            - 0.002697 * np.cos(3 * theta) + 0.00148 * np.sin(3 * theta)
+            
+    # Sunset hour angle (omega_s) in radians
+    omega_s = np.arccos((-np.tan(phi) * np.tan(delta)).clip(min=-1.0, max=1.0))
+    
+    # Eccentricity correction factor of Earth's orbit
+    dr = 1.000110 + 0.034221 * np.cos(theta) + 0.001280 * np.sin(theta) \
+         + 0.000719 * np.cos(2 * theta) + 0.000077 * np.sin(2 * theta)
+         
+    # Solar Constant in Langleys/day (approx. 1.94 Langleys/min * 1440 mins)
+    # Using Langleys as it is the native unit for the 1954 method.
+    Gsc = 2793.6 
+    
+    # Extraterrestrial radiation (Ra) in Langleys/day
+    Ra = (Gsc / np.pi) * dr * (
+        omega_s * np.sin(phi) * np.sin(delta) +
+        np.cos(phi) * np.cos(delta) * np.sin(omega_s)
+    )
+    
+    # The Hamon-Weiss-Wilson curves generally translate to a clear-sky 
+    # atmospheric transmissivity factor. For US Latitudes, 0.73 is the 
+    # classic mean bulk coefficient used to represent their clear-sky nomograms.
+    Rso = 0.73 * Ra
+    
+    Rso.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
+    Rso.attrs['units'] = 'Langleys/day'
+    
+    return Rso
+
+
+def hamon_weiss_wilson_actual_radiation(
+    clear_sky_rad: xr.DataArray,
+    percent_sunshine: xr.DataArray,
+    a_coef: float = 0.22,
+    b_coef: float = 0.78
+) -> xr.DataArray:
+    """
+    Computes actual incident solar radiation using the Hamon, Weiss, 
+    and Wilson (1954) empirical relationship based on percent sunshine.
+    
+    Parameters
+    ----------
+    clear_sky_rad : xr.DataArray
+        Clear-sky solar radiation (Rso).
+    percent_sunshine : xr.DataArray
+        Percent of possible sunshine duration (valid range: 0.0 to 100.0).
+    a_coef : float
+        Fraction of radiation occurring on a completely overcast day (0% sunshine).
+    b_coef : float
+        Coefficient representing radiation scaling with sunshine.
+        (Note: a_coef + b_coef typically equals ~1.0).
+        
+    Returns
+    -------
+    xr.DataArray
+        Estimated actual global solar radiation (Rs).
+    """
+    # Bound percent sunshine between 0 and 100, then convert to a fraction (0 to 1)
+    sun_frac = percent_sunshine.clip(min=0.0, max=100.0) / 100.0
+    
+    # Apply the linear sunshine/insolation empirical formula
+    rs = clear_sky_rad * (a_coef + b_coef * sun_frac)
+    
+    rs.attrs['long_name'] = 'Estimated Global Solar Radiation'
+    rs.attrs['method'] = 'Hamon, Weiss, Wilson (1954) Sunshine Duration'
+    if 'units' in clear_sky_rad.attrs:
+        rs.attrs['units'] = clear_sky_rad.attrs['units']
+        
+    return rs
 
 # ---------------------------------------------------------------------------
 # PET
@@ -662,131 +693,145 @@ def pet_hargreaves(
     pet.name = "pet_hargreaves_mm"
     return pet
 
-def calculate_net_radiation(
-    shortwave_down: xr.DataArray,  # W/m² - Downward solar radiation
-    longwave_down: xr.DataArray,  # W/m² - Downward longwave radiation
-    temperature: xr.DataArray,  # K - Surface temperature
-    albedo: float = 0.23,  # Default albedo for grassland
-    emissivity: float = 0.97,  # Default surface emissivity
+def pevt_penman_pyet_daily(
+    shortwave_hourly: xr.DataArray,   # W/m²
+    temperature_hourly: xr.DataArray, # °C
+    dewpoint_hourly: xr.DataArray,    # °C
+    wind_hourly: xr.DataArray,        # m/s at 2 m
+    elevation: "xr.DataArray | float" = 0.0,  # m
+    albedo: float = 0.06,
 ) -> xr.DataArray:
-    """Calculate net radiation (R_n) in W/m².
+    """Daily Penman pan evaporation on a spatial grid via pyet (mm/day).
 
-    Parameters
-    ----------
-    shortwave_down:
-        Downward shortwave solar radiation (W/m²).
-    longwave_down:
-        Downward longwave atmospheric radiation (W/m²).
-    temperature:
-        Surface temperature in Kelvin (K).
-    albedo:
-        Surface albedo for reflectance (default 0.23 for grassland).
-    emissivity:
-        Surface emissivity (default 0.97 for most land surfaces).
-
-    Returns
-    -------
-    Net radiation (R_n) as xarray.DataArray in W/m².
+    Aggregates hourly inputs to daily then calls ``pyet.penman`` directly on
+    the xarray inputs.  Use ``albedo=0.06`` for open-water / pan (Kohler et al. 1955).
     """
-    # Stefan-Boltzmann constant (W/m²/K⁴)
-    sigma = 5.67e-8
+    rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum()  # W/m² → MJ/m²/day
+    tmean_daily = temperature_hourly.resample(time="1D").mean()          # °C
+    wind_daily  = wind_hourly.resample(time="1D").mean()                 # m/s
+    ea_daily    = (
+        0.6108 * np.exp(17.27 * dewpoint_hourly / (dewpoint_hourly + 237.3))
+    ).resample(time="1D").mean()                                          # kPa
 
-    # Reflected shortwave radiation
-    shortwave_up = shortwave_down * albedo
+    lat_rad = np.radians(shortwave_hourly.coords["lat"])
 
-    # Outgoing longwave radiation (Stefan-Boltzmann law)
-    longwave_up = emissivity * sigma * temperature**4
+    pet = pyet.penman(
+        tmean=tmean_daily,
+        wind=wind_daily,
+        rs=rs_daily,
+        ea=ea_daily,
+        lat=lat_rad,
+        elevation=elevation,
+        albedo=albedo,
+    )
 
-    # Net radiation: combine all components
-    net_radiation = (shortwave_down - shortwave_up) + (longwave_down - longwave_up)
+    return pet.clip(min=0.0).rename("pevt_penman_mm_day").assign_attrs(
+        {"units": "mm/day", "albedo": albedo}
+    )
 
-    return net_radiation.rename("net_radiation")
 
-
-def calculate_specific_humidity(
-    temperature: xr.DataArray,  # K
-    dewpoint: xr.DataArray,  # K
-    pressure: xr.DataArray,  # Pa
+def pevt_penman_pyet_hourly(
+    shortwave_hourly: xr.DataArray,   # W/m²
+    temperature_hourly: xr.DataArray, # °C
+    dewpoint_hourly: xr.DataArray,    # °C — pass two options for two PEVT variants
+    wind_hourly: xr.DataArray,        # m/s at 2 m
+    elevation: "xr.DataArray | float" = 0.0,  # m
+    albedo: float = 0.06,
+    min_solar_elevation: float = 10.0,
 ) -> xr.DataArray:
-    """Calculate specific humidity (q) in kg/kg.
+    """Hourly Penman pan evaporation on a spatial grid (mm/hr).
 
-    Parameters
-    ----------
-    temperature:
-        Air temperature in Kelvin (K).
-    dewpoint:
-        Dewpoint temperature in Kelvin (K).
-    pressure:
-        Surface pressure in Pa.
+    Computes daily PET via ``pevt_penman_pyet_daily`` then disaggregates to
+    hourly proportional to daytime observed shortwave.  Nighttime = 0.
 
-    Returns
-    -------
-    Specific humidity (kg/kg) as xarray.DataArray.
+    Call twice with different ``dewpoint_hourly`` arrays to produce the two
+    PEVT variants (Liston & Elder 2006).
     """
-    # Convert pressure from Pa to kPa
-    pressure_kpa = pressure / 1000.0
+    pet_daily = pevt_penman_pyet_daily(
+        shortwave_hourly, temperature_hourly, dewpoint_hourly,
+        wind_hourly, elevation, albedo,
+    )  # mm/day
 
-    # Saturation vapor pressure (e_s) in kPa
-    def magnus_formula(temp):
-        A, B = 17.27, 237.3  # Constants for water vapor over water
-        return 0.6108 * np.exp(A * (temp - 273.15) / (temp - 273.15 + B))
+    _, daytime_mask = calculate_clearsky_array(
+        shortwave_hourly,
+        lat=shortwave_hourly.coords["lat"].values,
+        lon=shortwave_hourly.coords["lon"].values,
+        time=shortwave_hourly.coords["time"].values,
+        min_solar_elevation=min_solar_elevation,
+    )
 
-    e_s = magnus_formula(temperature)
+    sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
+    sw_daily_sum = sw_daytime.resample(time="1D").sum()
+    sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
 
-    # Actual vapor pressure (e_a) from dewpoint
-    e_a = magnus_formula(dewpoint)
+    pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
+    sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
 
-    # Specific humidity (q) calculation
-    epsilon = 0.622
-    q = (epsilon * e_a) / (pressure_kpa - (1 - epsilon) * e_a)
+    pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
-    return q.rename("specific_humidity")
+    return pet_hourly.rename("pevt_penman_mm_hr").assign_attrs(
+        {"units": "mm/hr", "albedo": albedo}
+    )
 
+def pevt_penman_kohler(
+    shortwave_hourly: xr.DataArray,   # W/m²
+    temperature_hourly: xr.DataArray, # °C
+    dewpoint_hourly: xr.DataArray,    # °C — two options → two PEVT variants
+    wind_hourly: xr.DataArray,        # m/s at 2 m
+    pressure: xr.DataArray | float = 1013.25,        # hPa
+    albedo: float = 0.06,
+    min_solar_elevation: float = 10.0,
+) -> xr.DataArray:
+    """Hourly Penman pan evaporation via Kohler et al. (1955) (mm/hr).
 
-def pevt_kohler(temp_c, dewpoint_c, wind, sw_down, pressure=1013.25, albedo = .65):
+    Aggregates hourly inputs to daily (SOLR MJ/m²/day, mean ATEM °C, mean
+    DEWP °C, mean wind m/s), applies the Penman/Kohler formula, then
+    disaggregates back to hourly proportional to daytime observed shortwave.
+    Nighttime = 0.
+
+    Call twice with different ``dewpoint_hourly`` to produce the two PEVT
+    variants (Liston & Elder 2006).  Use ``albedo=0.06`` for open-water / pan.
     """
-    Inputs are xarray DataArrays:
-    temp: Air Temperature (°C)
-    rh: Relative Humidity (%)
-    wind_10m: 10m Wind Speed (m/s) - common in gridded products
-    sw_down: Downward Shortwave (W/m^2)
-    """
-    # 1. Scale Wind from 10m to 2m (Log-profile approximation)
-    
-    # 2. Vapor Pressure (hPa)
-    # Vapor Pressure Calculations (hPa) using Dewpoint
-    # Saturation vapor pressure at air temperature
-    es = 6.112 * np.exp((17.67 * temp_c) / (temp_c + 243.5))
+    # --- Aggregate to daily ---
+    rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum()  # W/m² → MJ/m²/day
+    tmean_daily = temperature_hourly.resample(time="1D").mean()          # °C
+    dp_daily    = dewpoint_hourly.resample(time="1D").mean()             # °C
+    wind_daily  = wind_hourly.resample(time="1D").mean()                 # m/s
 
-    # Actual vapor pressure is saturation vapor pressure at dewpoint
-    ea = 6.112 * np.exp((17.67 * dewpoint_c) / (dewpoint_c + 243.5))
+    # --- Penman / Kohler formula on daily inputs ---
+    es       = 6.112 * np.exp(17.67 * tmean_daily / (tmean_daily + 243.5))  # hPa
+    ea       = 6.112 * np.exp(17.67 * dp_daily    / (dp_daily    + 243.5))  # hPa
+    vpd      = (es - ea).clip(min=0.0)
+    delta    = 4098.0 * es / (tmean_daily + 237.3) ** 2                      # hPa/°C
+    gamma    = 0.000665 * pressure                                            # hPa/°C
+    lambda_v = 2.501 - 0.002361 * tmean_daily                                # MJ/kg
+    rn       = rs_daily * (1.0 - albedo)                                      # MJ/m²/day
+    f_u      = 0.005 + 0.00085 * (wind_daily * 3.6)                          # Kohler wind fn (km/hr)
+    ea_term  = f_u * vpd
 
-    # Vapor Pressure Deficit
-    vpd = np.maximum(es - ea, 0)
+    pet_daily = ((delta * (rn / lambda_v) + gamma * ea_term) / (delta + gamma)).clip(min=0.0)
 
-    # 3. Slopes and Constants
-    delta = (4098 * es) / ((temp_c + 237.3)**2)
-    gamma = 0.000665 * pressure
-    lambda_v = 2.501 - (0.002361 * temp_c) # MJ/kg
+    # --- Disaggregate daily → hourly via daytime SW pattern ---
+    _, daytime_mask = calculate_clearsky_array(
+        shortwave_hourly,
+        lat=shortwave_hourly.coords["lat"].values,
+        lon=shortwave_hourly.coords["lon"].values,
+        time=shortwave_hourly.coords["time"].values,
+        min_solar_elevation=min_solar_elevation,
+    )
 
-    # 4. Net Radiation (Energy Component)
-    # Estimate Net Radiation if not provided (Albedo ~0.06 for water)
-    rn_hr = (sw_down * (1 - albedo)) * 0.0036 
+    sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
+    sw_daily_sum = sw_daytime.resample(time="1D").sum()
+    sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
 
-    # 5. Kohler Aerodynamic Component (Ea)
-    # Kohler's wind function: f(u) = 0.005 + 0.00085 * u_km_hr
-    wind_km_hr = wind * 3.6
-    f_u = 0.005 + 0.00085 * wind_km_hr 
-    Ea = f_u * vpd
+    pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
+    sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
 
-    # 6. Final Potential Evaporation (mm/hr)
-    pe = (delta * (rn_hr / lambda_v) + gamma * Ea) / (delta + gamma)
-    
-    # Preserve metadata and clip negative values
-    pe.name = "potential_evaporation"
-    pe.attrs['units'] = 'mm/hr'
-    
-    return pe.where(pe > 0, 0)
+    pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
+
+    return pet_hourly.rename("pevt_penman_kohler_mm_hr").assign_attrs(
+        {"units": "mm/hr", "albedo": albedo}
+    )
 
 def pet_penman_hourly(
     shortwave_down: xr.DataArray,  # W/m²
@@ -961,7 +1006,105 @@ def pet_penman_monteith_hourly(
 # ---------------------------------------------------------------------------
 
 
-def _clear_sky_radiation(lat: float, lon: float, dt: datetime.datetime) -> float:
+STEFAN_BOLTZMANN = 5.67e-8  # W/m²/K⁴
+
+def calculate_net_radiation(
+    shortwave_down: xr.DataArray,  # W/m² - Downward solar radiation
+    longwave_down: xr.DataArray,  # W/m² - Downward longwave radiation
+    temperature: xr.DataArray,  # K - Surface temperature
+    albedo: float = 0.23,  # Default albedo for grassland
+    emissivity: float = 0.97,  # Default surface emissivity
+) -> xr.DataArray:
+    """Calculate net radiation (R_n) in W/m².
+
+    Parameters
+    ----------
+    shortwave_down:
+        Downward shortwave solar radiation (W/m²).
+    longwave_down:
+        Downward longwave atmospheric radiation (W/m²).
+    temperature:
+        Surface temperature in Kelvin (K).
+    albedo:
+        Surface albedo for reflectance (default 0.23 for grassland).
+    emissivity:
+        Surface emissivity (default 0.97 for most land surfaces).
+
+    Returns
+    -------
+    Net radiation (R_n) as xarray.DataArray in W/m².
+    """
+    # Stefan-Boltzmann constant (W/m²/K⁴)
+    sigma = STEFAN_BOLTZMANN
+
+    # Reflected shortwave radiation
+    shortwave_up = shortwave_down * albedo
+
+    # Outgoing longwave radiation (Stefan-Boltzmann law)
+    longwave_up = emissivity * sigma * temperature**4
+
+    # Net radiation: combine all components
+    net_radiation = (shortwave_down - shortwave_up) + (longwave_down - longwave_up)
+
+    return net_radiation.rename("net_radiation")
+
+
+
+# Saturation vapor pressure (e_s) in kPa
+def svp_magnus(temperature: xr.DataArray, A=17.27, B=237.3):
+    '''
+    Calculate saturation vapor pressure (eₛ) in kPa using the Magnus formula.
+    Parameters
+    ----------
+    temperature:
+        Air temperature in celsius.
+    A, B:
+        Constants for water vapor over water.
+
+    Returns
+    -------
+    :class:`xarray.DataArray`
+        Saturation vapor pressure in kPa.
+    '''
+    # A, B Constants for water vapor over water
+    return 0.6108 * np.exp(A * (temperature) / (temperature + B))
+
+def calculate_specific_humidity(
+    temperature: xr.DataArray,  # K
+    dewpoint: xr.DataArray,  # K
+    pressure: xr.DataArray,  # Pa
+    epsilon: float = 0.622,  # Ratio of molecular weights of water vapor/dry air
+) -> xr.DataArray:
+    """Calculate specific humidity (q) in kg/kg.
+
+    Parameters
+    ----------
+    temperature:
+        Air temperature in Celsius (C).
+    dewpoint:
+        Dewpoint temperature in Celsius (C).
+    pressure:
+        Surface pressure in kPa.
+
+    Returns
+    -------
+    Specific humidity (kg/kg) as xarray.DataArray.
+    """
+    # Convert pressure from Pa to kPa
+    pressure_kpa = pressure
+
+
+    e_s = svp_magnus(temperature)  # Saturation vapor pressure at air temperature
+
+    # Actual vapor pressure (e_a) from dewpoint
+    e_a = svp_magnus(dewpoint)
+
+    # Specific humidity (q) calculation
+    q = (epsilon * e_a) / (pressure_kpa - (1 - epsilon) * e_a)
+
+    return q.rename("specific_humidity")
+
+def calculate_clearsky_radiation(lat: float, lon: float, dt: datetime.datetime) -> float:
     """Compute theoretical clear-sky surface shortwave radiation (W/m²).
 
     Uses standard solar geometry with a fixed atmospheric transmittance.
@@ -1004,8 +1147,118 @@ def _clear_sky_radiation(lat: float, lon: float, dt: datetime.datetime) -> float
     return float(S0 * cos_zenith * tau)
 
 
-def _to_datetime(t_val) -> datetime.datetime:
-    """Convert an arbitrary numpy/pandas timestamp to a :class:`datetime.datetime`."""
-    import pandas as pd
+def calculate_clearsky_array(
+    shortwave: xr.DataArray,
+    lat: xr.DataArray | np.ndarray,
+    lon: xr.DataArray | np.ndarray,
+    time: xr.DataArray | np.ndarray | None = None,
+    min_solar_elevation: float = 10.0,
+) -> tuple[xr.DataArray, xr.DataArray]:
+    """Build clear-sky radiation and daytime mask arrays using pvlib.
 
-    return pd.Timestamp(t_val).to_pydatetime(warn=False)
+    Uses the Ineichen/Perez clear-sky model with the built-in Linke
+    turbidity climatology.  This accounts for seasonal and geographic
+    variation in atmospheric clarity (aerosols, water vapor) without
+    requiring any inputs beyond lat/lon/time.
+
+    The Linke turbidity climatology is a 0.5° monthly global dataset
+    derived from satellite observations.  At NLDAS resolution (~12 km)
+    the spatial sampling is adequate.  pvlib interpolates between months
+    automatically.
+
+    Parameters
+    ----------
+    shortwave:
+        Observed shortwave, used only for shape/coords.
+    lat, lon:
+        Coordinate arrays in decimal degrees.
+    time:
+        Datetime-like values for solar geometry.
+    min_solar_elevation:
+        Minimum solar elevation angle in degrees.  Default 10°.
+
+    Returns
+    -------
+    (clearsky, daytime_mask)
+    """
+
+    lat_vals = np.asarray(lat)
+    lon_vals = np.asarray(lon)
+
+    if time is not None:
+        times = pd.DatetimeIndex(np.asarray(time))
+    else:
+        times = pd.DatetimeIndex([datetime.datetime(2000, 7, 1, 12, 0, 0)])
+
+    clearsky_values = np.full(shortwave.shape, np.nan, dtype=float)
+    elevation_values = np.full(shortwave.shape, np.nan, dtype=float)
+
+    time_axis = shortwave.dims.index("time") if "time" in shortwave.dims else None
+
+    for i, la in enumerate(lat_vals):
+        for j, lo in enumerate(lon_vals):
+            loc = pvlib.location.Location(latitude=la, longitude=lo)
+
+            # get_solarposition + get_clearsky handles airmass internally
+            solpos = loc.get_solarposition(times)
+            cs = loc.get_clearsky(times, model="ineichen", solar_position=solpos)
+
+            if time_axis is not None:
+                clearsky_values[:, i, j] = cs["ghi"].values
+                elevation_values[:, i, j] = solpos["apparent_elevation"].values
+            else:
+                clearsky_values[i, j] = cs["ghi"].iloc[0]
+                elevation_values[i, j] = solpos["apparent_elevation"].iloc[0]    
+     
+    clearsky = xr.DataArray(clearsky_values, dims=shortwave.dims, coords=shortwave.coords)
+    elevation = xr.DataArray(elevation_values, dims=shortwave.dims, coords=shortwave.coords)
+
+    daytime_mask = elevation >= min_solar_elevation
+    return clearsky, daytime_mask
+ 
+
+ 
+def calculate_relative_humidity(
+    temperature: xr.DataArray,  # °C
+    specific_humidity: xr.DataArray,  # kg/kg
+    pressure: xr.DataArray,  # Pa
+) -> xr.DataArray:
+    """Compute relative humidity from specific humidity, pressure, and temperature.
+
+    Parameters
+    ----------
+    temperature:
+        Air temperature in °C.
+    specific_humidity:
+        Specific humidity (dimensionless ratio, kg/kg).
+    pressure:
+        Surface pressure in Pa.
+
+    Returns
+    -------
+    :class:`xarray.DataArray` named ``relative_humidity``.
+        Relative humidity in %.
+    """
+    # Constants
+    epsilon = 0.622  # Ratio of molecular weight of water vapor to dry air
+    A = 17.27
+    B = 237.7  # °C
+
+    # Convert pressure from Pa to hPa
+    pressure_hpa = pressure / 100.0
+
+    # Saturation vapor pressure (e_s) in hPa
+    e_s = 6.112 * np.exp((A * temperature) / (B + temperature))
+
+    # Actual vapor pressure (e) in hPa
+    e = (specific_humidity * pressure_hpa) / (epsilon + specific_humidity)
+
+    # Relative Humidity (RH)
+    rh = (e / e_s) * 100.0
+
+    return xr.DataArray(
+        rh.clip(0.0, 100.0),  # Clamp to [0%, 100%]
+        dims=temperature.dims,
+        coords=temperature.coords,
+        name="relative_humidity",
+    )
