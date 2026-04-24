@@ -62,7 +62,7 @@ def relative_humidity(
     e_s = 6.112 * np.exp(
         (constants.VAPOR_A_MAGNUS * temperature) / (constants.VAPOR_B_TETENS + temperature)
     )
-    e = (specific_humidity * pressure_hpa) / (constants.EPSILON + specific_humidity)
+    e = (sh * pressure_hpa) / (constants.EPSILON + sh)
     rh = (e / e_s) * 100.0
 
     return xr.DataArray(

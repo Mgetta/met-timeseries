@@ -51,7 +51,7 @@ def pet_penman_pyet_daily(
         albedo=albedo,
     )
 
-    return pet.clip(min=0.0).rename("pevt_penman_mm_day").assign_attrs(
+    return pet.clip(min=0.0).rename("pet_penman_mm_day").assign_attrs(
         {"units": "mm/day", "albedo": albedo}
     )
 
@@ -65,7 +65,7 @@ def pet_penman_pyet_hourly(
     min_solar_elevation: float = 10.0,
 ) -> xr.DataArray:
     """Hourly Penman pan evaporation on a spatial grid (mm/hr)."""
-    pet_daily = pevt_penman_pyet_daily(
+    pet_daily = pet_penman_pyet_daily(
         shortwave_hourly, temperature_hourly, dewpoint_hourly,
         wind_hourly, elevation, albedo,
     )
@@ -87,7 +87,7 @@ def pet_penman_pyet_hourly(
 
     pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
-    return pet_hourly.rename("pevt_penman_mm_hr").assign_attrs(
+    return pet_hourly.rename("pet_penman_mm_hr").assign_attrs(
         {"units": "mm/hr", "albedo": albedo}
     )
 
@@ -137,7 +137,7 @@ def pet_penman_kohler(
 
     pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
-    return pet_hourly.rename("pevt_penman_kohler_mm_hr").assign_attrs(
+    return pet_hourly.rename("pet_penman_kohler_mm_hr").assign_attrs(
         {"units": "mm/hr", "albedo": albedo}
     )
 

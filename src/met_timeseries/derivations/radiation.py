@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import pvlib
+from met_timeseries.derivations import constants
 
 SOLAR_CONSTANT_W_M2 = 1361.0
 CLEARSKY_TRANSMITTANCE = 0.75
@@ -93,7 +94,7 @@ def cloud_cover_davis(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using the Davis (1975) method."""
-    clearsky, daytime_mask = calculate_clearsky_array(
+    clearsky, daytime_mask = clearsky_array(
         shortwave, lat, lon, time, min_solar_elevation=min_clearsky
     )
 
@@ -130,7 +131,7 @@ def cloud_cover_thompson(
     coeffs: tuple[float, float, float] | None = None,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using Thompson's (1976) parabolic method."""
-    clearsky, daytime_mask = calculate_clearsky_array(
+    clearsky, daytime_mask = clearsky_array(
         shortwave, lat, lon, time, min_solar_elevation,
     )
 
@@ -154,7 +155,7 @@ def cloud_cover_linear(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction (linear method)."""
-    clearsky, daytime_mask = calculate_clearsky_array(
+    clearsky, daytime_mask = clearsky_array(
         shortwave, lat, lon, time, min_solar_elevation=min_clearsky
     )
 
@@ -190,7 +191,7 @@ def clearsky_radiation_hww(
     Rso.attrs['units'] = 'Langleys/day'
     return Rso
 
-def radiation_hww(
+def net_radiation_hww(
     clear_sky_rad: xr.DataArray,
     percent_sunshine: xr.DataArray,
     a_coef: float = 0.22,
