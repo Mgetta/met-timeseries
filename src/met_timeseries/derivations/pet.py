@@ -257,9 +257,12 @@ def pet_penman_monteith_hourly(
     # FAO-56 Eq 39: cloudiness correction (1.35 * Rs/Rso - 0.35).
     # When rso = 0 (nighttime) the ratio is undefined; use 1.0 (clear-sky
     # assumption) so that rnl remains physically bounded.
+    # The cloudiness factor is clipped to [0.05, 1.0] to prevent physically
+    # invalid negative net longwave values when Rs/Rso < 0.259.
     with np.errstate(divide="ignore", invalid="ignore"):
         rs_over_rso = np.clip(np.where(rso > 0, rs / rso, 1.0), 0.0, 1.0)
-    rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))) * (1.35 * rs_over_rso - 0.35)
+    cloudiness_factor = np.clip(1.35 * rs_over_rso - 0.35, 0.05, 1.0)
+    rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))) * cloudiness_factor
 
     rn = rns - rnl
     is_daytime = rn > 0.0
