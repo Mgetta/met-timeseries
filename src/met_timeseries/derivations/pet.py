@@ -33,7 +33,13 @@ def pet_penman_pyet_daily(
     elevation: "xr.DataArray | float" = 0.0,
     albedo: float = 0.06,
 ) -> xr.DataArray:
-    """Daily Penman pan evaporation on a spatial grid via pyet (mm/day)."""
+    """Daily Penman pan evaporation on a spatial grid via pyet (mm/day).
+
+    Note:
+        shortwave_hourly is assumed to be at 1-hour intervals. The factor 0.0036
+        converts W/m² to MJ/m²/hr (= W/m² × 3600 s/hr × 1e-6 MJ/J).
+        Sub-hourly or super-hourly data will give incorrect daily totals.
+    """
     rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum()  
     tmean_daily = temperature_hourly.resample(time="1D").mean()          
     wind_daily  = wind_hourly.resample(time="1D").mean()                 
@@ -70,7 +76,7 @@ def pet_penman_pyet_hourly(
         wind_hourly, elevation, albedo,
     )
 
-    _, daytime_mask = radiation.calculate_clearsky_array(
+    _, daytime_mask = radiation.clearsky_array(
         shortwave_hourly,
         lat=shortwave_hourly.coords["lat"].values,
         lon=shortwave_hourly.coords["lon"].values,
@@ -96,11 +102,20 @@ def pet_penman_kohler(
     temperature_hourly: xr.DataArray,
     dewpoint_hourly: xr.DataArray,
     wind_hourly: xr.DataArray,
-    pressure: xr.DataArray | float = 1013.25,
+    pressure: xr.DataArray | float = 101325.0,
     albedo: float = 0.06,
     min_solar_elevation: float = 10.0,
 ) -> xr.DataArray:
-    """Hourly Penman pan evaporation via Kohler et al. (1955) (mm/hr)."""
+    """Hourly Penman pan evaporation via Kohler et al. (1955) (mm/hr).
+
+    Note:
+        shortwave_hourly is assumed to be at 1-hour intervals. The factor 0.0036
+        converts W/m² to MJ/m²/hr (= W/m² × 3600 s/hr × 1e-6 MJ/J).
+        Sub-hourly or super-hourly data will give incorrect daily totals.
+
+    Args:
+        pressure: Atmospheric pressure in Pa (default 101325.0 Pa = standard atmosphere).
+    """
     rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum() 
     tmean_daily = temperature_hourly.resample(time="1D").mean()          
     dp_daily    = dewpoint_hourly.resample(time="1D").mean()             
@@ -111,7 +126,8 @@ def pet_penman_kohler(
     
     vpd      = (es - ea).clip(min=0.0)
     delta    = 4098.0 * es / (tmean_daily + 237.3) ** 2                      
-    gamma    = 0.000665 * pressure                                            
+    pressure_kpa = pressure / 1000.0
+    gamma    = 0.000665 * pressure_kpa                                        
     lambda_v = 2.501 - 0.002361 * tmean_daily                                
     rn       = rs_daily * (1.0 - albedo)                                      
     f_u      = 0.005 + 0.00085 * (wind_daily * 3.6)                          
@@ -120,7 +136,7 @@ def pet_penman_kohler(
 
     pet_daily = ((delta * (rn / lambda_v) + gamma * ea_term) / (delta + gamma)).clip(min=0.0)
 
-    _, daytime_mask = radiation.calculate_clearsky_array(
+    _, daytime_mask = radiation.clearsky_array(
         shortwave_hourly,
         lat=shortwave_hourly.coords["lat"].values,
         lon=shortwave_hourly.coords["lon"].values,
@@ -151,14 +167,20 @@ def pet_penman_hourly(
     elevation: float = 0.0,
     albedo: float = 0.23,
 ) -> xr.DataArray:
-    """Compute hourly Penman Pan Evaporation (mm/hour)."""
+    """Compute hourly Penman Pan Evaporation (mm/hour).
+
+    Args:
+        temperature: Air temperature in °C.
+        dewpoint: Dewpoint temperature in °C.
+        pressure: Atmospheric pressure in Pa.
+    """
     cn = 37.0  
     cd = 0.24  
 
     net_radiation = radiation.net_radiation(shortwave_down, longwave_down, temperature, albedo)
     net_radiation_mj = net_radiation * 0.0036  
 
-    specific_humidity = humidity.specific_humidity(temperature, dewpoint, pressure)
+    specific_humidity_val = humidity.specific_humidity(dewpoint, pressure)
 
     e_s = humidity.saturation_vapor_pressure_magnus(temperature)
     e_a = humidity.saturation_vapor_pressure_magnus(dewpoint)
@@ -166,10 +188,10 @@ def pet_penman_hourly(
     pressure_kpa = pressure / 1000.0
     gamma = 0.000665 * pressure_kpa  
 
-    delta = (4098 * e_s) / ((temperature - 273.15) + 237.3) ** 2  
+    delta = (4098 * e_s) / (temperature + 237.3) ** 2  
     vapor_pressure_deficit = e_s - e_a
 
-    numerator = 0.408 * delta * net_radiation_mj + gamma * cn / (temperature - 273.15 + 273) * wind_speed * vapor_pressure_deficit
+    numerator = 0.408 * delta * net_radiation_mj + gamma * (cn / (temperature + 273.0)) * wind_speed * vapor_pressure_deficit
     denominator = delta + gamma * (1 + cd * wind_speed)
 
     pet_hourly = numerator / denominator  
@@ -188,7 +210,14 @@ def pet_penman_monteith_hourly(
     dewpoint: xr.DataArray,
     elevation: "xr.DataArray | float",
 ) -> xr.DataArray:
-    """Compute hourly FAO-56 Penman-Monteith reference ET (mm/hour)."""
+    """Compute hourly FAO-56 Penman-Monteith reference ET (mm/hour).
+
+    Args:
+        temperature: Air temperature in °C.
+        dewpoint: Dewpoint temperature in °C.
+        shortwave: Incoming shortwave radiation in W/m².
+        elevation: Surface elevation in metres.
+    """
     cn = 37.0    
     cd_day = 0.24
     cd_night = 0.96
@@ -196,14 +225,24 @@ def pet_penman_monteith_hourly(
     humid_a = 0.34
     humid_b = 0.14
     albedo = 0.23  
+
+    # Compute clear-sky radiation for FAO-56 Eq 39 cloudiness correction (Rs/Rso)
+    rso_xr, _ = radiation.clearsky_array(
+        shortwave,
+        lat=shortwave.coords["lat"].values,
+        lon=shortwave.coords["lon"].values,
+        time=shortwave.coords["time"].values,
+    )
     
     t = temperature.values.astype(float)
     u2 = wind_speed.values.astype(float)
     rs_wm2 = shortwave.values.astype(float)
     td = dewpoint.values.astype(float)
     z = elevation.values.astype(float) if isinstance(elevation, xr.DataArray) else float(elevation)
+    rso_wm2 = rso_xr.values.astype(float)
 
-    rs = rs_wm2 * 0.0036
+    rs = rs_wm2 * 0.0036  # W/m² → MJ/m²/hr
+    rso = rso_wm2 * 0.0036  # W/m² → MJ/m²/hr
     pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  
     gamma = 0.000665 * pressure
 
@@ -215,7 +254,15 @@ def pet_penman_monteith_hourly(
     rns = (1.0 - albedo) * rs
     
     t_k = t + 273.15
-    rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0))) * rs
+    # FAO-56 Eq 39: cloudiness correction (1.35 * Rs/Rso - 0.35).
+    # When rso = 0 (nighttime) the ratio is undefined; use 1.0 (clear-sky
+    # assumption) so that rnl remains physically bounded.
+    # The cloudiness factor is clipped to [0.05, 1.0] to prevent physically
+    # invalid negative net longwave values when Rs/Rso < 0.259.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs_over_rso = np.clip(np.where(rso > 0, rs / rso, 1.0), 0.0, 1.0)
+    cloudiness_factor = np.clip(1.35 * rs_over_rso - 0.35, 0.05, 1.0)
+    rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))) * cloudiness_factor
 
     rn = rns - rnl
     is_daytime = rn > 0.0
