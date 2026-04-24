@@ -5,8 +5,7 @@ import pandas as pd
 import xarray as xr
 import pyet
 
-from met_timeseries.derivations import thermodynamics
-from met_timeseries.derivations import radiation
+from met_timeseries.derivations import humidity, radiation
 
 
 def pet_hargreaves(daily_tmin, daily_tmax, lat: float):
@@ -38,9 +37,7 @@ def pet_penman_pyet_daily(
     rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum()  
     tmean_daily = temperature_hourly.resample(time="1D").mean()          
     wind_daily  = wind_hourly.resample(time="1D").mean()                 
-    ea_daily    = (
-        0.6108 * np.exp(17.27 * dewpoint_hourly / (dewpoint_hourly + 237.3))
-    ).resample(time="1D").mean()                                          
+    ea_daily    =  humidity.saturation_vapor_pressure_magnus(dewpoint_hourly).resample(time="1D").mean()                                          
 
     lat_rad = np.radians(shortwave_hourly.coords["lat"])
 
@@ -109,8 +106,9 @@ def pet_penman_kohler(
     dp_daily    = dewpoint_hourly.resample(time="1D").mean()             
     wind_daily  = wind_hourly.resample(time="1D").mean()                 
 
-    es       = 6.112 * np.exp(17.67 * tmean_daily / (tmean_daily + 243.5))  
-    ea       = 6.112 * np.exp(17.67 * dp_daily    / (dp_daily    + 243.5))  
+    es = humidity.saturation_vapor_pressure_magnus(tmean_daily)
+    ea = humidity.saturation_vapor_pressure_magnus(dp_daily)
+    
     vpd      = (es - ea).clip(min=0.0)
     delta    = 4098.0 * es / (tmean_daily + 237.3) ** 2                      
     gamma    = 0.000665 * pressure                                            
@@ -118,6 +116,7 @@ def pet_penman_kohler(
     rn       = rs_daily * (1.0 - albedo)                                      
     f_u      = 0.005 + 0.00085 * (wind_daily * 3.6)                          
     ea_term  = f_u * vpd
+
 
     pet_daily = ((delta * (rn / lambda_v) + gamma * ea_term) / (delta + gamma)).clip(min=0.0)
 
@@ -156,16 +155,13 @@ def pet_penman_hourly(
     cn = 37.0  
     cd = 0.24  
 
-    net_radiation = thermodynamics.calculate_net_radiation(shortwave_down, longwave_down, temperature, albedo)
+    net_radiation = radiation.net_radiation(shortwave_down, longwave_down, temperature, albedo)
     net_radiation_mj = net_radiation * 0.0036  
 
-    specific_humidity = thermodynamics.calculate_specific_humidity(temperature, dewpoint, pressure)
+    specific_humidity = humidity.specific_humidity(temperature, dewpoint, pressure)
 
-    def _vapor_pressure(temp_k):
-        return 0.6108 * np.exp(17.27 * (temp_k - 273.15) / (temp_k - 273.15 + 237.3))
-        
-    e_s = _vapor_pressure(temperature)
-    e_a = _vapor_pressure(dewpoint)
+    e_s = humidity.saturation_vapor_pressure_magnus(temperature)
+    e_a = humidity.saturation_vapor_pressure_magnus(dewpoint)
 
     pressure_kpa = pressure / 1000.0
     gamma = 0.000665 * pressure_kpa  
@@ -211,10 +207,9 @@ def pet_penman_monteith_hourly(
     pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  
     gamma = 0.000665 * pressure
 
-    def _magnus(temp):
-        return 0.6108 * np.exp(17.27 * temp / (temp + 237.3))
-    es = _magnus(t)
-    ea = _magnus(td)
+
+    es = humidity.saturation_vapor_pressure_magnus(t)
+    ea = humidity.saturation_vapor_pressure_magnus(td)
 
     delta = 4098.0 * es / (t + 237.3) ** 2
     rns = (1.0 - albedo) * rs
