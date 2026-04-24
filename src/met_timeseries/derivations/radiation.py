@@ -5,9 +5,8 @@ import pandas as pd
 import numpy as np
 import xarray as xr
 import pvlib
-from met_timeseries.derivations import constants
+from met_timeseries.derivations import constants, humidity
 
-from met_timeseries.derivations import constants
 
 SOLAR_CONSTANT_W_M2 = 1361.0
 CLEARSKY_TRANSMITTANCE = 0.75
@@ -199,7 +198,8 @@ def clearsky_radiation_hww(
     Rso.attrs['units'] = 'MJ/m²/day'
     return Rso
 
-def net_radiation_hww(
+
+def actual_radiation_hww(
     clear_sky_rad: xr.DataArray,
     percent_sunshine: xr.DataArray,
     a_coef: float = 0.22,
@@ -213,3 +213,94 @@ def net_radiation_hww(
     if 'units' in clear_sky_rad.attrs:
         rs.attrs['units'] = clear_sky_rad.attrs['units']
     return rs
+
+def net_longwave_brutsaert(
+    temperature: xr.DataArray,        # °C
+    vapor_pressure: xr.DataArray,     # kPa  (actual, not saturation)
+    clearsky_shortwave: xr.DataArray | None = None,
+    shortwave_down: xr.DataArray | None = None,
+    humid_a: float = 0.34,
+    humid_b: float = 0.14,
+) -> xr.DataArray:
+    """
+    Estimate net longwave radiation loss (W/m²) using Brutsaert's atmospheric
+    emissivity parameterisation.
+
+    R_nl = σ T⁴ · (a - b√eₐ) · (Rs/Rso)
+
+    The cloud correction term (Rs/Rso) requires both shortwave_down and
+    clearsky_shortwave. If either is None the term is omitted (clear-sky assumed).
+
+    Args:
+        temperature:        Air temperature (°C)
+        vapor_pressure:     Actual vapor pressure (kPa) — pass actual, not saturation.
+                            Use humidity.saturation_vapor_pressure_arm(dewpoint) to derive.
+        clearsky_shortwave: Clear-sky shortwave (W/m²) for cloud correction.
+        shortwave_down:     Observed shortwave (W/m²) for cloud correction.
+        humid_a:            Emissivity coefficient a (default 0.34, Bruin 1987)
+        humid_b:            Emissivity coefficient b (default 0.14, Bruin 1987)
+
+    Returns:
+        Net longwave radiation in W/m² (positive = upward loss).
+    """
+    t_k = temperature + 273.15
+
+    if clearsky_shortwave is not None and shortwave_down is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rs_rso = (shortwave_down / clearsky_shortwave).clip(0.25, 1.0)
+    else:
+        rs_rso = xr.ones_like(temperature)
+
+    rnl = (
+        constants.STEFAN_BOLTZMANN
+        * t_k**4
+        * (humid_a - humid_b * np.sqrt(vapor_pressure.clip(min=0.0)))
+        * rs_rso
+    )
+    return rnl.rename("net_longwave_brutsaert")
+
+
+def net_radiation_arm(
+    shortwave_down: xr.DataArray,
+    temperature: xr.DataArray,        # °C
+    dewpoint: xr.DataArray,           # °C
+    clearsky_shortwave: xr.DataArray | None = None,
+    albedo: float = 0.23,
+    humid_a: float = 0.34,
+    humid_b: float = 0.14,
+) -> xr.DataArray:
+    """
+    Estimate net radiation (W/m²) using the August-Roche-Magnus vapor pressure
+    approximation for atmospheric emissivity (Brutsaert-style net longwave).
+
+    Suitable when longwave_down is unavailable and must be parameterised from
+    temperature and dewpoint. Delegates to humidity.saturation_vapor_pressure_arm
+    and net_longwave_brutsaert.
+
+    Args:
+        shortwave_down:     Incoming shortwave radiation (W/m²)
+        temperature:        Air temperature (°C)
+        dewpoint:           Dewpoint temperature (°C)
+        clearsky_shortwave: Clear-sky shortwave (W/m²) for cloud correction.
+                            If None, clear-sky is assumed (Rs/Rso = 1).
+        albedo:             Surface albedo (default 0.23, short reference grass)
+        humid_a:            Emissivity coefficient a (default 0.34)
+        humid_b:            Emissivity coefficient b (default 0.14)
+    """
+    e_a = humidity.vapor_pressure_magnus(
+        dewpoint,
+        b=constants.VAPOR_B_TETENS,
+        base=0.6112,
+    )
+    rns = shortwave_down * (1.0 - albedo)
+
+    rnl = net_longwave_brutsaert(
+        temperature,
+        vapor_pressure=e_a,
+        clearsky_shortwave=clearsky_shortwave,
+        shortwave_down=shortwave_down,
+        humid_a=humid_a,
+        humid_b=humid_b,
+    )
+
+    return (rns - rnl).rename("net_radiation_arm")

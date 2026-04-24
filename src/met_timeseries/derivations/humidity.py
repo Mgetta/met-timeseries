@@ -4,15 +4,95 @@ import xarray as xr
 
 from met_timeseries.derivations import constants
 
+def vapor_pressure_magnus(
+    temperature: xr.DataArray,
+    a: float = constants.VAPOR_A_MAGNUS,
+    b: float = constants.VAPOR_B_MAGNUS,
+    base: float = 0.6108,
+) -> xr.DataArray:
+    """
+    Calculate vapor pressure (e) in kPa using the Magnus formula.
 
-def saturation_vapor_pressure_magnus(temperature: xr.DataArray) -> xr.DataArray:
+    Pass air temperature to get saturation vapor pressure (eₛ).
+    Pass dewpoint temperature to get actual vapor pressure (eₐ).
+
+    Args:
+        temperature: Air or dewpoint temperature (°C).
+        a:    Magnus coefficient A (default 17.27, FAO-56).
+        b:    Magnus coefficient B in °C (default 237.3, FAO-56).
+              Pass constants.VAPOR_B_TETENS (237.7) for August-Roche-Magnus variant.
+        base: Vapor pressure at 0 °C in kPa (default 0.6108, FAO-56).
+              Pass 0.6112 for August-Roche-Magnus variant.
     """
-    Calculate saturation vapor pressure (eₛ) in kPa using the Magnus formula.
-    Assumes temperature is in Celsius.
+    return base * np.exp((a * temperature) / (temperature + b))
+
+def vapor_pressure_mixing(
+    specific_humidity: xr.DataArray,  # kg/kg
+    pressure: xr.DataArray,           # Pa
+) -> xr.DataArray:
     """
-    return 0.6108 * np.exp(
-        constants.VAPOR_A_MAGNUS * temperature / (temperature + constants.VAPOR_B_MAGNUS)
-    )
+    Derive actual vapor pressure (kPa) from specific humidity and pressure
+    via mixing ratio.
+
+    Signal flow: q  →  w (mixing ratio)  →  e_a (kPa)
+
+    Args:
+        specific_humidity: Specific humidity (kg/kg)
+        pressure:          Atmospheric pressure (Pa)
+    """
+    w = specific_humidity / (1.0 - specific_humidity)
+    return (w / (constants.EPSILON + w)) * (pressure / 1000.0)
+
+def dewpoint_magnus(
+    vapor_pressure: xr.DataArray,
+    a: float = constants.VAPOR_A_MAGNUS,
+    b: float = constants.VAPOR_B_TETENS,
+    base: float = 0.6112,
+) -> xr.DataArray:
+    """
+    Invert the Magnus formula to recover dewpoint temperature (°C) from
+    vapor pressure (kPa).
+
+    Algebraic inverse of vapor_pressure_magnus:
+        e = base · exp(A·T / (T + B))  →  Td = B · ln(e/base) / (A - ln(e/base))
+
+    Defaults to ARM constants (VAPOR_B_TETENS, 0.6112) since this inversion is
+    most commonly used in the August-Roche-Magnus dewpoint pathway. Pass
+    VAPOR_B_MAGNUS / 0.6108 for the FAO-56 variant.
+
+    Args:
+        vapor_pressure: Actual vapor pressure (kPa).
+        a:    Magnus coefficient A (default 17.27).
+        b:    Magnus coefficient B in °C (default 237.7, ARM).
+        base: Vapor pressure at 0 °C in kPa (default 0.6112, ARM).
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ln_e = np.log(vapor_pressure / base)
+        dewpoint = (b * ln_e) / (a - ln_e)
+    return dewpoint.rename("dewpoint_c")
+
+
+def dewpoint_cc(
+    vapor_pressure: xr.DataArray,
+    ref_vp: float = 0.6113,
+    cc_const: float = 0.0001844,
+) -> xr.DataArray:
+    """
+    Invert vapor pressure (kPa) to dewpoint temperature (°C) via the
+    linearised Clausius-Clapeyron equation.
+
+        Td = 1 / (1/T₀ - (1/L) · ln(e/e₀))  - 273.15
+
+    where T₀ = 273.15 K, e₀ = ref_vp kPa, and cc_const approximates 1/L.
+
+    Args:
+        vapor_pressure: Actual vapor pressure (kPa).
+        ref_vp:    Reference vapor pressure at 0 °C (kPa). Default 0.6113.
+        cc_const:  Linearised latent heat coefficient (K⁻¹). Default 0.0001844.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        td_k = 1.0 / (1.0 / 273.15 - cc_const * np.log(vapor_pressure / ref_vp))
+    return (td_k - 273.15).rename("dewpoint_c")
 
 
 def specific_humidity(
@@ -24,7 +104,7 @@ def specific_humidity(
     Args:
         pressure: Atmospheric pressure in Pa
     """
-    e_a = saturation_vapor_pressure_magnus(dewpoint)   # kPa
+    e_a = vapor_pressure_magnus(dewpoint)   # kPa
     pressure_kpa = pressure / 1000.0                   # Pa → kPa
 
     q = (constants.EPSILON * e_a) / (pressure_kpa - (1 - constants.EPSILON) * e_a)
@@ -38,7 +118,7 @@ def relative_humidity_from_specific_humidity(
     """Compute relative humidity from specific humidity, pressure, and temperature (°C)."""
     pressure_kpa = pressure / 1000.0
 
-    e_s = saturation_vapor_pressure_magnus(temperature)  # kPa
+    e_s = vapor_pressure_magnus(temperature)  # kPa
     e = (specific_humidity * pressure_kpa) / (constants.EPSILON + specific_humidity)
     rh = (e / e_s) * 100.0
 
@@ -93,22 +173,10 @@ def dewpoint_from_specific_humidity_cc(
     pressure: xr.DataArray,
 ) -> xr.DataArray:
     """Compute dewpoint from specific humidity using Clausius-Clapeyron."""
-    q = specific_humidity.values.astype(float)
-    p_kpa = pressure.values.astype(float) / 1000.0  
-
-    w = q / (1.0 - q)
-    e_a = (w / (0.622 + w)) * p_kpa
-
-    REF_VP = 0.6113  
-    CC_CONST = 0.0001844  
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        td_k = 1.0 / (1.0 / 273.15 - CC_CONST * np.log(e_a / REF_VP))
-
-    td_c = td_k - 273.15
-
+    e_a = vapor_pressure_mixing(specific_humidity, pressure)
+    dewpoint = dewpoint_cc(e_a)   # or dewpoint_cc(e_a)
     return xr.DataArray(
-        td_c,
+        dewpoint,
         dims=specific_humidity.dims,
         coords=specific_humidity.coords,
         name="dewpoint_c",
@@ -120,17 +188,9 @@ def dewpoint_august_roche_magnus(
     pressure: xr.DataArray,
 ) -> xr.DataArray:
     """Compute dewpoint temperature using the August-Roche-Magnus equation."""
-    relative_humidity = relative_humidity_from_specific_humidity(
-        temperature, specific_humidity, pressure
-    )
-
-    e_s = saturation_vapor_pressure_magnus(temperature)  # kPa
-    e = (relative_humidity / 100) * e_s
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        dewpoint = (constants.VAPOR_B_MAGNUS * np.log(e / constants.SAT_VP_0C_KPA)) / (
-            constants.VAPOR_A_MAGNUS - np.log(e / constants.SAT_VP_0C_KPA)
-        )
+    
+    e_a = vapor_pressure_mixing(specific_humidity, pressure)
+    dewpoint = dewpoint_magnus(e_a)  
 
     return xr.DataArray(
         dewpoint,

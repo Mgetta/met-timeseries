@@ -43,7 +43,7 @@ def pet_penman_pyet_daily(
     rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum()  
     tmean_daily = temperature_hourly.resample(time="1D").mean()          
     wind_daily  = wind_hourly.resample(time="1D").mean()                 
-    ea_daily    =  humidity.saturation_vapor_pressure_magnus(dewpoint_hourly).resample(time="1D").mean()                                          
+    ea_daily    =  humidity.vapor_pressure_magnus(dewpoint_hourly).resample(time="1D").mean()                                          
 
     lat_rad = np.radians(shortwave_hourly.coords["lat"])
 
@@ -121,8 +121,8 @@ def pet_penman_kohler(
     dp_daily    = dewpoint_hourly.resample(time="1D").mean()             
     wind_daily  = wind_hourly.resample(time="1D").mean()                 
 
-    es = humidity.saturation_vapor_pressure_magnus(tmean_daily)
-    ea = humidity.saturation_vapor_pressure_magnus(dp_daily)
+    es = humidity.vapor_pressure_magnus(tmean_daily)
+    ea = humidity.vapor_pressure_magnus(dp_daily)
     
     vpd      = (es - ea).clip(min=0.0)
     delta    = 4098.0 * es / (tmean_daily + 237.3) ** 2                      
@@ -182,8 +182,8 @@ def pet_penman_hourly(
 
     specific_humidity_val = humidity.specific_humidity(dewpoint, pressure)
 
-    e_s = humidity.saturation_vapor_pressure_magnus(temperature)
-    e_a = humidity.saturation_vapor_pressure_magnus(dewpoint)
+    e_s = humidity.vapor_pressure_magnus(temperature)
+    e_a = humidity.vapor_pressure_magnus(dewpoint)
 
     pressure_kpa = pressure / 1000.0
     gamma = 0.000665 * pressure_kpa  
@@ -209,6 +209,13 @@ def pet_penman_monteith_hourly(
     shortwave: xr.DataArray,
     dewpoint: xr.DataArray,
     elevation: "xr.DataArray | float",
+    cn = 37.0,    
+    cd_day = 0.24,
+    cd_night = 0.96,
+    sigma_h = 2.042e-10,  
+    humid_a = 0.34,
+    humid_b = 0.14,
+    albedo = 0.23
 ) -> xr.DataArray:
     """Compute hourly FAO-56 Penman-Monteith reference ET (mm/hour).
 
@@ -218,13 +225,7 @@ def pet_penman_monteith_hourly(
         shortwave: Incoming shortwave radiation in W/m².
         elevation: Surface elevation in metres.
     """
-    cn = 37.0    
-    cd_day = 0.24
-    cd_night = 0.96
-    sigma_h = 2.042e-10  
-    humid_a = 0.34
-    humid_b = 0.14
-    albedo = 0.23  
+  
 
     # Compute clear-sky radiation for FAO-56 Eq 39 cloudiness correction (Rs/Rso)
     rso_xr, _ = radiation.clearsky_array(
@@ -247,8 +248,8 @@ def pet_penman_monteith_hourly(
     gamma = 0.000665 * pressure
 
 
-    es = humidity.saturation_vapor_pressure_magnus(t)
-    ea = humidity.saturation_vapor_pressure_magnus(td)
+    es = humidity.vapor_pressure_magnus(t)
+    ea = humidity.vapor_pressure_magnus(td)
 
     delta = 4098.0 * es / (t + 237.3) ** 2
     rns = (1.0 - albedo) * rs
