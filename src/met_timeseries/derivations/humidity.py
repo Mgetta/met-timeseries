@@ -55,14 +55,11 @@ def relative_humidity(
     pressure: xr.DataArray,
 ) -> xr.DataArray:
     """Compute relative humidity from specific humidity, pressure, and temperature (°C)."""
-    pressure_hpa = pressure / 100.0
-
     sh = specific_humidity(dewpoint, pressure)
 
-    e_s = 6.112 * np.exp(
-        (constants.VAPOR_A_MAGNUS * temperature) / (constants.VAPOR_B_TETENS + temperature)
-    )
-    e = (specific_humidity * pressure_hpa) / (constants.EPSILON + specific_humidity)
+    pressure_kpa = pressure / 1000.0
+    e_s = saturation_vapor_pressure_magnus(temperature)  # kPa
+    e = (sh * pressure_kpa) / (constants.EPSILON + sh)
     rh = (e / e_s) * 100.0
 
     return xr.DataArray(
@@ -131,14 +128,12 @@ def dewpoint_august_roche_magnus(
         temperature, specific_humidity, pressure
     )
 
-    e_s = 6.112 * np.exp(
-        (constants.VAPOR_A_MAGNUS * temperature) / (constants.VAPOR_B_TETENS + temperature)
-    )
+    e_s = saturation_vapor_pressure_magnus(temperature)  # kPa
     e = (relative_humidity / 100) * e_s
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        dewpoint = (constants.VAPOR_B_TETENS * np.log(e / 6.112)) / (
-            constants.VAPOR_A_MAGNUS - np.log(e / 6.112)
+        dewpoint = (constants.VAPOR_B_MAGNUS * np.log(e / constants.SAT_VP_0C_KPA)) / (
+            constants.VAPOR_A_MAGNUS - np.log(e / constants.SAT_VP_0C_KPA)
         )
 
     return xr.DataArray(

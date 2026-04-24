@@ -6,6 +6,8 @@ import numpy as np
 import xarray as xr
 import pvlib
 
+from met_timeseries.derivations import constants
+
 SOLAR_CONSTANT_W_M2 = 1361.0
 CLEARSKY_TRANSMITTANCE = 0.75
 
@@ -16,9 +18,15 @@ def net_radiation(
     albedo: float = 0.23,
     emissivity: float = 0.97,
 ) -> xr.DataArray:
-    """Calculate net radiation (R_n) in W/m²."""
+    """Calculate net radiation (R_n) in W/m².
+
+    Args:
+        temperature: Surface temperature in °C (converted to K internally for
+            the Stefan-Boltzmann longwave-up term).
+    """
     shortwave_up = shortwave_down * albedo
-    longwave_up = emissivity * constants.STEFAN_BOLTZMANN * temperature**4
+    temperature_k = temperature + 273.15  # °C → K for Stefan-Boltzmann
+    longwave_up = emissivity * constants.STEFAN_BOLTZMANN * temperature_k**4
     net_radiation = (shortwave_down - shortwave_up) + (longwave_down - longwave_up)
     return net_radiation.rename("net_radiation")
 
@@ -93,7 +101,7 @@ def cloud_cover_davis(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using the Davis (1975) method."""
-    clearsky, daytime_mask = calculate_clearsky_array(
+    clearsky, daytime_mask = clearsky_array(
         shortwave, lat, lon, time, min_solar_elevation=min_clearsky
     )
 
@@ -130,7 +138,7 @@ def cloud_cover_thompson(
     coeffs: tuple[float, float, float] | None = None,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using Thompson's (1976) parabolic method."""
-    clearsky, daytime_mask = calculate_clearsky_array(
+    clearsky, daytime_mask = clearsky_array(
         shortwave, lat, lon, time, min_solar_elevation,
     )
 
@@ -154,7 +162,7 @@ def cloud_cover_linear(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction (linear method)."""
-    clearsky, daytime_mask = calculate_clearsky_array(
+    clearsky, daytime_mask = clearsky_array(
         shortwave, lat, lon, time, min_solar_elevation=min_clearsky
     )
 
@@ -179,7 +187,7 @@ def clearsky_radiation_hww(
     dr = 1.000110 + 0.034221 * np.cos(theta) + 0.001280 * np.sin(theta) \
          + 0.000719 * np.cos(2 * theta) + 0.000077 * np.sin(2 * theta)
          
-    Gsc = 2793.6 
+    Gsc = 117.5  # MJ/m²/day (= 2793.6 Langleys/day × 0.04184 MJ/Langley)
     Ra = (Gsc / np.pi) * dr * (
         omega_s * np.sin(phi) * np.sin(delta) +
         np.cos(phi) * np.cos(delta) * np.sin(omega_s)
@@ -187,10 +195,10 @@ def clearsky_radiation_hww(
     
     Rso = 0.73 * Ra
     Rso.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
-    Rso.attrs['units'] = 'Langleys/day'
+    Rso.attrs['units'] = 'MJ/m²/day'
     return Rso
 
-def radiation_hww(
+def actual_radiation_hww(
     clear_sky_rad: xr.DataArray,
     percent_sunshine: xr.DataArray,
     a_coef: float = 0.22,

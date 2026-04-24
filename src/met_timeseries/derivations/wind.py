@@ -2,10 +2,6 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
-from __future__ import annotations
-import numpy as np
-import xarray as xr
-
 def adjust_wind_height(
     wind_speed: xr.DataArray,
     z_from: float = 10.0,
