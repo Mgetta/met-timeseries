@@ -26,7 +26,7 @@ def pet_hargreaves(daily_tmin, daily_tmax, lat: float):
     pet.name = "pet_hargreaves_mm"
     return pet
 
-def pevt_penman_pyet_daily(
+def pet_penman_pyet_daily(
     shortwave_hourly: xr.DataArray,
     temperature_hourly: xr.DataArray,
     dewpoint_hourly: xr.DataArray,
@@ -58,7 +58,7 @@ def pevt_penman_pyet_daily(
         {"units": "mm/day", "albedo": albedo}
     )
 
-def pevt_penman_pyet_hourly(
+def pet_penman_pyet_hourly(
     shortwave_hourly: xr.DataArray,
     temperature_hourly: xr.DataArray,
     dewpoint_hourly: xr.DataArray,
@@ -94,7 +94,7 @@ def pevt_penman_pyet_hourly(
         {"units": "mm/hr", "albedo": albedo}
     )
 
-def pevt_penman_kohler(
+def pet_penman_kohler(
     shortwave_hourly: xr.DataArray,
     temperature_hourly: xr.DataArray,
     dewpoint_hourly: xr.DataArray,

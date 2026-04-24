@@ -9,7 +9,20 @@ import pvlib
 SOLAR_CONSTANT_W_M2 = 1361.0
 CLEARSKY_TRANSMITTANCE = 0.75
 
-def calculate_clearsky_radiation(lat: float, lon: float, dt: datetime.datetime) -> float:
+def net_radiation(
+    shortwave_down: xr.DataArray,
+    longwave_down: xr.DataArray,
+    temperature: xr.DataArray,
+    albedo: float = 0.23,
+    emissivity: float = 0.97,
+) -> xr.DataArray:
+    """Calculate net radiation (R_n) in W/m²."""
+    shortwave_up = shortwave_down * albedo
+    longwave_up = emissivity * constants.STEFAN_BOLTZMANN * temperature**4
+    net_radiation = (shortwave_down - shortwave_up) + (longwave_down - longwave_up)
+    return net_radiation.rename("net_radiation")
+
+def clearsky_radiation(lat: float, lon: float, dt: datetime.datetime) -> float:
     """Compute theoretical clear-sky surface shortwave radiation (W/m²)."""
       
 
@@ -31,7 +44,7 @@ def calculate_clearsky_radiation(lat: float, lon: float, dt: datetime.datetime) 
 
     return float(SOLAR_CONSTANT_W_M2 * cos_zenith * CLEARSKY_TRANSMITTANCE)
 
-def calculate_clearsky_array(
+def clearsky_array(
     shortwave: xr.DataArray,
     lat: xr.DataArray | np.ndarray,
     lon: xr.DataArray | np.ndarray,
@@ -93,7 +106,7 @@ def cloud_cover_davis(
     cc = cc.clip(0.0, 1.0).where(daytime_mask)
     return cc.rename("cloud_cover_fraction_davis")
 
-def thompson_sky_cover_radiation(
+def sky_cover_radiation_thompson(
     clear_sky_rad: xr.DataArray,
     cloud_cover: xr.DataArray,
     b_coef: float = 0.3
@@ -151,7 +164,7 @@ def cloud_cover_linear(
     cc = cc.clip(0.0, 1.0).where(daytime_mask)
     return cc.rename("cloud_cover_fraction")
 
-def hamon_weiss_wilson_clearsky(
+def clearsky_radiation_hww(
     day_of_year: xr.DataArray,
     latitude: xr.DataArray
 ) -> xr.DataArray:
@@ -177,7 +190,7 @@ def hamon_weiss_wilson_clearsky(
     Rso.attrs['units'] = 'Langleys/day'
     return Rso
 
-def hamon_weiss_wilson_actual_radiation(
+def radiation_hww(
     clear_sky_rad: xr.DataArray,
     percent_sunshine: xr.DataArray,
     a_coef: float = 0.22,

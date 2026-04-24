@@ -3,7 +3,74 @@ import numpy as np
 import xarray as xr
 
 from met_timeseries.derivations import constants
-from met_timeseries.derivations import thermodynamics
+
+
+def saturation_vapor_pressure_magnus(temperature: xr.DataArray) -> xr.DataArray:
+    """
+    Calculate saturation vapor pressure (eₛ) in kPa using the Magnus formula.
+    Assumes temperature is in Celsius.
+    """
+    return 0.6108 * np.exp(
+        constants.VAPOR_A_MAGNUS * temperature / (temperature + constants.VAPOR_B_MAGNUS)
+    )
+
+
+def specific_humidity(
+    dewpoint: xr.DataArray, # Celsius
+    pressure: xr.DataArray,  # Pa
+) -> xr.DataArray:
+    """Calculate specific humidity (q) in kg/kg.
+    
+    Args:
+        pressure: Atmospheric pressure in Pa
+    """
+    e_a = saturation_vapor_pressure_magnus(dewpoint)   # kPa
+    pressure_kpa = pressure / 1000.0                   # Pa → kPa
+
+    q = (constants.EPSILON * e_a) / (pressure_kpa - (1 - constants.EPSILON) * e_a)
+    return q.rename("specific_humidity")
+
+def relative_humidity_from_specific_humidity(
+    temperature: xr.DataArray,  # Celsius
+    specific_humidity: xr.DataArray,  # kg/kg
+    pressure: xr.DataArray,  # Pa
+) -> xr.DataArray:
+    """Compute relative humidity from specific humidity, pressure, and temperature (°C)."""
+    pressure_kpa = pressure / 1000.0
+
+    e_s = saturation_vapor_pressure_magnus(temperature)  # kPa
+    e = (specific_humidity * pressure_kpa) / (constants.EPSILON + specific_humidity)
+    rh = (e / e_s) * 100.0
+
+    return xr.DataArray(
+        rh.clip(0.0, 100.0),
+        dims=temperature.dims,
+        coords=temperature.coords,
+        name="relative_humidity",
+    )
+
+def relative_humidity(
+    temperature: xr.DataArray,
+    dewpoint: xr.DataArray,
+    pressure: xr.DataArray,
+) -> xr.DataArray:
+    """Compute relative humidity from specific humidity, pressure, and temperature (°C)."""
+    pressure_hpa = pressure / 100.0
+
+    sh = specific_humidity(dewpoint, pressure)
+
+    e_s = 6.112 * np.exp(
+        (constants.VAPOR_A_MAGNUS * temperature) / (constants.VAPOR_B_TETENS + temperature)
+    )
+    e = (specific_humidity * pressure_hpa) / (constants.EPSILON + specific_humidity)
+    rh = (e / e_s) * 100.0
+
+    return xr.DataArray(
+        rh.clip(0.0, 100.0),
+        dims=temperature.dims,
+        coords=temperature.coords,
+        name="relative_humidity",
+    )
 
 def dewpoint_from_specific_humidity(
     specific_humidity: xr.DataArray,
@@ -60,7 +127,7 @@ def dewpoint_august_roche_magnus(
     pressure: xr.DataArray,
 ) -> xr.DataArray:
     """Compute dewpoint temperature using the August-Roche-Magnus equation."""
-    relative_humidity = thermodynamics.calculate_relative_humidity(
+    relative_humidity = relative_humidity_from_specific_humidity(
         temperature, specific_humidity, pressure
     )
 
