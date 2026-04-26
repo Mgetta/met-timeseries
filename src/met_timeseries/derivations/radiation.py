@@ -8,8 +8,17 @@ import pvlib
 from met_timeseries.derivations import constants, humidity
 
 
-SOLAR_CONSTANT_W_M2 = 1361.0
-CLEARSKY_TRANSMITTANCE = 0.75
+SOLAR_CONSTANT = 1361.0 # W/m² at Earth's distance, used in geometric clearsky model and as base for pvlib calculations
+
+# --- Clearsky Transmittance ---
+CLEARSKY_TRANSMITTANCE = 0.75  # Geometric clearsky model (clearsky_radiation_geometric)
+CLEARSKY_TRANSMITTANCE_HWW    = 0.73  # HWW (1954) clearsky model (clearsky_radiation_hww)
+                                       # NB: different empirical source to SIMPLE
+
+# --- Brutsaert Net Longwave Emissivity (Bruin 1987) ---
+BRUTSAERT_A = 0.34  # Atmospheric emissivity coefficient a
+BRUTSAERT_B = 0.14  # Atmospheric emissivity coefficient b
+
 
 def net_radiation(
     shortwave_down: xr.DataArray,
@@ -30,7 +39,7 @@ def net_radiation(
     net_radiation = (shortwave_down - shortwave_up) + (longwave_down - longwave_up)
     return net_radiation.rename("net_radiation")
 
-def clearsky_radiation(lat: float, lon: float, dt: datetime.datetime) -> float:
+def clearsky_radiation_geometric(lat: float, lon: float, dt: datetime.datetime) -> float:
     """Compute theoretical clear-sky surface shortwave radiation (W/m²)."""
       
 
@@ -52,7 +61,7 @@ def clearsky_radiation(lat: float, lon: float, dt: datetime.datetime) -> float:
 
     return float(SOLAR_CONSTANT_W_M2 * cos_zenith * CLEARSKY_TRANSMITTANCE)
 
-def clearsky_array(
+def clearsky_radiation_ineichen(
     shortwave: xr.DataArray,
     lat: xr.DataArray | np.ndarray,
     lon: xr.DataArray | np.ndarray,
@@ -92,6 +101,39 @@ def clearsky_array(
     daytime_mask = elevation >= min_solar_elevation
     return clearsky, daytime_mask
 
+
+def clearsky_radiation_hww(
+    day_of_year: xr.DataArray,
+    latitude: xr.DataArray
+) -> xr.DataArray:
+    """Computes daily clear-sky solar radiation approximating Hamon, Weiss, Wilson (1954)."""
+    phi = np.radians(latitude)
+    theta = 2.0 * np.pi * day_of_year / 365.0
+    delta = 0.006918 - 0.399912 * np.cos(theta) + 0.070257 * np.sin(theta) \
+            - 0.006758 * np.cos(2 * theta) + 0.000907 * np.sin(2 * theta) \
+            - 0.002697 * np.cos(3 * theta) + 0.00148 * np.sin(3 * theta)
+            
+    omega_s = np.arccos((-np.tan(phi) * np.tan(delta)).clip(min=-1.0, max=1.0))
+    dr = 1.000110 + 0.034221 * np.cos(theta) + 0.001280 * np.sin(theta) \
+         + 0.000719 * np.cos(2 * theta) + 0.000077 * np.sin(2 * theta)
+         
+    Gsc = 117.5  # MJ/m²/day (= 2793.6 Langleys/day × 0.04184 MJ/Langley)
+    Ra = (Gsc / np.pi) * dr * (
+        omega_s * np.sin(phi) * np.sin(delta) +
+        np.cos(phi) * np.cos(delta) * np.sin(omega_s)
+    )
+    
+    Rso = 0.73 * Ra
+    Rso.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
+    Rso.attrs['units'] = 'MJ/m²/day'
+    return Rso
+
+
+
+
+
+
+
 def cloud_cover_davis(
     shortwave: xr.DataArray,
     lat: xr.DataArray | np.ndarray,
@@ -101,7 +143,7 @@ def cloud_cover_davis(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using the Davis (1975) method."""
-    clearsky, daytime_mask = clearsky_array(
+    clearsky, daytime_mask = clearsky_radiation_ineichen(
         shortwave, lat, lon, time, min_solar_elevation=min_clearsky
     )
 
@@ -162,7 +204,7 @@ def cloud_cover_linear(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction (linear method)."""
-    clearsky, daytime_mask = clearsky_array(
+    clearsky, daytime_mask = clearsky_radiation_ineichen(
         shortwave, lat, lon, time, min_solar_elevation=min_clearsky
     )
 
@@ -171,32 +213,6 @@ def cloud_cover_linear(
 
     cc = cc.clip(0.0, 1.0).where(daytime_mask)
     return cc.rename("cloud_cover_fraction")
-
-def clearsky_radiation_hww(
-    day_of_year: xr.DataArray,
-    latitude: xr.DataArray
-) -> xr.DataArray:
-    """Computes daily clear-sky solar radiation approximating Hamon, Weiss, Wilson (1954)."""
-    phi = np.radians(latitude)
-    theta = 2.0 * np.pi * day_of_year / 365.0
-    delta = 0.006918 - 0.399912 * np.cos(theta) + 0.070257 * np.sin(theta) \
-            - 0.006758 * np.cos(2 * theta) + 0.000907 * np.sin(2 * theta) \
-            - 0.002697 * np.cos(3 * theta) + 0.00148 * np.sin(3 * theta)
-            
-    omega_s = np.arccos((-np.tan(phi) * np.tan(delta)).clip(min=-1.0, max=1.0))
-    dr = 1.000110 + 0.034221 * np.cos(theta) + 0.001280 * np.sin(theta) \
-         + 0.000719 * np.cos(2 * theta) + 0.000077 * np.sin(2 * theta)
-         
-    Gsc = 117.5  # MJ/m²/day (= 2793.6 Langleys/day × 0.04184 MJ/Langley)
-    Ra = (Gsc / np.pi) * dr * (
-        omega_s * np.sin(phi) * np.sin(delta) +
-        np.cos(phi) * np.cos(delta) * np.sin(omega_s)
-    )
-    
-    Rso = 0.73 * Ra
-    Rso.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
-    Rso.attrs['units'] = 'MJ/m²/day'
-    return Rso
 
 
 def actual_radiation_hww(

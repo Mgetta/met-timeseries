@@ -3,6 +3,34 @@ import numpy as np
 import xarray as xr
 
 from met_timeseries.derivations import constants
+# --- Vapor Pressure (Magnus formula family) ---
+SAT_VP_0C_KPA = 0.6108          # Saturation VP at 0 °C, FAO-56 base (kPa)
+SAT_VP_0C_ARM = 0.6112          # Saturation VP at 0 °C, ARM base (kPa)
+VAPOR_A_MAGNUS = 17.27          # Magnus coefficient A (dimensionless)
+VAPOR_B_MAGNUS = 237.3          # Magnus coefficient B, FAO-56 (°C)
+VAPOR_B_TETENS = 237.7          # Magnus coefficient B, August-Roche-Magnus (°C)
+
+def delta_svp(
+    temperature: xr.DataArray,
+    b: float = constants.VAPOR_B_MAGNUS,
+) -> xr.DataArray:
+    """
+    Slope of the saturation vapor pressure curve (Δ) in kPa/°C.
+
+    Analytical derivative of the Magnus formula:
+        Δ = (A · B · eₛ) / (T + B)²
+          = 4098 · eₛ / (T + 237.3)²    ← FAO-56 form
+
+    Signal flow:
+        T  →  eₛ (vapor_pressure_magnus)  →  Δ
+
+    Args:
+        temperature: Air temperature (°C).
+        b:           Magnus B coefficient (°C). Defaults to FAO-56 (237.3).
+                     Pass constants.VAPOR_B_TETENS (237.7) for ARM variant.
+    """
+    es = vapor_pressure_magnus(temperature, b=b)
+    return (constants.VAPOR_A_MAGNUS * b * es) / (temperature + b) ** 2
 
 def vapor_pressure_magnus(
     temperature: xr.DataArray,

@@ -5,8 +5,51 @@ import pandas as pd
 import xarray as xr
 import pyet
 
-from met_timeseries.derivations import humidity, radiation
+from met_timeseries.derivations import constants, humidity, radiation
 
+# --- FAO-56 Reference Crop (short grass, hourly Penman-Monteith) ---
+FAO56_CN       = 37.0  # Numerator constant (kPa·s³/Mg/hr)
+FAO56_CD_DAY   = 0.24  # Denominator constant, daytime
+FAO56_CD_NIGHT = 0.96  # Denominator constant, nighttime
+
+
+def _disaggregate_daily_to_hourly_solar(
+    daily: xr.DataArray,
+    shortwave_hourly: xr.DataArray,
+    daytime_mask: xr.DataArray,
+) -> xr.DataArray:
+    """
+    Disaggregate a daily value to hourly resolution using solar radiation
+    as a temporal weight.
+
+    Signal flow:
+        daily total  ×  (hourly SW / daily SW sum)  →  hourly value
+
+    PET is allocated only during daytime hours (where daytime_mask is True).
+    Nighttime hours and days with no daytime SW receive 0.
+
+    Args:
+        daily:            Daily values to disaggregate (any units per day).
+        shortwave_hourly: Hourly incoming shortwave radiation (W/m²),
+                          used as the weighting signal.
+        daytime_mask:     Boolean mask marking daytime hours, typically from
+                          clearsky_array(...) with a minimum solar elevation threshold.
+
+    Returns:
+        Hourly DataArray with the same dims/coords as shortwave_hourly.
+    """
+    # Zero out nighttime SW so only daytime hours receive weight
+    sw_daytime = shortwave_hourly.where(daytime_mask, 0.0)
+
+    # Daily sum of daytime SW — NaN where no daytime SW exists (polar night etc.)
+    sw_daily_sum = sw_daytime.resample(time="1D").sum()
+    sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
+
+    # Broadcast daily values and SW sum back to hourly resolution
+    daily_bcast   = daily.reindex_like(shortwave_hourly, method="ffill")
+    sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
+
+    return (daily_bcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
 def pet_hargreaves(daily_tmin, daily_tmax, lat: float):
     """Estimate daily PET using the Hargreaves (1985) method."""
@@ -84,14 +127,17 @@ def pet_penman_pyet_hourly(
         min_solar_elevation=min_solar_elevation,
     )
 
-    sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
-    sw_daily_sum = sw_daytime.resample(time="1D").sum()
-    sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
+    pet_hourly = _disaggregate_daily_to_hourly_solar(
+        pet_daily, shortwave_hourly, daytime_mask
+    )
+    # sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
+    # sw_daily_sum = sw_daytime.resample(time="1D").sum()
+    # sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
 
-    pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
-    sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
+    # pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
+    # sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
 
-    pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
+    # pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
     return pet_hourly.rename("pet_penman_mm_hr").assign_attrs(
         {"units": "mm/hr", "albedo": albedo}
@@ -125,7 +171,7 @@ def pet_penman_kohler(
     ea = humidity.vapor_pressure_magnus(dp_daily)
     
     vpd      = (es - ea).clip(min=0.0)
-    delta    = 4098.0 * es / (tmean_daily + 237.3) ** 2                      
+    delta = humidity.delta_svp(tmean_daily, constants.VAPOR_B_MAGNUS)
     pressure_kpa = pressure / 1000.0
     gamma    = 0.000665 * pressure_kpa                                        
     lambda_v = 2.501 - 0.002361 * tmean_daily                                
@@ -144,14 +190,17 @@ def pet_penman_kohler(
         min_solar_elevation=min_solar_elevation,
     )
 
-    sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
-    sw_daily_sum = sw_daytime.resample(time="1D").sum()
-    sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
+    pet_hourly = _disaggregate_daily_to_hourly_solar(
+        pet_daily, shortwave_hourly, daytime_mask
+    )
+    # sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
+    # sw_daily_sum = sw_daytime.resample(time="1D").sum()
+    # sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
 
-    pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
-    sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
+    # pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
+    # sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
 
-    pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
+    # pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
     return pet_hourly.rename("pet_penman_kohler_mm_hr").assign_attrs(
         {"units": "mm/hr", "albedo": albedo}
@@ -188,7 +237,7 @@ def pet_penman_hourly(
     pressure_kpa = pressure / 1000.0
     gamma = 0.000665 * pressure_kpa  
 
-    delta = (4098 * e_s) / (temperature + 237.3) ** 2  
+    delta = humidity.delta_svp(temperature, constants.VAPOR_B_MAGNUS)
     vapor_pressure_deficit = e_s - e_a
 
     numerator = 0.408 * delta * net_radiation_mj + gamma * (cn / (temperature + 273.0)) * wind_speed * vapor_pressure_deficit
@@ -251,7 +300,7 @@ def pet_penman_monteith_hourly(
     es = humidity.vapor_pressure_magnus(t)
     ea = humidity.vapor_pressure_magnus(td)
 
-    delta = 4098.0 * es / (t + 237.3) ** 2
+    delta = humidity.delta_svp(t, constants.VAPOR_B_MAGNUS)
     rns = (1.0 - albedo) * rs
     
     t_k = t + 273.15
