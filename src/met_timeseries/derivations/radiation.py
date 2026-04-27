@@ -180,7 +180,7 @@ def cloud_cover_thompson(
     coeffs: tuple[float, float, float] | None = None,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using Thompson's (1976) parabolic method."""
-    clearsky, daytime_mask = clearsky_array(
+    clearsky, daytime_mask = clearsky_radiation_geometric(
         shortwave, lat, lon, time, min_solar_elevation,
     )
 

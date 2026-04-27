@@ -33,7 +33,7 @@ def _disaggregate_daily_to_hourly_solar(
         shortwave_hourly: Hourly incoming shortwave radiation (W/m²),
                           used as the weighting signal.
         daytime_mask:     Boolean mask marking daytime hours, typically from
-                          clearsky_array(...) with a minimum solar elevation threshold.
+                          clearsky_radiation_ineichen(...) with a minimum solar elevation threshold.
 
     Returns:
         Hourly DataArray with the same dims/coords as shortwave_hourly.
@@ -119,7 +119,7 @@ def pet_penman_pyet_hourly(
         wind_hourly, elevation, albedo,
     )
 
-    _, daytime_mask = radiation.clearsky_array(
+    _, daytime_mask = radiation.clearsky_radiation_ineichen(
         shortwave_hourly,
         lat=shortwave_hourly.coords["lat"].values,
         lon=shortwave_hourly.coords["lon"].values,
@@ -130,14 +130,6 @@ def pet_penman_pyet_hourly(
     pet_hourly = _disaggregate_daily_to_hourly_solar(
         pet_daily, shortwave_hourly, daytime_mask
     )
-    # sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
-    # sw_daily_sum = sw_daytime.resample(time="1D").sum()
-    # sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
-
-    # pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
-    # sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
-
-    # pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
     return pet_hourly.rename("pet_penman_mm_hr").assign_attrs(
         {"units": "mm/hr", "albedo": albedo}
@@ -171,10 +163,10 @@ def pet_penman_kohler(
     ea = humidity.vapor_pressure_magnus(dp_daily)
     
     vpd      = (es - ea).clip(min=0.0)
-    delta = humidity.delta_svp(tmean_daily, constants.VAPOR_B_MAGNUS)
+    delta = humidity.delta_svp(tmean_daily, humidity.VAPOR_B_MAGNUS)
     pressure_kpa = pressure / 1000.0
-    gamma    = 0.000665 * pressure_kpa                                        
-    lambda_v = 2.501 - 0.002361 * tmean_daily                                
+    gamma    = constants.PSYCHROMETRIC_COEFFICIENT * pressure_kpa                                        
+    lambda_v = constants.LAMBDA_0 - constants.LAMBDA_T * tmean_daily                                
     rn       = rs_daily * (1.0 - albedo)                                      
     f_u      = 0.005 + 0.00085 * (wind_daily * 3.6)                          
     ea_term  = f_u * vpd
@@ -182,7 +174,7 @@ def pet_penman_kohler(
 
     pet_daily = ((delta * (rn / lambda_v) + gamma * ea_term) / (delta + gamma)).clip(min=0.0)
 
-    _, daytime_mask = radiation.clearsky_array(
+    _, daytime_mask = radiation.clearsky_radiation_ineichen(
         shortwave_hourly,
         lat=shortwave_hourly.coords["lat"].values,
         lon=shortwave_hourly.coords["lon"].values,
@@ -213,7 +205,6 @@ def pet_penman_hourly(
     dewpoint: xr.DataArray,
     wind_speed: xr.DataArray,
     pressure: xr.DataArray,
-    elevation: float = 0.0,
     albedo: float = 0.23,
 ) -> xr.DataArray:
     """Compute hourly Penman Pan Evaporation (mm/hour).
@@ -223,24 +214,22 @@ def pet_penman_hourly(
         dewpoint: Dewpoint temperature in °C.
         pressure: Atmospheric pressure in Pa.
     """
-    cn = 37.0  
-    cd = 0.24  
+    cn = FAO56_CN
+    cd = FAO56_CD_DAY
 
     net_radiation = radiation.net_radiation(shortwave_down, longwave_down, temperature, albedo)
     net_radiation_mj = net_radiation * 0.0036  
-
-    specific_humidity_val = humidity.specific_humidity(dewpoint, pressure)
 
     e_s = humidity.vapor_pressure_magnus(temperature)
     e_a = humidity.vapor_pressure_magnus(dewpoint)
 
     pressure_kpa = pressure / 1000.0
-    gamma = 0.000665 * pressure_kpa  
+    gamma = constants.PSYCHROMETRIC_COEFFICIENT * pressure_kpa  
 
-    delta = humidity.delta_svp(temperature, constants.VAPOR_B_MAGNUS)
+    delta = humidity.delta_svp(temperature, humidity.VAPOR_B_MAGNUS)
     vapor_pressure_deficit = e_s - e_a
 
-    numerator = 0.408 * delta * net_radiation_mj + gamma * (cn / (temperature + 273.0)) * wind_speed * vapor_pressure_deficit
+    numerator = constants.RECIPROCAL_LAMBDA_20C * delta * net_radiation_mj + gamma * (cn / (temperature + 273.0)) * wind_speed * vapor_pressure_deficit
     denominator = delta + gamma * (1 + cd * wind_speed)
 
     pet_hourly = numerator / denominator  
@@ -257,13 +246,7 @@ def pet_penman_monteith_hourly(
     wind_speed: xr.DataArray,
     shortwave: xr.DataArray,
     dewpoint: xr.DataArray,
-    elevation: "xr.DataArray | float",
-    cn = 37.0,    
-    cd_day = 0.24,
-    cd_night = 0.96,
-    sigma_h = 2.042e-10,  
-    humid_a = 0.34,
-    humid_b = 0.14,
+    pressure: xr.DataArray,
     albedo = 0.23
 ) -> xr.DataArray:
     """Compute hourly FAO-56 Penman-Monteith reference ET (mm/hour).
@@ -272,12 +255,14 @@ def pet_penman_monteith_hourly(
         temperature: Air temperature in °C.
         dewpoint: Dewpoint temperature in °C.
         shortwave: Incoming shortwave radiation in W/m².
-        elevation: Surface elevation in metres.
+        pressure: Surface pressure in kPa.
     """
-  
+    cn = FAO56_CN
+    cd_day = FAO56_CD_DAY
+    cd_night = FAO56_CD_NIGHT
 
     # Compute clear-sky radiation for FAO-56 Eq 39 cloudiness correction (Rs/Rso)
-    rso_xr, _ = radiation.clearsky_array(
+    rso_xr, _ = radiation.clearsky_radiation_ineichen(
         shortwave,
         lat=shortwave.coords["lat"].values,
         lon=shortwave.coords["lon"].values,
@@ -288,38 +273,38 @@ def pet_penman_monteith_hourly(
     u2 = wind_speed.values.astype(float)
     rs_wm2 = shortwave.values.astype(float)
     td = dewpoint.values.astype(float)
-    z = elevation.values.astype(float) if isinstance(elevation, xr.DataArray) else float(elevation)
     rso_wm2 = rso_xr.values.astype(float)
 
     rs = rs_wm2 * 0.0036  # W/m² → MJ/m²/hr
     rso = rso_wm2 * 0.0036  # W/m² → MJ/m²/hr
-    pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  
-    gamma = 0.000665 * pressure
+    #pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  
+    gamma = constants.PSYCHROMETRIC_COEFFICIENT * pressure
 
 
     es = humidity.vapor_pressure_magnus(t)
     ea = humidity.vapor_pressure_magnus(td)
 
-    delta = humidity.delta_svp(t, constants.VAPOR_B_MAGNUS)
+    delta = humidity.delta_svp(t, humidity.VAPOR_B_MAGNUS)
     rns = (1.0 - albedo) * rs
     
     t_k = t + 273.15
-    # FAO-56 Eq 39: cloudiness correction (1.35 * Rs/Rso - 0.35).
-    # When rso = 0 (nighttime) the ratio is undefined; use 1.0 (clear-sky
-    # assumption) so that rnl remains physically bounded.
-    # The cloudiness factor is clipped to [0.05, 1.0] to prevent physically
-    # invalid negative net longwave values when Rs/Rso < 0.259.
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rs_over_rso = np.clip(np.where(rso > 0, rs / rso, 1.0), 0.0, 1.0)
-    cloudiness_factor = np.clip(1.35 * rs_over_rso - 0.35, 0.05, 1.0)
-    rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))) * cloudiness_factor
+    # # FAO-56 Eq 39: cloudiness correction (1.35 * Rs/Rso - 0.35).
+    # # When rso = 0 (nighttime) the ratio is undefined; use 1.0 (clear-sky
+    # # assumption) so that rnl remains physically bounded.
+    # # The cloudiness factor is clipped to [0.05, 1.0] to prevent physically
+    # # invalid negative net longwave values when Rs/Rso < 0.259.
+    # with np.errstate(divide="ignore", invalid="ignore"):
+    #     rs_over_rso = np.clip(np.where(rso > 0, rs / rso, 1.0), 0.0, 1.0)
+    # cloudiness_factor = np.clip(1.35 * rs_over_rso - 0.35, 0.05, 1.0)
+    # rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))) * cloudiness_factor
+    rnl = radiation.net_longwave_brutsaert(t_k,ea,rns,rs)
 
     rn = rns - rnl
     is_daytime = rn > 0.0
     g = np.where(is_daytime, 0.1 * rn, 0.5 * rn)
     cd = np.where(is_daytime, cd_day, cd_night)
 
-    numerator = 0.408 * delta * (rn - g) + gamma * (cn / (t + 273.0)) * u2 * (es - ea)
+    numerator = constants.RECIPROCAL_LAMBDA_20C * delta * (rn - g) + gamma * (cn / (t + 273.0)) * u2 * (es - ea)
     denominator = delta + gamma * (1.0 + cd * u2)
     
     pet_pm = numerator / denominator

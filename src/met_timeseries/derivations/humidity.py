@@ -13,7 +13,7 @@ VAPOR_B_TETENS = 237.7          # Magnus coefficient B, August-Roche-Magnus (°C
 # --- Clausius-Clapeyron ---
 def delta_svp(
     temperature: xr.DataArray,
-    b: float = constants.VAPOR_B_MAGNUS,
+    b: float = VAPOR_B_MAGNUS,
 ) -> xr.DataArray:
     """
     Slope of the saturation vapor pressure curve (Δ) in kPa/°C.
@@ -28,15 +28,15 @@ def delta_svp(
     Args:
         temperature: Air temperature (°C).
         b:           Magnus B coefficient (°C). Defaults to FAO-56 (237.3).
-                     Pass constants.VAPOR_B_TETENS (237.7) for ARM variant.
+                     Pass VAPOR_B_TETENS (237.7) for ARM variant.
     """
     es = vapor_pressure_magnus(temperature, b=b)
-    return (constants.VAPOR_A_MAGNUS * b * es) / (temperature + b) ** 2
+    return (VAPOR_A_MAGNUS * b * es) / (temperature + b) ** 2
 
 def vapor_pressure_magnus(
     temperature: xr.DataArray,
-    a: float = constants.VAPOR_A_MAGNUS,
-    b: float = constants.VAPOR_B_MAGNUS,
+    a: float = VAPOR_A_MAGNUS,
+    b: float = VAPOR_B_MAGNUS,
     base: float = 0.6108,
 ) -> xr.DataArray:
     """
@@ -49,7 +49,7 @@ def vapor_pressure_magnus(
         temperature: Air or dewpoint temperature (°C).
         a:    Magnus coefficient A (default 17.27, FAO-56).
         b:    Magnus coefficient B in °C (default 237.3, FAO-56).
-              Pass constants.VAPOR_B_TETENS (237.7) for August-Roche-Magnus variant.
+              Pass VAPOR_B_TETENS (237.7) for August-Roche-Magnus variant.
         base: Vapor pressure at 0 °C in kPa (default 0.6108, FAO-56).
               Pass 0.6112 for August-Roche-Magnus variant.
     """
@@ -74,8 +74,8 @@ def vapor_pressure_mixing(
 
 def dewpoint_magnus(
     vapor_pressure: xr.DataArray,
-    a: float = constants.VAPOR_A_MAGNUS,
-    b: float = constants.VAPOR_B_TETENS,
+    a: float = VAPOR_A_MAGNUS,
+    b: float = VAPOR_B_TETENS,
     base: float = SAT_VP_0C_ARM,
 ) -> xr.DataArray:
     """
