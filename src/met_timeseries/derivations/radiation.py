@@ -75,15 +75,12 @@ def clearsky_radiation_geometric(shortwave: xr.DataArray) -> xr.DataArray:
 
 def clearsky_radiation_ineichen(
     shortwave: xr.DataArray,
-    min_solar_elevation: float = 10.0,
 ) -> xr.DataArray:
     """Build a clear-sky radiation array using the pvlib Ineichen model.
 
     Args:
         shortwave: DataArray with dims including 'time', 'lat', 'lon'.
                    Used only for its coordinates/shape as a template.
-        min_solar_elevation: Unused here; retained for API consistency with
-                             daytime_mask_solar_elevation.
 
     Returns:
         Clear-sky GHI DataArray with the same dims/coords as shortwave.
@@ -176,10 +173,10 @@ def clearsky_radiation_hww(shortwave: xr.DataArray) -> xr.DataArray:
     )
     
     Rso = 0.73 * Ra
-    Rso = Rso.broadcast_like(shortwave)
-    Rso.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
-    Rso.attrs['units'] = 'MJ/m²/day'
-    return Rso
+    Rso_broadcast = Rso.broadcast_like(shortwave)
+    Rso_broadcast.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
+    Rso_broadcast.attrs['units'] = 'MJ/m²/day'
+    return Rso_broadcast
 
 
 

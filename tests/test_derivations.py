@@ -196,6 +196,9 @@ class TestCloudCover:
         da_half = _make_da_with_time(half_cs, hour=12, lon=0.0)
         result = cloud_cover_linear(da_half)
         cc = float(result.values.flat[0])
+        # Tolerance of 0.05 accommodates minor floating-point differences between
+        # the pvlib Ineichen clear-sky value used to build half_cs and the one
+        # recomputed inside cloud_cover_linear.
         assert abs(cc - 0.5) < 0.05
 
     def test_clear_sky_gives_zero(self):
