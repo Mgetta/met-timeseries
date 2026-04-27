@@ -119,12 +119,8 @@ def pet_penman_pyet_hourly(
         wind_hourly, elevation, albedo,
     )
 
-    _, daytime_mask = radiation.clearsky_radiation_ineichen(
-        shortwave_hourly,
-        lat=shortwave_hourly.coords["lat"].values,
-        lon=shortwave_hourly.coords["lon"].values,
-        time=shortwave_hourly.coords["time"].values,
-        min_solar_elevation=min_solar_elevation,
+    daytime_mask = radiation.daytime_mask_solar_elevation(
+        shortwave_hourly, min_solar_elevation=min_solar_elevation,
     )
 
     pet_hourly = _disaggregate_daily_to_hourly_solar(
@@ -174,12 +170,8 @@ def pet_penman_kohler(
 
     pet_daily = ((delta * (rn / lambda_v) + gamma * ea_term) / (delta + gamma)).clip(min=0.0)
 
-    _, daytime_mask = radiation.clearsky_radiation_ineichen(
-        shortwave_hourly,
-        lat=shortwave_hourly.coords["lat"].values,
-        lon=shortwave_hourly.coords["lon"].values,
-        time=shortwave_hourly.coords["time"].values,
-        min_solar_elevation=min_solar_elevation,
+    daytime_mask = radiation.daytime_mask_solar_elevation(
+        shortwave_hourly, min_solar_elevation=min_solar_elevation,
     )
 
     pet_hourly = _disaggregate_daily_to_hourly_solar(
@@ -262,12 +254,7 @@ def pet_penman_monteith_hourly(
     cd_night = FAO56_CD_NIGHT
 
     # Compute clear-sky radiation for FAO-56 Eq 39 cloudiness correction (Rs/Rso)
-    rso_xr, _ = radiation.clearsky_radiation_ineichen(
-        shortwave,
-        lat=shortwave.coords["lat"].values,
-        lon=shortwave.coords["lon"].values,
-        time=shortwave.coords["time"].values,
-    )
+    rso_xr = radiation.clearsky_radiation_ineichen(shortwave)
     
     t = temperature.values.astype(float)
     u2 = wind_speed.values.astype(float)
