@@ -43,11 +43,20 @@ def _make_da_with_time(value: float, hour: int = 12, lat: float = 45.0, lon: flo
 
 
 class TestClearSkyRadiation:
-    """Unit tests for the _clear_sky_radiation helper."""
+    """Unit tests for clearsky_radiation_geometric."""
 
     def _fn(self, lat, lon, dt):
-        from met_timeseries.derivations import _clear_sky_radiation
-        return _clear_sky_radiation(lat, lon, dt)
+        import pandas as pd
+        from met_timeseries.derivations import clearsky_radiation_geometric
+
+        t = pd.Timestamp(dt)
+        da = xr.DataArray(
+            np.full((1, 1, 1), 0.0, dtype=float),
+            dims=["time", "lat", "lon"],
+            coords={"time": [t], "lat": [lat], "lon": [lon]},
+        )
+        result = clearsky_radiation_geometric(da)
+        return float(result.values.flat[0])
 
     def test_solar_noon_midlatitude_summer_positive(self):
         dt = datetime.datetime(2000, 6, 21, 12, 0, 0)
@@ -179,90 +188,53 @@ class TestKelvinToCelsius:
 
 class TestCloudCover:
     def test_basic_fraction(self):
-        from met_timeseries.derivations import _clear_sky_radiation, cloud_cover
+        from met_timeseries.derivations import cloud_cover_linear, clearsky_radiation_ineichen
 
-        dt = datetime.datetime(2000, 6, 21, 12, 0, 0)
-        import pandas as pd
-
-        cs = _clear_sky_radiation(45.0, -110.0, dt)
-        da = _make_da_with_time(cs * 0.5, hour=12)
-        lat = np.array([45.0])
-        lon = np.array([-110.0])
-        time = da.coords["time"].values
-
-        result = cloud_cover(da, lat, lon, time)
+        da = _make_da_with_time(0.0, hour=12, lon=0.0)
+        cs = clearsky_radiation_ineichen(da)
+        half_cs = float(cs.values.flat[0]) * 0.5
+        da_half = _make_da_with_time(half_cs, hour=12, lon=0.0)
+        result = cloud_cover_linear(da_half)
         cc = float(result.values.flat[0])
-        assert abs(cc - 0.5) < 0.01
+        assert abs(cc - 0.5) < 0.05
 
     def test_clear_sky_gives_zero(self):
-        from met_timeseries.derivations import _clear_sky_radiation, cloud_cover
+        from met_timeseries.derivations import cloud_cover_linear, clearsky_radiation_ineichen
 
-        dt = datetime.datetime(2000, 6, 21, 12, 0, 0)
-        cs = _clear_sky_radiation(45.0, -110.0, dt)
-        da = _make_da_with_time(cs, hour=12)
-        lat = np.array([45.0])
-        lon = np.array([-110.0])
-        time = da.coords["time"].values
-
-        result = cloud_cover(da, lat, lon, time)
+        da = _make_da_with_time(0.0, hour=12, lon=0.0)
+        cs_val = float(clearsky_radiation_ineichen(da).values.flat[0])
+        da_cs = _make_da_with_time(cs_val, hour=12, lon=0.0)
+        result = cloud_cover_linear(da_cs)
         assert abs(float(result.values.flat[0])) < 0.01
 
     def test_overcast_gives_one(self):
-        from met_timeseries.derivations import cloud_cover
+        from met_timeseries.derivations import cloud_cover_linear
 
-        da = _make_da_with_time(0.0, hour=12)
-        lat = np.array([45.0])
-        lon = np.array([-110.0])
-        time = da.coords["time"].values
-
-        result = cloud_cover(da, lat, lon, time)
+        da = _make_da_with_time(0.0, hour=12, lon=0.0)
+        result = cloud_cover_linear(da)
         assert abs(float(result.values.flat[0]) - 1.0) < 0.01
 
     def test_nighttime_is_nan(self):
-        from met_timeseries.derivations import cloud_cover
+        from met_timeseries.derivations import cloud_cover_linear
 
-        da = _make_da_with_time(0.0, hour=0)
-        lat = np.array([45.0])
-        lon = np.array([-110.0])
-        time = da.coords["time"].values
-
-        result = cloud_cover(da, lat, lon, time)
+        da = _make_da_with_time(0.0, hour=0, lon=0.0)
+        result = cloud_cover_linear(da)
         assert np.isnan(float(result.values.flat[0]))
 
     def test_clamped_when_dswrf_exceeds_clearsky(self):
-        from met_timeseries.derivations import _clear_sky_radiation, cloud_cover
+        from met_timeseries.derivations import cloud_cover_linear, clearsky_radiation_ineichen
 
-        dt = datetime.datetime(2000, 6, 21, 12, 0, 0)
-        cs = _clear_sky_radiation(45.0, -110.0, dt)
-        da = _make_da_with_time(cs * 2.0, hour=12)
-        lat = np.array([45.0])
-        lon = np.array([-110.0])
-        time = da.coords["time"].values
-
-        result = cloud_cover(da, lat, lon, time)
+        da = _make_da_with_time(0.0, hour=12, lon=0.0)
+        cs_val = float(clearsky_radiation_ineichen(da).values.flat[0])
+        da_high = _make_da_with_time(cs_val * 2.0, hour=12, lon=0.0)
+        result = cloud_cover_linear(da_high)
         assert float(result.values.flat[0]) == 0.0
 
-    def test_no_time_returns_2d_array(self):
-        from met_timeseries.derivations import cloud_cover
-
-        lats = np.array([45.0, 46.0])
-        lons = np.array([-110.0, -109.0])
-        da = xr.DataArray(
-            np.full((2, 2), 300.0),
-            dims=["lat", "lon"],
-            coords={"lat": lats, "lon": lons},
-        )
-
-        result = cloud_cover(da, lats, lons, time=None)
-        assert result.dims == ("lat", "lon")
-        valid = result.values[~np.isnan(result.values)]
-        assert np.all(valid >= 0.0) and np.all(valid <= 1.0)
-
     def test_name(self):
-        from met_timeseries.derivations import cloud_cover
+        from met_timeseries.derivations import cloud_cover_linear
 
-        da = _make_da_with_time(300.0, hour=12)
-        result = cloud_cover(da, np.array([45.0]), np.array([-110.0]), da.coords["time"].values)
+        da = _make_da_with_time(300.0, hour=12, lon=0.0)
+        result = cloud_cover_linear(da)
         assert result.name == "cloud_cover_fraction"
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime
 import pandas as pd
 import numpy as np
 import xarray as xr
@@ -39,74 +38,127 @@ def net_radiation(
     net_radiation = (shortwave_down - shortwave_up) + (longwave_down - longwave_up)
     return net_radiation.rename("net_radiation")
 
-def clearsky_radiation_geometric(lat: float, lon: float, dt: datetime.datetime) -> float:
-    """Compute theoretical clear-sky surface shortwave radiation (W/m²)."""
-      
+def clearsky_radiation_geometric(shortwave: xr.DataArray) -> xr.DataArray:
+    """Compute theoretical clear-sky surface shortwave radiation (W/m²).
 
-    n = dt.timetuple().tm_yday  
-    dec_deg = 23.45 * np.sin(np.radians(360.0 / 365.0 * (284 + n)))
-    dec_rad = np.radians(dec_deg)
+    Args:
+        shortwave: DataArray with dims including 'time', 'lat', 'lon'.
+                   Used only for its coordinates/shape as a template.
 
-    hour = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
-    omega_rad = np.radians(15.0 * (hour - 12.0))
-    lat_rad = np.radians(lat)
+    Returns:
+        DataArray of the same shape as shortwave with clear-sky radiation values.
+    """
+    lat_vals = shortwave.coords["lat"].values
+    times = pd.DatetimeIndex(shortwave.coords["time"].values)
 
-    cos_zenith = (
-        np.sin(lat_rad) * np.sin(dec_rad)
-        + np.cos(lat_rad) * np.cos(dec_rad) * np.cos(omega_rad)
-    )
+    clearsky_values = np.zeros(shortwave.shape, dtype=float)
 
-    if cos_zenith <= 0.0:
-        return 0.0
+    for t_idx, dt in enumerate(times):
+        n = dt.timetuple().tm_yday
+        dec_deg = 23.45 * np.sin(np.radians(360.0 / 365.0 * (284 + n)))
+        dec_rad = np.radians(dec_deg)
 
-    return float(SOLAR_CONSTANT_W_M2 * cos_zenith * CLEARSKY_TRANSMITTANCE)
+        hour = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
+        omega_rad = np.radians(15.0 * (hour - 12.0))
+        lat_rad = np.radians(lat_vals)
+
+        cos_zenith = (
+            np.sin(lat_rad) * np.sin(dec_rad)
+            + np.cos(lat_rad) * np.cos(dec_rad) * np.cos(omega_rad)
+        )
+        cos_zenith = np.maximum(cos_zenith, 0.0)  # shape (Nlat,)
+
+        cs_at_time = SOLAR_CONSTANT * cos_zenith * CLEARSKY_TRANSMITTANCE  # (Nlat,)
+        clearsky_values[t_idx, :, :] = cs_at_time[:, np.newaxis]
+
+    return xr.DataArray(clearsky_values, dims=shortwave.dims, coords=shortwave.coords)
 
 def clearsky_radiation_ineichen(
     shortwave: xr.DataArray,
-    lat: xr.DataArray | np.ndarray,
-    lon: xr.DataArray | np.ndarray,
-    time: xr.DataArray | np.ndarray | None = None,
     min_solar_elevation: float = 10.0,
-) -> tuple[xr.DataArray, xr.DataArray]:
-    """Build clear-sky radiation and daytime mask arrays using pvlib."""
-    lat_vals = np.asarray(lat)
-    lon_vals = np.asarray(lon)
+) -> xr.DataArray:
+    """Build a clear-sky radiation array using the pvlib Ineichen model.
 
-    if time is not None:
-        times = pd.DatetimeIndex(np.asarray(time))
-    else:
-        times = pd.DatetimeIndex([datetime.datetime(2000, 7, 1, 12, 0, 0)])
+    Args:
+        shortwave: DataArray with dims including 'time', 'lat', 'lon'.
+                   Used only for its coordinates/shape as a template.
+        min_solar_elevation: Unused here; retained for API consistency with
+                             daytime_mask_solar_elevation.
+
+    Returns:
+        Clear-sky GHI DataArray with the same dims/coords as shortwave.
+    """
+    lat_vals = shortwave.coords["lat"].values
+    lon_vals = shortwave.coords["lon"].values
+    times = pd.DatetimeIndex(shortwave.coords["time"].values)
 
     clearsky_values = np.full(shortwave.shape, np.nan, dtype=float)
+
+    n_lat = len(lat_vals)
+    n_lon = len(lon_vals)
+
+    for idx in range(n_lat * n_lon):
+        i, j = np.unravel_index(idx, (n_lat, n_lon))
+        la, lo = lat_vals[i], lon_vals[j]
+        loc = pvlib.location.Location(latitude=la, longitude=lo)
+        solpos = loc.get_solarposition(times)
+        cs = loc.get_clearsky(times, model="ineichen", solar_position=solpos)
+        clearsky_values[:, i, j] = cs["ghi"].values
+
+    return xr.DataArray(clearsky_values, dims=shortwave.dims, coords=shortwave.coords)
+
+
+def daytime_mask_solar_elevation(
+    shortwave: xr.DataArray,
+    min_solar_elevation: float = 10.0,
+) -> xr.DataArray:
+    """Return a boolean DataArray that is True during daytime hours.
+
+    Daytime is defined as times when the apparent solar elevation exceeds
+    `min_solar_elevation` degrees, computed via pvlib for each grid point.
+
+    Args:
+        shortwave: DataArray with dims including 'time', 'lat', 'lon'.
+                   Used only for its coordinates/shape as a template.
+        min_solar_elevation: Minimum apparent solar elevation angle (degrees)
+                             above which a timestep is considered daytime.
+
+    Returns:
+        Boolean DataArray with the same dims/coords as shortwave.
+    """
+    lat_vals = shortwave.coords["lat"].values
+    lon_vals = shortwave.coords["lon"].values
+    times = pd.DatetimeIndex(shortwave.coords["time"].values)
+
     elevation_values = np.full(shortwave.shape, np.nan, dtype=float)
 
-    time_axis = shortwave.dims.index("time") if "time" in shortwave.dims else None
+    n_lat = len(lat_vals)
+    n_lon = len(lon_vals)
 
-    for i, la in enumerate(lat_vals):
-        for j, lo in enumerate(lon_vals):
-            loc = pvlib.location.Location(latitude=la, longitude=lo)
-            solpos = loc.get_solarposition(times)
-            cs = loc.get_clearsky(times, model="ineichen", solar_position=solpos)
+    for idx in range(n_lat * n_lon):
+        i, j = np.unravel_index(idx, (n_lat, n_lon))
+        la, lo = lat_vals[i], lon_vals[j]
+        loc = pvlib.location.Location(latitude=la, longitude=lo)
+        solpos = loc.get_solarposition(times)
+        elevation_values[:, i, j] = solpos["apparent_elevation"].values
 
-            if time_axis is not None:
-                clearsky_values[:, i, j] = cs["ghi"].values
-                elevation_values[:, i, j] = solpos["apparent_elevation"].values
-            else:
-                clearsky_values[i, j] = cs["ghi"].iloc[0]
-                elevation_values[i, j] = solpos["apparent_elevation"].iloc[0]    
-     
-    clearsky = xr.DataArray(clearsky_values, dims=shortwave.dims, coords=shortwave.coords)
     elevation = xr.DataArray(elevation_values, dims=shortwave.dims, coords=shortwave.coords)
-
-    daytime_mask = elevation >= min_solar_elevation
-    return clearsky, daytime_mask
+    return elevation >= min_solar_elevation
 
 
-def clearsky_radiation_hww(
-    day_of_year: xr.DataArray,
-    latitude: xr.DataArray
-) -> xr.DataArray:
-    """Computes daily clear-sky solar radiation approximating Hamon, Weiss, Wilson (1954)."""
+def clearsky_radiation_hww(shortwave: xr.DataArray) -> xr.DataArray:
+    """Computes daily clear-sky solar radiation approximating Hamon, Weiss, Wilson (1954).
+
+    Args:
+        shortwave: DataArray with dims including 'time' and 'lat'.
+                   Used only for its coordinates/shape as a template.
+
+    Returns:
+        DataArray of clear-sky radiation (MJ/m²/day) broadcast to the same
+        dims/coords as shortwave.
+    """
+    day_of_year = shortwave.coords["time"].dt.dayofyear
+    latitude = shortwave.coords["lat"]
     phi = np.radians(latitude)
     theta = 2.0 * np.pi * day_of_year / 365.0
     delta = 0.006918 - 0.399912 * np.cos(theta) + 0.070257 * np.sin(theta) \
@@ -124,6 +176,7 @@ def clearsky_radiation_hww(
     )
     
     Rso = 0.73 * Ra
+    Rso = Rso.broadcast_like(shortwave)
     Rso.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
     Rso.attrs['units'] = 'MJ/m²/day'
     return Rso
@@ -136,16 +189,12 @@ def clearsky_radiation_hww(
 
 def cloud_cover_davis(
     shortwave: xr.DataArray,
-    lat: xr.DataArray | np.ndarray,
-    lon: xr.DataArray | np.ndarray,
-    time: xr.DataArray | np.ndarray | None = None,
     k: float = 0.65,
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using the Davis (1975) method."""
-    clearsky, daytime_mask = clearsky_radiation_ineichen(
-        shortwave, lat, lon, time, min_solar_elevation=min_clearsky
-    )
+    clearsky = clearsky_radiation_ineichen(shortwave)
+    daytime_mask = daytime_mask_solar_elevation(shortwave, min_solar_elevation=min_clearsky)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         clearness_index = (shortwave / clearsky).clip(0.0, 1.0)
@@ -173,16 +222,12 @@ def sky_cover_radiation_thompson(
 
 def cloud_cover_thompson(
     shortwave: xr.DataArray,
-    lat: xr.DataArray | np.ndarray,
-    lon: xr.DataArray | np.ndarray,
-    time: xr.DataArray | np.ndarray | None = None,
     min_solar_elevation: float = 10.0,
     coeffs: tuple[float, float, float] | None = None,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using Thompson's (1976) parabolic method."""
-    clearsky, daytime_mask = clearsky_radiation_geometric(
-        shortwave, lat, lon, time, min_solar_elevation,
-    )
+    clearsky = clearsky_radiation_ineichen(shortwave)
+    daytime_mask = daytime_mask_solar_elevation(shortwave, min_solar_elevation)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         kt = (shortwave / clearsky).clip(0.0, 1.0)
@@ -198,15 +243,11 @@ def cloud_cover_thompson(
 
 def cloud_cover_linear(
     shortwave: xr.DataArray,
-    lat: xr.DataArray | np.ndarray,
-    lon: xr.DataArray | np.ndarray,
-    time: xr.DataArray | np.ndarray | None = None,
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction (linear method)."""
-    clearsky, daytime_mask = clearsky_radiation_ineichen(
-        shortwave, lat, lon, time, min_solar_elevation=min_clearsky
-    )
+    clearsky = clearsky_radiation_ineichen(shortwave)
+    daytime_mask = daytime_mask_solar_elevation(shortwave, min_solar_elevation=min_clearsky)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         cc = 1.0 - shortwave / clearsky
