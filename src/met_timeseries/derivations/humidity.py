@@ -10,6 +10,7 @@ VAPOR_A_MAGNUS = 17.27          # Magnus coefficient A (dimensionless)
 VAPOR_B_MAGNUS = 237.3          # Magnus coefficient B, FAO-56 (°C)
 VAPOR_B_TETENS = 237.7          # Magnus coefficient B, August-Roche-Magnus (°C)
 
+# --- Clausius-Clapeyron ---
 def delta_svp(
     temperature: xr.DataArray,
     b: float = constants.VAPOR_B_MAGNUS,
@@ -75,7 +76,7 @@ def dewpoint_magnus(
     vapor_pressure: xr.DataArray,
     a: float = constants.VAPOR_A_MAGNUS,
     b: float = constants.VAPOR_B_TETENS,
-    base: float = 0.6112,
+    base: float = SAT_VP_0C_ARM,
 ) -> xr.DataArray:
     """
     Invert the Magnus formula to recover dewpoint temperature (°C) from

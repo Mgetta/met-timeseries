@@ -607,4 +607,63 @@ def disaggregate_dewpoint_constant(daily_dewpoint: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 
+def disaggregate_pevt(pevt_daily: xr.DataArray, method: str = "diurnal") -> xr.DataArray:
+    """
+    Downscale daily PEVT into hourly values.
 
+    Parameters:
+    - pevt_daily (xr.DataArray): Daily Potential Evapotranspiration (PEVT) values.
+        Must have 'time' coordinates in daily resolution with units (mm/day).
+    - method (str): Method used for disaggregation. Options are:
+        - "diurnal" (default): Weight based on diurnal variability curve.
+        - "static": Uniform hourly distribution.
+
+    Returns:
+    - xr.DataArray: Hourly PEVT values (mm/hour), aligned with expanded coordinates.
+
+    Notes:
+    - Input is assumed to be daily resolution with units of mm/day.
+    - Output is hourly resolution with units converted to mm/hour.
+    - The diurnal method uses weights informed by typical evapotranspiration patterns.
+    
+    References:
+    - Allen et al., 1998. Crop Evapotranspiration: Guidelines for Computing Crop Water Requirements (FAO-56).
+    """
+    if "time" not in pevt_daily.coords:
+        raise ValueError("Input DataArray must contain 'time' coordinates.")
+
+    if pevt_daily.resample(time="1D").count().size != pevt_daily.time.size:
+        raise ValueError("Input data should be daily; check the time resolution.")
+
+    if method == "static":
+        # Static disaggregation: evenly spread mm/day across 24 hours
+        hourly_values = pevt_daily / 24.0
+        pevt_hourly = hourly_values.resample(time="1H").ffill()
+
+    elif method == "diurnal":
+        # Diurnal Dynamic Disaggregation
+        diurnal_weights = np.array([
+            0.05, 0.05, 0.03, 0.03, 0.02, 0.03,  # Midnight-06:00
+            0.05, 0.10, 0.15, 0.20, 0.15, 0.10,  # 06:00-Noon
+            0.08, 0.07, 0.05, 0.03, 0.02, 0.03,  # Noon-18:00
+            0.03, 0.05, 0.07, 0.08, 0.05, 0.05   # 18:00-Midnight
+        ])
+        diurnal_weights /= diurnal_weights.sum()  # Normalize weights
+        scale_factor = pevt_daily / diurnal_weights.sum()
+
+        # Expand weights across time range
+        pevt_hourly = (
+            pevt_daily.resample(time="1H").ffill() * scale_factor
+        )
+
+    else:
+        raise ValueError(f"Unknown method: '{method}'. Choose 'static' or 'diurnal'.")
+
+    # Add metadata
+    pevt_hourly.attrs["units"] = "mm/hour"
+    pevt_hourly.attrs["description"] = (
+        f"Potential Evapotranspiration (PEVT) downscaled to hourly using"
+        f"the '{method}' method."
+    )
+
+    return pevt_hourly
