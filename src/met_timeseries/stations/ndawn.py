@@ -110,12 +110,69 @@ _METADATA_COLS = ['Station Name',
 _COORD_COLS = ['Latitude', 'Longitude',
                'time']
 
+# https://ndawn.ndsu.nodak.edu/table.csv?station=95&
+# variable=ddmxt&
+# variable=ddmxtt&
+# variable=ddmnt&
+# variable=ddmntt&
+# variable=ddavt&
+# variable=dddtr&
+# variable=ddbst&
+# variable=ddtst&
+# variable=ddws&
+# variable=ddmxws&
+# variable=ddmxwst&
+# variable=ddwd&
+# variable=ddwdsd&
+# variable=ddsr&
+# variable=ddtpetp&
+# variable=ddtpetjh&variable=ddr&variable=dddp&variable=ddwc&variable=ddmnwc&variable=ddmxt9&variable=ddmxtt9&variable=ddmnt9&variable=ddmntt9&variable=ddmxws10&variable=ddmxwst10&variable=ddwd10&variable=ddwdsd10&dfy=&year=2026&ttype=daily&quick_pick=&begin_date=2026-04-25&end_date=2026-04-25
+DAILY_VARIABLE_MAP = {
+    'ddmxt': 'Max Air Temp',               
+    'ddmxtt': 'Max Air Temp Time',
+    'ddmnt': 'Min Air Temp', 
+    'ddmntt': 'Min Air Temp Time',
+    'ddavt': 'Avg Air Temp', 
+    'dddtr': 'Diurnal Temp Range',
+    'ddbst': 'Avg Bare Soil Temp',
+    'ddtst': 'Avg Turf Soil Temp', 
+    'ddws': 'Avg Wind Speed',
+    'ddmxws': 'Max Wind Speed',
+    'ddmxwst': 'Max Wind Speed Time',
+    'ddwd': 'Avg Wind Dir', 
+    'ddwdsd': 'Avg Wind Dir SD', 
+    'ddsr': 'Total Solar Rad',
+    'ddtpetp': 'PET Penman Daily',
+    'ddtpetjh': 'PET Penman Monteith Daily',
+    'ddr':  'Total Rainfall', 
+    'dddp':  'Avg Baro Press', 
+    'ddwc':  'Avg Wind Chill', 
+    'ddmnwc':  "Min Wind Chill",
+    'ddmxt9':  "Max Air Temp at 9 m",
+    'ddmxtt9': "Max Air Temp at 9 m Time",
+    'ddmnt9':  "Min Air Temp at 9 m", 
+    'ddmntt9': "Min Air Temp at 9 m Time",
+    'ddmxws10': "Max Wind Speed at 10 m",
+    'ddmxwst10': "Max Wind Speed at 10 m Time", 
+    'ddwd10': "Avg Wind Dir at 10 m",
+    'ddwdsd10': "Avg Wind Dir SD at 10 m"
+}
+
 def _to_xarray_dataset(
-    df: pd.DataFrame, 
+    df: pd.DataFrame,
+    tstep: str
 ) -> xr.Dataset:
     """
     Convert a DataFrame to an xarray Dataset with programmatic names and rich metadata.
     """
+
+    if tstep == 'daily':
+        variable_map = DAILY_VARIABLE_MAP
+    elif tstep == 'hourly':
+        variable_map = HOURLY_VARIABLE_MAP
+    else:
+        raise ValueError(f"Unknown time step '{tstep}'. Use 'daily' or 'hourly'.")
+
     # 1. Create a copy and ensure time is a datetime objects
     df = df.copy()
     if 'time' in df.columns:
@@ -128,18 +185,18 @@ def _to_xarray_dataset(
     df = df.set_index(_COORD_COLS)
     metadata = {col: df[col].iloc[0] for col in _METADATA_COLS}
     # Filter DF to only include variables we care about
-    valid_cols = [c for c in df.columns if c in HOURLY_VARIABLE_MAP.values()]
+    valid_cols = [c for c in df.columns if c in variable_map.values()]
     df = df[valid_cols]
     #map df columns to short name
-    rename_map = {v: k for k, v in HOURLY_VARIABLE_MAP.items()}
+    rename_map = {v: k for k, v in variable_map.items() }
     df = df.rename(columns=rename_map)
     ds = df.to_xarray()
 
     # 4. Attach Long Names/Descriptions to individual variables
     for var_name in ds.data_vars:
-        if var_name in HOURLY_VARIABLE_MAP:
-            ds[var_name].attrs['long_name'] = HOURLY_VARIABLE_MAP[var_name]
-            # You can also add standard units here if you have a map for them
+        if var_name in variable_map:
+            ds[var_name].attrs['long_name'] = variable_map[var_name]
+            # TODO: standard units here if you have a map for them
             # ds[var_name].attrs['units'] = 'degC' 
 
     # 6. Global Metadata Attributes
@@ -188,7 +245,51 @@ def get_stations() -> gpd.GeoDataFrame:
     return pd.DataFrame(stations)
 
 
-def get_station_data(station_id, variables = None, begin_year = 1996, end_year = 2026, as_dataset = True):
+def get_station_data_daily(station_id,variables = None, begin_year = 1996, end_year = 2026, as_dataset = True):
+    """
+    Downloads daily weather data from NDAWN.
+    
+    Args:
+        station_id (str/int): The internal ID for the station (e.g., 115).
+        variables (list): List of variable codes (e.g., ['ddmxt', 'ddr']).
+        begin_year (int): Start year (e.g., 1996).
+        end_year (int): End year (e.g., 2026).
+    """
+    if variables is None:
+        variables = list(DAILY_VARIABLE_MAP.keys())
+
+    begin_date = f"{begin_year}-01-01"
+    end_date = f"{end_year}-12-31"
+    # Setting up the dictionary for URL arguments
+    # Note: Using a list for 'variable' allows 'requests' to repeat 
+    # the key in the URL (e.g., &variable=ddmxt&variable=ddr)
+    params = {
+        'station': station_id,
+        'variable': variables,
+        'ttype': 'daily',
+        'quick_pick': '',
+        'begin_date': begin_date,
+        'end_date': end_date
+    }
+
+    print(f"Downloading data for station {station_id}...")
+    response = requests.get(_BASE_URL, params=params)
+    
+    # Raise an exception for bad status codes (404, 500, etc.)
+    response.raise_for_status()
+    
+    lines = response.text.splitlines()
+    
+    df = pd.read_csv(StringIO("\n".join(lines[_TABLE_START_LINE:])), skiprows=[1])
+    
+    df['time'] = pd.to_datetime(df[['Year', 'Month', 'Day']])
+    
+    if as_dataset:
+        df = _to_xarray_dataset(df,'daily')
+    
+    return df
+
+def get_station_data_hourly(station_id, variables = None, begin_year = 1996, end_year = 2026, as_dataset = True):
     """
     Downloads weather data from NDAWN.
     
@@ -242,7 +343,7 @@ def get_station_data(station_id, variables = None, begin_year = 1996, end_year =
     df['time'] = pd.to_datetime(df[['Year', 'Month', 'Day', 'Hour']])
     
     if as_dataset:
-        df = _to_xarray_dataset(df)
+        df = _to_xarray_dataset(df,'hourly')
     
     return df
 
