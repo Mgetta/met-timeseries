@@ -38,20 +38,20 @@ def net_radiation(
     net_radiation = (shortwave_down - shortwave_up) + (longwave_down - longwave_up)
     return net_radiation.rename("net_radiation")
 
-def clearsky_radiation_geometric(shortwave: xr.DataArray) -> xr.DataArray:
+def clearsky_radiation_geometric(datarray: xr.DataArray) -> xr.DataArray:
     """Compute theoretical clear-sky surface shortwave radiation (W/m²).
 
     Args:
-        shortwave: DataArray with dims including 'time', 'lat', 'lon'.
+        shortwave: datarray with dims including 'time', 'lat', 'lon'.
                    Used only for its coordinates/shape as a template.
 
     Returns:
-        DataArray of the same shape as shortwave with clear-sky radiation values.
+        datarray of the same shape as shortwave with clear-sky radiation values.
     """
-    lat_vals = shortwave.coords["lat"].values
-    times = pd.DatetimeIndex(shortwave.coords["time"].values)
+    lat_vals = datarray.coords["lat"].values
+    times = pd.DatetimeIndex(datarray.coords["time"].values)
 
-    clearsky_values = np.zeros(shortwave.shape, dtype=float)
+    clearsky_values = np.zeros(datarray.shape, dtype=float)
 
     for t_idx, dt in enumerate(times):
         n = dt.timetuple().tm_yday
@@ -71,7 +71,7 @@ def clearsky_radiation_geometric(shortwave: xr.DataArray) -> xr.DataArray:
         cs_at_time = SOLAR_CONSTANT * cos_zenith * CLEARSKY_TRANSMITTANCE  # (Nlat,)
         clearsky_values[t_idx, :, :] = cs_at_time[:, np.newaxis]
 
-    return xr.DataArray(clearsky_values, dims=shortwave.dims, coords=shortwave.coords)
+    return xr.DataArray(clearsky_values, dims=datarray.dims, coords=shortwave.coords)
 
 def clearsky_radiation_ineichen(
     shortwave: xr.DataArray,
@@ -143,19 +143,19 @@ def daytime_mask_solar_elevation(
     return elevation >= min_solar_elevation
 
 
-def clearsky_radiation_hww(shortwave: xr.DataArray) -> xr.DataArray:
+def clearsky_radiation_hww(datarray: xr.DataArray) -> xr.DataArray:
     """Computes daily clear-sky solar radiation approximating Hamon, Weiss, Wilson (1954).
 
     Args:
-        shortwave: DataArray with dims including 'time' and 'lat'.
+        datarray: DataArray with dims including 'time' and 'lat'.
                    Used only for its coordinates/shape as a template.
 
     Returns:
         DataArray of clear-sky radiation (MJ/m²/day) broadcast to the same
         dims/coords as shortwave.
     """
-    day_of_year = shortwave.coords["time"].dt.dayofyear
-    latitude = shortwave.coords["lat"]
+    day_of_year = datarray.coords["time"].dt.dayofyear
+    latitude = datarray.coords["lat"]
     phi = np.radians(latitude)
     theta = 2.0 * np.pi * day_of_year / 365.0
     delta = 0.006918 - 0.399912 * np.cos(theta) + 0.070257 * np.sin(theta) \
@@ -311,7 +311,7 @@ def net_longwave_brutsaert(
         * (humid_a - humid_b * np.sqrt(vapor_pressure.clip(min=0.0)))
         * rs_rso
     )
-    return rnl.rename("net_longwave_brutsaert")
+    return rnl # .rename("net_longwave_brutsaert")
 
 
 def net_radiation_arm(

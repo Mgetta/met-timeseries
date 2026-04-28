@@ -260,12 +260,10 @@ def pet_penman_monteith_hourly(
     u2 = wind_speed.values.astype(float)
     rs_wm2 = shortwave.values.astype(float)
     td = dewpoint.values.astype(float)
-    rso_wm2 = rso_xr.values.astype(float)
 
     rs = rs_wm2 * 0.0036  # W/m² → MJ/m²/hr
-    rso = rso_wm2 * 0.0036  # W/m² → MJ/m²/hr
     #pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  
-    gamma = constants.PSYCHROMETRIC_COEFFICIENT * pressure
+    gamma = constants.PSYCHROMETRIC_COEFFICIENT * pressure / 10
 
 
     es = humidity.vapor_pressure_magnus(t)
@@ -274,7 +272,6 @@ def pet_penman_monteith_hourly(
     delta = humidity.delta_svp(t, humidity.VAPOR_B_MAGNUS)
     rns = (1.0 - albedo) * rs
     
-    t_k = t + 273.15
     # # FAO-56 Eq 39: cloudiness correction (1.35 * Rs/Rso - 0.35).
     # # When rso = 0 (nighttime) the ratio is undefined; use 1.0 (clear-sky
     # # assumption) so that rnl remains physically bounded.
@@ -284,8 +281,11 @@ def pet_penman_monteith_hourly(
     #     rs_over_rso = np.clip(np.where(rso > 0, rs / rso, 1.0), 0.0, 1.0)
     # cloudiness_factor = np.clip(1.35 * rs_over_rso - 0.35, 0.05, 1.0)
     # rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))) * cloudiness_factor
-    rnl = radiation.net_longwave_brutsaert(t_k,ea,rns,rs)
+    rnl = radiation.net_longwave_brutsaert(t, ea, 
+                                        clearsky_shortwave=rso_xr,  # clearsky
+                                        shortwave_down=shortwave)    # observed
 
+    rnl = rnl* 0.0036  # W/m² → MJ/m²/hr
     rn = rns - rnl
     is_daytime = rn > 0.0
     g = np.where(is_daytime, 0.1 * rn, 0.5 * rn)
