@@ -9,6 +9,37 @@ SAT_VP_0C_ARM = 0.6112          # Saturation VP at 0 °C, ARM base (kPa)
 VAPOR_A_MAGNUS = 17.27          # Magnus coefficient A (dimensionless)
 VAPOR_B_MAGNUS = 237.3          # Magnus coefficient B, FAO-56 (°C)
 VAPOR_B_TETENS = 237.7          # Magnus coefficient B, August-Roche-Magnus (°C)
+LAMBDA_0 = 2.501                      # Latent heat of vaporisation at 0 °C (MJ/kg)
+LAMBDA_T = 0.002361                   # Temperature correction for λ (MJ/kg/°C)
+RECIPROCAL_LAMBDA_20C = 0.408         # 1/λ at ~20 °C, FAO-56 shorthand (kg/MJ)
+PSYCHROMETRIC_COEFFICIENT = 0.000665  # γ = cp / (λ·ε) (kPa/°C per kPa pressure)
+
+def latent_heat_linear(temperature: xr.DataArray):
+    """
+    Dynamically calculate the latent heat of vaporization using a linear approximation
+    
+    Args:
+        temperature: Air temperature (°C).
+    """
+    return LAMBDA_0 - LAMBDA_T * temperature
+
+def psychrometric_constant_dynamic(
+    pressure_kpa: xr.DataArray, 
+    latent_heat_mj_kg: xr.DataArray
+) -> xr.DataArray:
+    """
+    Compute the physical psychrometric constant (kPa/°C) using dynamic latent heat.
+    
+    Args:
+        pressure_kpa: Atmospheric pressure in kPa.
+        latent_heat_mj_kg: Dynamic latent heat of vaporization in MJ/kg.
+        
+    Returns:
+        xr.DataArray: Psychrometric constant (gamma).
+    """
+    # 0.00163 is the specific heat of moist air divided by the ratio of molecular weights (cp / epsilon)
+    return (0.00163 * pressure_kpa) / latent_heat_mj_kg
+
 
 # --- Clausius-Clapeyron ---
 def delta_svp(
@@ -32,6 +63,23 @@ def delta_svp(
     """
     es = vapor_pressure_magnus(temperature, b=b)
     return (VAPOR_A_MAGNUS * b * es) / (temperature + b) ** 2
+
+
+def vapor_pressure_lamoreux(temperature_f: xr.DataArray) -> xr.DataArray:
+    """
+    Calculate vapor pressure in kPa using the Lamoreux empirical method.
+    Handles internal unit conversions from C to F, and inHg to kPa.
+
+    Args:
+        temperature_c: Air or dewpoint temperature in °F.
+        
+    Returns:
+        xr.DataArray: Vapor pressure in inHg.
+    """
+
+    #legacy empirical formula (outputs inHg)
+    vp_inhg = 6413252.0 * np.exp(-7482.6 / (temperature_f + 398.36))
+    return vp_inhg
 
 def vapor_pressure_magnus(
     temperature: xr.DataArray,

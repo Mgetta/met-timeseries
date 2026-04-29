@@ -12,6 +12,271 @@ FAO56_CN       = 37.0  # Numerator constant (kPa·s³/Mg/hr)
 FAO56_CD_DAY   = 0.24  # Denominator constant, daytime
 FAO56_CD_NIGHT = 0.96  # Denominator constant, nighttime
 
+# Daily Methods
+def hargreaves(daily_tmin, daily_tmax, lat: float):
+    """Estimate daily PET using the Hargreaves (1985) method."""
+    from mettoolbox.utils import radiation as met_rad
+
+    tmean = (daily_tmin + daily_tmax) / 2.0
+    trange = (daily_tmax - daily_tmin).clip(lower=0.0)
+
+    ra_df = met_rad(tmean.to_frame(name="temp"), lat)
+    ra = ra_df["ra"]
+
+    with np.errstate(invalid="ignore"):
+        pet = 0.0023 * ra * (tmean + 17.8) * np.sqrt(trange)
+
+    pet = pet.fillna(0.0).clip(lower=0.0)
+    pet.name = "pet_hargreaves_mm"
+    return pet
+
+def penman_pan():
+    raise NotImplementedError("Daily Penman Pan method is not yet implemented. Use pet_penman_kohler instead, which replicates the Kohler 1955 pan method and can be disaggregated to hourly resolution.")
+
+def penman_knb(
+    temp_mean_c: xr.DataArray,
+    temp_min_c: xr.DataArray,
+    temp_max_c: xr.DataArray,
+    temp_dew_c: xr.DataArray,
+    wind_speed_ms: xr.DataArray,
+    solar_rad_mj: xr.DataArray  # Daily total solar radiation in MJ/m²/day
+) -> xr.DataArray:
+    """
+    Computes daily pan evaporation replicating legacy Kohler-Nordenson-Baker (1959). 
+    Refactored from 2017 TetraTech MetTool.
+    
+    Accepts metric xarray DataArrays, vectorizes the empirical English-unit 
+    computations, and returns evaporation in metric mm/day.
+    """
+    # 1. Convert metric inputs to legacy English units
+    #temp_min_f = temp_min_c * 1.8 + 32.0
+    #temp_max_f = temp_max_c * 1.8 + 32.0
+    #t_mean_f = (temp_min_f + temp_max_f) / 2.0
+    t_mean_f = temp_mean_c*1.8 + 32
+    t_dew_f = temp_dew_c * 1.8 + 32.0
+    
+    
+    wind_mpd = wind_speed_ms * 53.6819       # 1 m/s = ~53.68 miles/day
+    solar_langley = solar_rad_mj * 23.8845   # 1 MJ/m² = ~23.88 Langleys
+    
+    # Prevent log(0) errors using xarray/numpy clipping
+    solar_langley = solar_langley.clip(min=25.0)
+
+    # 2. Helper function for legacy empirical vapor pressure
+    
+    # 3. Radiation Term (Equivalent to Qn * Delta)
+    rad_exponent = (t_mean_f - 212.0) * (0.1024 - 0.01066 * np.log(solar_langley))
+    rad_term = np.exp(rad_exponent) - 0.0001
+    
+    #4. Vapor Pressure Deficit (es - ea)
+    # es_max = humidity.vapor_pressure_lamoreux(temp_max_f)
+    # es_min = humidity.vapor_pressure_lamoreux(temp_min_f)
+    # es = (es_max + es_min) / 2.0
+    es = humidity.vapor_pressure_lamoreux(t_mean_f) # alternate method for es
+    ea = humidity.vapor_pressure_lamoreux(t_dew_f)
+    
+    # es_max = humidity.vapor_pressure_magnus(temp_max_c)
+    # es_min = humidity.vapor_pressure_magnus(temp_min_c)
+    # es = (es_max + es_min) / 2.0
+    # es = humidity.vapor_pressure_magnus(temp_mean_c) # alternate method for es
+    # ea = humidity.vapor_pressure_magnus(temp_dew_c)
+    # convert kPa to inHg
+    # es = es / 3.38639
+    # ea = ea / 3.38639
+
+    vpd = (es - ea).clip(min=0.0)
+    
+    # 5. Aerodynamic Term (Equivalent to Ea * gamma)
+    aero_term = 0.0105 * (vpd ** 0.88) * (0.37 + 0.0041 * wind_mpd)
+    
+    # 6. Slope of saturation vapor pressure curve (Delta)
+    delta = (47987800000.0 * np.exp(-7482.6 / (t_mean_f + 398.36))) / ((t_mean_f + 398.36) ** 2)
+    
+    # 7. Compute Pan Evaporation in Inches
+    pan_evap_in = (rad_term + aero_term) / (delta + 0.0105)
+    
+    # 8. Convert back to Metric (mm/day) and clip negative values
+    pan_evap_mm = (pan_evap_in * 25.4).clip(min=0.0)
+    
+    return pan_evap_mm.rename("penman_knb").assign_attrs({"units": "mm/day"})    
+
+
+def oudin(
+    temperature_c: xr.DataArray,
+) -> xr.DataArray:
+    """
+    Computes daily Potential Evapotranspiration (mm/day) using the Oudin (2005) method.
+    
+    This method is highly optimized for rainfall-runoff models and relies purely 
+    on mean daily temperature and extraterrestrial radiation.
+
+    Args:
+        temperature_c: Mean daily air temperature in °C.
+        ra_mj: Extraterrestrial radiation (Ra) at the top of the atmosphere in MJ/m²/day.
+               (Can be calculated purely from latitude and day of the year).
+               
+    Returns:
+        xr.DataArray: Daily PET in mm/day.
+    """
+    ra_mj = radiation.extra_radiation(temperature_c) #Note it just takes the temperature to get the time coordinate and lat coordinate, the actual value is not used in the calculation
+    # 1. Convert Ra (Energy) into mm/day (Water Equivalent)
+    # Using 2.45 MJ/kg as the standard latent heat of vaporization
+    ra_mm_day = ra_mj / 2.45
+
+    # 2. Apply the Oudin mathematical formula
+    # Extraterrestrial radiation scaled by a simple temperature index
+    oudin_pet = (ra_mm_day / 100.0) * (temperature_c + 5.0)
+
+    # 3. Apply the threshold constraint
+    # Oudin explicitly defined PET as 0 for any day where mean temp drops below -5°C
+    #pet_daily = xr.where(temperature_c > -5.0, oudin_pet, 0.0)
+
+    # 4. Standard safety clip to prevent physically impossible negative evaporation
+    pet_daily = oudin_pet.clip(min=0.0)
+
+    return pet_daily.rename("pet_oudin").assign_attrs(
+        {"units": "mm/day", "long_name": "Oudin Potential Evapotranspiration"}
+    )
+
+
+# Hourly Methods
+
+
+def penman_monteith_asce(
+    shortwave_down: xr.DataArray,
+    longwave_down: xr.DataArray,
+    temperature: xr.DataArray,
+    dewpoint: xr.DataArray,
+    wind_speed: xr.DataArray,
+    pressure: xr.DataArray,
+    albedo: float = 0.23, # 0.23 is standard for PM reference crop
+    cn: float = 37.0,     # Short crop (grass) default
+    cd_day: float = 0.24, # Short crop day default
+    cd_night: float = 0.96 # Short crop night default
+) -> xr.DataArray:
+    """Compute hourly ASCE Standardized Penman-Monteith Reference ET (mm/hour)."""
+
+    # 1. Net Radiation (Hourly Volume)
+    net_radiation = radiation.net_radiation(shortwave_down, longwave_down, temperature, albedo)
+    rn_mj = net_radiation * 0.0036  
+
+    # 2. Dynamic Hourly Soil Heat Flux (G) and Aerodynamic Coefficient (Cd)
+    # ASCE defines "daytime" as any hour where Rn > 0
+    is_daytime = rn_mj > 0
+
+    g_mj = xr.where(is_daytime, 0.10 * rn_mj, 0.50 * rn_mj)
+    cd_dynamic = xr.where(is_daytime, cd_day, cd_night)
+
+    # 3. Available Energy
+    available_energy = rn_mj - g_mj
+
+    # 4. Vapor Pressures
+    e_s = humidity.vapor_pressure_magnus(temperature)
+    e_a = humidity.vapor_pressure_magnus(dewpoint)
+    vapor_pressure_deficit = (e_s - e_a).clip(min=0.0)
+
+    # 5. Psychrometric & Thermodynamics
+    pressure_kpa = pressure / 1000.0
+    gamma = humidity.PSYCHROMETRIC_COEFFICIENT * pressure_kpa  
+    delta = humidity.delta_svp(temperature, humidity.VAPOR_B_MAGNUS)
+
+    # 6. ASCE PM Equation
+    # 0.408 is the RECIPROCAL_LAMBDA_20C
+    numerator = (
+        humidity.RECIPROCAL_LAMBDA_20C * delta * available_energy 
+        + gamma * (cn / (temperature + 273.15)) * wind_speed * vapor_pressure_deficit
+    )
+    
+    denominator = delta + gamma * (1 + cd_dynamic * wind_speed)
+
+    pet_hourly = numerator / denominator  
+    
+    return xr.DataArray(
+        pet_hourly.clip(min=0.0),  
+        dims=shortwave_down.dims,
+        coords=shortwave_down.coords,
+        name="pet_penman_monteith_hourly_mm",
+    )
+
+
+def _disaggregate_pet_trapezoidal(
+    daily_pet: xr.DataArray,
+) -> xr.DataArray:
+    """
+    Distributes daily PET into an hourly curve using a legacy trapezoidal 
+    solar day-length approximation. Refactored from 2017 TetraTech MetTool.
+    
+    Args:
+        daily_pet: DataArray containing daily PET values.
+           """
+    # 1. Extract coordinates and time arrays
+    hourly_template = daily_pet.resample(time="1h").ffill()
+    lat = hourly_template.coords["lat"]
+    lat_rad = np.radians(lat)
+    
+    # Use exact datetime properties instead of the legacy '30.5 * Month' approximation
+    doy = hourly_template.coords["time"].dt.dayofyear
+    hour = hourly_template.coords["time"].dt.hour
+    
+    # 2. Solar Geometry (Preserving legacy empirical constants for exact replication)
+    declination = 0.40928 * np.cos(0.0172141 * (172.0 - doy))
+    
+    # SS / CS mathematically reduces to -tan(lat) * tan(declination)
+    x2 = -np.tan(lat_rad) * np.tan(declination)
+    
+    # Safety clip to prevent domain errors in polar regions during solstices
+    x2 = x2.clip(min=-1.0, max=1.0)
+    
+    # Replace the legacy atan(x/sqrt(1-x^2)) hack with native arccos
+    day_length = 7.6394 * np.arccos(x2)
+    sunrise = 12.0 - day_length / 2.0
+    
+    # 3. Prevent Division by Zero (Polar Night)
+    # If day_length is 0, we temporarily set it to 1.0 to let the math evaluate safely.
+    # The valid_day mask ensures the final output is still 0.0 for those days.
+    valid_day = day_length > 0.0
+    safe_day_length = day_length.where(valid_day, 1.0)
+    
+    # 4. Trapezoid Parameters
+    dtr2 = safe_day_length / 2.0
+    dtr4 = safe_day_length / 4.0
+    
+    crad = (2.0 / 3.0) / dtr2    # Peak multiplier
+    sl = crad / dtr4             # Slope of the curve
+    
+    tr2 = sunrise + dtr4
+    tr3 = tr2 + dtr2
+    tr4 = sunrise + safe_day_length # Sunset
+    
+    # 5. Build the Piecewise Hourly Mask using xr.where
+    # Condition 1: Morning Ramp Up
+    fraction = xr.where(
+        valid_day & (hour > sunrise) & (hour <= tr2),
+        (hour - sunrise) * sl,
+        0.0
+    )
+    
+    # Condition 2: Midday Peak (Flat Top)
+    fraction = xr.where(
+        valid_day & (hour > tr2) & (hour <= tr3),
+        crad,
+        fraction
+    )
+    
+    # Condition 3: Afternoon Ramp Down
+    fraction = xr.where(
+        valid_day & (hour > tr3) & (hour <= tr4),
+        crad - (hour - tr3) * sl,
+        fraction
+    )
+    
+    # 6. Apply to Daily Data
+    # Forward-fill the daily PET values onto the hourly grid shape
+    daily_pet_hourly_grid = daily_pet.resample(time="1h").ffill().reindex_like(hourly_template, method="ffill")
+    
+    hourly_pet = daily_pet_hourly_grid * fraction
+    
+    return hourly_pet.rename("pet_hourly_trapezoidal")
 
 def _disaggregate_daily_to_hourly_solar(
     daily: xr.DataArray,
@@ -51,255 +316,3 @@ def _disaggregate_daily_to_hourly_solar(
 
     return (daily_bcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
 
-def pet_hargreaves(daily_tmin, daily_tmax, lat: float):
-    """Estimate daily PET using the Hargreaves (1985) method."""
-    from mettoolbox.utils import radiation as met_rad
-
-    tmean = (daily_tmin + daily_tmax) / 2.0
-    trange = (daily_tmax - daily_tmin).clip(lower=0.0)
-
-    ra_df = met_rad(tmean.to_frame(name="temp"), lat)
-    ra = ra_df["ra"]
-
-    with np.errstate(invalid="ignore"):
-        pet = 0.0023 * ra * (tmean + 17.8) * np.sqrt(trange)
-
-    pet = pet.fillna(0.0).clip(lower=0.0)
-    pet.name = "pet_hargreaves_mm"
-    return pet
-
-def pet_penman_pyet_daily(
-    shortwave_hourly: xr.DataArray,
-    temperature_hourly: xr.DataArray,
-    dewpoint_hourly: xr.DataArray,
-    wind_hourly: xr.DataArray,
-    elevation: "xr.DataArray | float" = 0.0,
-    albedo: float = 0.06,
-) -> xr.DataArray:
-    """Daily Penman pan evaporation on a spatial grid via pyet (mm/day).
-
-    Note:
-        shortwave_hourly is assumed to be at 1-hour intervals. The factor 0.0036
-        converts W/m² to MJ/m²/hr (= W/m² × 3600 s/hr × 1e-6 MJ/J).
-        Sub-hourly or super-hourly data will give incorrect daily totals.
-    """
-    rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum()  
-    tmean_daily = temperature_hourly.resample(time="1D").mean()          
-    wind_daily  = wind_hourly.resample(time="1D").mean()                 
-    ea_daily    =  humidity.vapor_pressure_magnus(dewpoint_hourly).resample(time="1D").mean()                                          
-
-    lat_rad = np.radians(shortwave_hourly.coords["lat"])
-
-    pet = pyet.penman(
-        tmean=tmean_daily,
-        wind=wind_daily,
-        rs=rs_daily,
-        ea=ea_daily,
-        lat=lat_rad,
-        elevation=elevation,
-        albedo=albedo,
-    )
-
-    return pet.clip(min=0.0).rename("pet_penman_mm_day").assign_attrs(
-        {"units": "mm/day", "albedo": albedo}
-    )
-
-def pet_penman_pyet_hourly(
-    shortwave_hourly: xr.DataArray,
-    temperature_hourly: xr.DataArray,
-    dewpoint_hourly: xr.DataArray,
-    wind_hourly: xr.DataArray,
-    elevation: "xr.DataArray | float" = 0.0,
-    albedo: float = 0.06,
-    min_solar_elevation: float = 10.0,
-) -> xr.DataArray:
-    """Hourly Penman pan evaporation on a spatial grid (mm/hr)."""
-    pet_daily = pet_penman_pyet_daily(
-        shortwave_hourly, temperature_hourly, dewpoint_hourly,
-        wind_hourly, elevation, albedo,
-    )
-
-    daytime_mask = radiation.daytime_mask_solar_elevation(
-        shortwave_hourly, min_solar_elevation=min_solar_elevation,
-    )
-
-    pet_hourly = _disaggregate_daily_to_hourly_solar(
-        pet_daily, shortwave_hourly, daytime_mask
-    )
-
-    return pet_hourly.rename("pet_penman_mm_hr").assign_attrs(
-        {"units": "mm/hr", "albedo": albedo}
-    )
-
-def pet_penman_kohler(
-    shortwave_hourly: xr.DataArray,
-    temperature_hourly: xr.DataArray,
-    dewpoint_hourly: xr.DataArray,
-    wind_hourly: xr.DataArray,
-    pressure: xr.DataArray | float = 101325.0,
-    albedo: float = 0.06,
-    min_solar_elevation: float = 10.0,
-) -> xr.DataArray:
-    """Hourly Penman pan evaporation via Kohler et al. (1955) (mm/hr).
-
-    Note:
-        shortwave_hourly is assumed to be at 1-hour intervals. The factor 0.0036
-        converts W/m² to MJ/m²/hr (= W/m² × 3600 s/hr × 1e-6 MJ/J).
-        Sub-hourly or super-hourly data will give incorrect daily totals.
-
-    Args:
-        pressure: Atmospheric pressure in Pa (default 101325.0 Pa = standard atmosphere).
-    """
-    rs_daily    = (shortwave_hourly * 0.0036).resample(time="1D").sum() 
-    tmean_daily = temperature_hourly.resample(time="1D").mean()          
-    dp_daily    = dewpoint_hourly.resample(time="1D").mean()             
-    wind_daily  = wind_hourly.resample(time="1D").mean()                 
-
-    es = humidity.vapor_pressure_magnus(tmean_daily)
-    ea = humidity.vapor_pressure_magnus(dp_daily)
-    
-    vpd      = (es - ea).clip(min=0.0)
-    delta = humidity.delta_svp(tmean_daily, humidity.VAPOR_B_MAGNUS)
-    pressure_kpa = pressure / 1000.0
-    gamma    = constants.PSYCHROMETRIC_COEFFICIENT * pressure_kpa                                        
-    lambda_v = constants.LAMBDA_0 - constants.LAMBDA_T * tmean_daily                                
-    rn       = rs_daily * (1.0 - albedo)                                      
-    f_u      = 0.005 + 0.00085 * (wind_daily * 3.6)                          
-    ea_term  = f_u * vpd
-
-
-    pet_daily = ((delta * (rn / lambda_v) + gamma * ea_term) / (delta + gamma)).clip(min=0.0)
-
-    daytime_mask = radiation.daytime_mask_solar_elevation(
-        shortwave_hourly, min_solar_elevation=min_solar_elevation,
-    )
-
-    pet_hourly = _disaggregate_daily_to_hourly_solar(
-        pet_daily, shortwave_hourly, daytime_mask
-    )
-    # sw_daytime   = shortwave_hourly.where(daytime_mask, 0.0)
-    # sw_daily_sum = sw_daytime.resample(time="1D").sum()
-    # sw_daily_sum = sw_daily_sum.where(sw_daily_sum > 0.0, other=np.nan)
-
-    # pet_broadcast = pet_daily.reindex_like(shortwave_hourly, method="ffill")
-    # sw_sum_bcast  = sw_daily_sum.reindex_like(shortwave_hourly, method="ffill")
-
-    # pet_hourly = (pet_broadcast * sw_daytime / sw_sum_bcast).fillna(0.0).clip(min=0.0)
-
-    return pet_hourly.rename("pet_penman_kohler_mm_hr").assign_attrs(
-        {"units": "mm/hr", "albedo": albedo}
-    )
-
-def pet_penman_hourly(
-    shortwave_down: xr.DataArray,
-    longwave_down: xr.DataArray,
-    temperature: xr.DataArray,
-    dewpoint: xr.DataArray,
-    wind_speed: xr.DataArray,
-    pressure: xr.DataArray,
-    albedo: float = 0.23,
-) -> xr.DataArray:
-    """Compute hourly Penman Pan Evaporation (mm/hour).
-
-    Args:
-        temperature: Air temperature in °C.
-        dewpoint: Dewpoint temperature in °C.
-        pressure: Atmospheric pressure in Pa.
-    """
-    cn = FAO56_CN
-    cd = FAO56_CD_DAY
-
-    net_radiation = radiation.net_radiation(shortwave_down, longwave_down, temperature, albedo)
-    net_radiation_mj = net_radiation * 0.0036  
-
-    e_s = humidity.vapor_pressure_magnus(temperature)
-    e_a = humidity.vapor_pressure_magnus(dewpoint)
-
-    pressure_kpa = pressure / 1000.0
-    gamma = constants.PSYCHROMETRIC_COEFFICIENT * pressure_kpa  
-
-    delta = humidity.delta_svp(temperature, humidity.VAPOR_B_MAGNUS)
-    vapor_pressure_deficit = e_s - e_a
-
-    numerator = constants.RECIPROCAL_LAMBDA_20C * delta * net_radiation_mj + gamma * (cn / (temperature + 273.0)) * wind_speed * vapor_pressure_deficit
-    denominator = delta + gamma * (1 + cd * wind_speed)
-
-    pet_hourly = numerator / denominator  
-    pet_hourly = xr.DataArray(
-        pet_hourly.clip(0.0),  
-        dims=shortwave_down.dims,
-        coords=shortwave_down.coords,
-        name="pet_penman_hourly_mm",
-    )
-    return pet_hourly
-
-def pet_penman_monteith_hourly(
-    temperature: xr.DataArray,
-    wind_speed: xr.DataArray,
-    shortwave: xr.DataArray,
-    dewpoint: xr.DataArray,
-    pressure: xr.DataArray,
-    albedo = 0.23
-) -> xr.DataArray:
-    """Compute hourly FAO-56 Penman-Monteith reference ET (mm/hour).
-
-    Args:
-        temperature: Air temperature in °C.
-        dewpoint: Dewpoint temperature in °C.
-        shortwave: Incoming shortwave radiation in W/m².
-        pressure: Surface pressure in kPa.
-    """
-    cn = FAO56_CN
-    cd_day = FAO56_CD_DAY
-    cd_night = FAO56_CD_NIGHT
-
-    # Compute clear-sky radiation for FAO-56 Eq 39 cloudiness correction (Rs/Rso)
-    rso_xr = radiation.clearsky_radiation_ineichen(shortwave)
-    
-    t = temperature.values.astype(float)
-    u2 = wind_speed.values.astype(float)
-    rs_wm2 = shortwave.values.astype(float)
-    td = dewpoint.values.astype(float)
-
-    rs = rs_wm2 * 0.0036  # W/m² → MJ/m²/hr
-    #pressure = 101.3 * ((293.0 - 0.0065 * z) / 293.0) ** 5.26  
-    gamma = constants.PSYCHROMETRIC_COEFFICIENT * pressure / 10
-
-
-    es = humidity.vapor_pressure_magnus(t)
-    ea = humidity.vapor_pressure_magnus(td)
-
-    delta = humidity.delta_svp(t, humidity.VAPOR_B_MAGNUS)
-    rns = (1.0 - albedo) * rs
-    
-    # # FAO-56 Eq 39: cloudiness correction (1.35 * Rs/Rso - 0.35).
-    # # When rso = 0 (nighttime) the ratio is undefined; use 1.0 (clear-sky
-    # # assumption) so that rnl remains physically bounded.
-    # # The cloudiness factor is clipped to [0.05, 1.0] to prevent physically
-    # # invalid negative net longwave values when Rs/Rso < 0.259.
-    # with np.errstate(divide="ignore", invalid="ignore"):
-    #     rs_over_rso = np.clip(np.where(rso > 0, rs / rso, 1.0), 0.0, 1.0)
-    # cloudiness_factor = np.clip(1.35 * rs_over_rso - 0.35, 0.05, 1.0)
-    # rnl = sigma_h * (t_k**4) * (humid_a - humid_b * np.sqrt(np.maximum(ea, 0.0))) * cloudiness_factor
-    rnl = radiation.net_longwave_brutsaert(t, ea, 
-                                        clearsky_shortwave=rso_xr,  # clearsky
-                                        shortwave_down=shortwave)    # observed
-
-    rnl = rnl* 0.0036  # W/m² → MJ/m²/hr
-    rn = rns - rnl
-    is_daytime = rn > 0.0
-    g = np.where(is_daytime, 0.1 * rn, 0.5 * rn)
-    cd = np.where(is_daytime, cd_day, cd_night)
-
-    numerator = constants.RECIPROCAL_LAMBDA_20C * delta * (rn - g) + gamma * (cn / (t + 273.0)) * u2 * (es - ea)
-    denominator = delta + gamma * (1.0 + cd * u2)
-    
-    pet_pm = numerator / denominator
-    pet_pm = np.clip(pet_pm, 0.0, None)  
-
-    return xr.DataArray(
-        pet_pm,
-        dims=temperature.dims,
-        coords=temperature.coords,
-        name="pet_penman_monteith_hourly_mm",
-    )

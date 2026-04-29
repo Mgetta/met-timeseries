@@ -71,12 +71,12 @@ def clearsky_radiation_geometric(datarray: xr.DataArray) -> xr.DataArray:
         cs_at_time = SOLAR_CONSTANT * cos_zenith * CLEARSKY_TRANSMITTANCE  # (Nlat,)
         clearsky_values[t_idx, :, :] = cs_at_time[:, np.newaxis]
 
-    return xr.DataArray(clearsky_values, dims=datarray.dims, coords=shortwave.coords)
+    return xr.DataArray(clearsky_values, dims=datarray.dims, coords=datarray.coords)
 
 def clearsky_radiation_ineichen(
-    shortwave: xr.DataArray,
+    dataarray: xr.DataArray,
 ) -> xr.DataArray:
-    """Build a clear-sky radiation array using the pvlib Ineichen model.
+    """Build a clear-sky radiation array using the pvlib lat/lon Ineichen model.
 
     Args:
         shortwave: DataArray with dims including 'time', 'lat', 'lon'.
@@ -85,11 +85,11 @@ def clearsky_radiation_ineichen(
     Returns:
         Clear-sky GHI DataArray with the same dims/coords as shortwave.
     """
-    lat_vals = shortwave.coords["lat"].values
-    lon_vals = shortwave.coords["lon"].values
-    times = pd.DatetimeIndex(shortwave.coords["time"].values)
+    lat_vals = dataarray.coords["lat"].values
+    lon_vals = dataarray.coords["lon"].values
+    times = pd.DatetimeIndex(dataarray.coords["time"].values)
 
-    clearsky_values = np.full(shortwave.shape, np.nan, dtype=float)
+    clearsky_values = np.full(dataarray.shape, np.nan, dtype=float)
 
     n_lat = len(lat_vals)
     n_lon = len(lon_vals)
@@ -102,46 +102,116 @@ def clearsky_radiation_ineichen(
         cs = loc.get_clearsky(times, model="ineichen", solar_position=solpos)
         clearsky_values[:, i, j] = cs["ghi"].values
 
-    return xr.DataArray(clearsky_values, dims=shortwave.dims, coords=shortwave.coords)
+    return xr.DataArray(clearsky_values, dims=dataarray.dims, coords=dataarray.coords)
 
-
-def daytime_mask_solar_elevation(
-    shortwave: xr.DataArray,
-    min_solar_elevation: float = 10.0,
+def extra_radiation(
+    hourly_template: xr.DataArray
 ) -> xr.DataArray:
-    """Return a boolean DataArray that is True during daytime hours.
-
-    Daytime is defined as times when the apparent solar elevation exceeds
-    `min_solar_elevation` degrees, computed via pvlib for each grid point.
-
-    Args:
-        shortwave: DataArray with dims including 'time', 'lat', 'lon'.
-                   Used only for its coordinates/shape as a template.
-        min_solar_elevation: Minimum apparent solar elevation angle (degrees)
-                             above which a timestep is considered daytime.
-
-    Returns:
-        Boolean DataArray with the same dims/coords as shortwave.
     """
-    lat_vals = shortwave.coords["lat"].values
-    lon_vals = shortwave.coords["lon"].values
-    times = pd.DatetimeIndex(shortwave.coords["time"].values)
+    Computes daily extraterrestrial radiation (Ra) at the top of the atmosphere.
+    
+    Args:
+        hourly_template: DataArray used purely to extract 'time' and 'lat' coordinates.
+        
+    Returns:
+        xr.DataArray: Daily Ra in MJ/m²/day.
+    """
+    # 1. Extract coordinates
+    lat = hourly_template.coords["lat"]
+    lat_rad = np.radians(lat)
+    
+    # We use daily time, so resample to daily if the template is hourly
+    daily_time = hourly_template.coords["time"].resample(time="1D").first()
+    day_of_year = daily_time.dt.dayofyear
+    
+    # 2. Solar Geometry Variables
+    # Solar Constant in MJ/m²/min is roughly 0.0820, which is 118.08 MJ/m²/day
+    # (Note: FAO-56 uses Gsc = 0.0820 MJ/m²/min)
+    Gsc = 0.0820 * 60 * 24  # MJ/m²/day (approx 118.08)
+    
+    # Inverse relative distance Earth-Sun (dr)
+    theta = (2.0 * np.pi / 365.0) * day_of_year
+    dr = 1.0 + 0.033 * np.cos(theta)
+    
+    # Solar declination (delta)
+    delta = 0.409 * np.sin(theta - 1.39)
+    
+    # Sunset hour angle (omega_s)
+    # Clip prevents domain errors during polar night/day
+    x = (-np.tan(lat_rad) * np.tan(delta)).clip(min=-1.0, max=1.0)
+    omega_s = np.arccos(x)
+    
+    # 3. Calculate Ra (FAO-56 Equation 21)
+    # The integration of solar geometry over the course of the day
+    ra_mj = (Gsc / np.pi) * dr * (
+        omega_s * np.sin(lat_rad) * np.sin(delta) +
+        np.cos(lat_rad) * np.cos(delta) * np.sin(omega_s)
+    )
+    
+    # 4. Broadcast to the correct daily dimensions
+    # Using np.newaxis or xarray broadcasting to ensure it aligns with (time, lat)
+    ra_mj = ra_mj.transpose("time", "lat")
+    
+    return ra_mj.rename("extraterrestrial_radiation_mj_day").assign_attrs(
+        {"units": "MJ/m²/day", "long_name": "Extraterrestrial Solar Radiation"}
+    )
 
-    elevation_values = np.full(shortwave.shape, np.nan, dtype=float)
 
+def extra_radiation_pvlib(
+    hourly_template: xr.DataArray
+) -> xr.DataArray:
+    """
+    Computes daily Extraterrestrial Radiation (Ra) in MJ/m²/day using pvlib.
+    
+    This method calculates hourly horizontal extra-terrestrial radiation 
+    and then integrates it over the day.
+    """
+    lat_vals = hourly_template.coords["lat"].values
+    lon_vals = hourly_template.coords["lon"].values
+    times = pd.DatetimeIndex(hourly_template.coords["time"].values)
+    
     n_lat = len(lat_vals)
     n_lon = len(lon_vals)
-
+    
+    # 1. Get Top-of-Atmosphere Direct Normal Irradiance (DNI_extra)
+    # This only depends on the day of the year (Earth-Sun distance), 
+    # so we only need to calculate it once for the whole time series.
+    dni_extra = pvlib.irradiance.get_extra_radiation(times).values  # Shape: (time,)
+    
+    # Array to hold our hourly horizontal radiation in W/m²
+    ra_hourly_values = np.zeros((len(times), n_lat, n_lon), dtype=float)
+    
+    # 2. Loop through spatial grid (the pvlib constraint)
     for idx in range(n_lat * n_lon):
         i, j = np.unravel_index(idx, (n_lat, n_lon))
         la, lo = lat_vals[i], lon_vals[j]
+        
+        # Get solar position for this specific pixel
         loc = pvlib.location.Location(latitude=la, longitude=lo)
         solpos = loc.get_solarposition(times)
-        elevation_values[:, i, j] = solpos["apparent_elevation"].values
+        
+        # Zenith angle (0 is straight up, 90 is horizon)
+        zenith_rad = np.radians(solpos['zenith'].values)
+        
+        # 3. Project DNI onto the Horizontal Plane
+        # Ra = DNI_extra * cos(zenith). Clip at 0 so nights don't go negative.
+        cos_zenith = np.maximum(np.cos(zenith_rad), 0.0)
+        
+        # Broadcast DNI_extra across the zenith array
+        ra_hourly_values[:, i, j] = dni_extra * cos_zenith
 
-    elevation = xr.DataArray(elevation_values, dims=shortwave.dims, coords=shortwave.coords)
-    return elevation >= min_solar_elevation
-
+    # 4. Rebuild the xarray DataArray for the hourly values (W/m²)
+    ra_hourly_w = xr.DataArray(
+        ra_hourly_values, 
+        dims=hourly_template.dims, 
+        coords=hourly_template.coords
+    )
+    
+    # 5. Convert to Daily Volume
+    # Convert W/m² to MJ/m²/hr (multiply by 0.0036), then sum the 24 hours
+    ra_daily_mj = (ra_hourly_w * 0.0036).resample(time="1D").sum()
+    
+    return ra_daily_mj.rename("extraterrestrial_radiation_pvlib_mj_day")
 
 def clearsky_radiation_hww(datarray: xr.DataArray) -> xr.DataArray:
     """Computes daily clear-sky solar radiation approximating Hamon, Weiss, Wilson (1954).
@@ -173,12 +243,65 @@ def clearsky_radiation_hww(datarray: xr.DataArray) -> xr.DataArray:
     )
     
     Rso = 0.73 * Ra
-    Rso_broadcast = Rso.broadcast_like(shortwave)
+    Rso_broadcast = Rso.broadcast_like(datarray)
     Rso_broadcast.attrs['long_name'] = 'Clear-sky Solar Radiation (Hamon-Weiss-Wilson parameterization)'
-    Rso_broadcast.attrs['units'] = 'MJ/m²/day'
+    Rso_broadcast.attrs['units'] = 'W/m²/day'
     return Rso_broadcast
 
+def clearsky_radiation_fao56(
+    ra: xr.DataArray,     # Extraterrestrial radiation (Ra)
+    elevation: float      # Station elevation in meters (z)
+) -> xr.DataArray:
+    """
+    Calculates clear-sky solar radiation (Rso) using FAO-56 Eq 37.
+    """
+    
+    # Calculate the elevation-based atmospheric transmissivity
+    transmissivity = 0.75 + (2e-5 * elevation)
+    
+    # Calculate Rso
+    rso = transmissivity * ra
+    
+    return rso.rename("clearsky_shortwave_fao56")
 
+def daytime_mask_solar_elevation(
+    dataarray: xr.DataArray,
+    min_solar_elevation: float = 10.0,
+    lat_coord: str = "lat",
+    lon_coord: str = "lon",
+) -> xr.DataArray:
+    """Return a boolean DataArray that is True during daytime hours.
+
+    Daytime is defined as times when the apparent solar elevation exceeds
+    `min_solar_elevation` degrees, computed via pvlib for each grid point.
+
+    Args:
+        dataarray: DataArray with dims including 'time', 'lat', 'lon'.
+                   Used only for its coordinates/shape as a template.
+        min_solar_elevation: Minimum apparent solar elevation angle (degrees)
+                             above which a timestep is considered daytime.
+
+    Returns:
+        Boolean DataArray with the same dims/coords as shortwave.
+    """
+    lat_vals = dataarray.coords[lat_coord].values
+    lon_vals = dataarray.coords[lon_coord].values
+    times = pd.DatetimeIndex(dataarray.coords["time"].values)
+
+    elevation_values = np.full(dataarray.shape, np.nan, dtype=float)
+
+    n_lat = len(lat_vals)
+    n_lon = len(lon_vals)
+
+    for idx in range(n_lat * n_lon):
+        i, j = np.unravel_index(idx, (n_lat, n_lon))
+        la, lo = lat_vals[i], lon_vals[j]
+        loc = pvlib.location.Location(latitude=la, longitude=lo)
+        solpos = loc.get_solarposition(times)
+        elevation_values[:, i, j] = solpos["apparent_elevation"].values
+
+    elevation = xr.DataArray(elevation_values, dims=dataarray.dims, coords=dataarray.coords)
+    return elevation >= min_solar_elevation
 
 
 
@@ -268,7 +391,110 @@ def actual_radiation_hww(
         rs.attrs['units'] = clear_sky_rad.attrs['units']
     return rs
 
+
+def cloud_factor_ratio(
+    shortwave_hourly: xr.DataArray,
+    clearsky_shortwave_hourly: xr.DataArray
+) -> xr.DataArray:
+    
+    # 1. Sum radiation over the whole day
+    rs_daily = shortwave_hourly.resample(time="1D").sum()
+    rso_daily = clearsky_shortwave_hourly.resample(time="1D").sum()
+    
+    # 2. Calculate the ratio on the daily totals (avoids the nighttime 0/0 issue)
+    rs_rso_daily = (rs_daily / rso_daily).clip(0.25, 1.0)
+    
+    # 3. Calculate the daily cloud factor
+    cloud_factor_daily = 1.35 * rs_rso_daily - 0.35
+    
+    # 4. Broadcast/forward-fill that daily factor back to the hourly timestep
+    cloud_factor_hourly = cloud_factor_daily.resample(time="1h").ffill()
+    
+    return cloud_factor_hourly
+
+
+def net_longwave_direct(
+    temperature: xr.DataArray,        # °C (from NLDAS)
+    downward_longwave: xr.DataArray,  # W/m² (NLDAS DLWRF)
+    surface_emissivity: float = 0.98  # Standard for open water / wet soil
+) -> xr.DataArray:
+    """
+    Calculates Net Outgoing Longwave radiation directly using measured/modeled 
+    downward longwave radiation, bypassing empirical cloud corrections.
+    """
+    t_k = temperature + 273.15
+    
+    # 1. Calculate Upward Longwave emitted by the surface
+    r_lu = surface_emissivity * constants.STEFAN_BOLTZMANN * t_k**4
+    
+    # 2. Calculate Net Outgoing Longwave
+    # (Positive means energy is leaving the surface, which is standard for PET)
+    r_nl = r_lu - downward_longwave
+    
+    return r_nl.rename("net_outgoing_longwave")
+
 def net_longwave_brutsaert(
+        temperature: xr.DataArray,        # °C
+        vapor_pressure: xr.DataArray,     # kPa  (actual, not saturation)
+        surface_emissivity: float = 0.98
+) -> xr.DataArray:
+    
+    t_k = temperature + 273.15
+    vp = vapor_pressure.clip(min=0.0) * 10 # Prevent negative vapor pressure values causing NaNs in emissivity
+    
+    atmos_emissivity = 1.24 * (vp / t_k) ** (1.0 / 7.0) 
+    dlr = atmos_emissivity * constants.STEFAN_BOLTZMANN * t_k**4
+
+    r_lu = surface_emissivity * constants.STEFAN_BOLTZMANN * t_k**4
+
+    rnl = r_lu - dlr
+    return rnl.rename("net_longwave_brutsaert")
+
+def net_longwave_brunt(
+    temperature: xr.DataArray,        # °C
+    vapor_pressure: xr.DataArray,     # kPa  (actual, not saturation)
+    clearsky_shortwave: xr.DataArray | None = None,
+    shortwave_down: xr.DataArray | None = None,
+    humid_a: float = 0.34,
+    humid_b: float = 0.14,
+) -> xr.DataArray:
+    
+    t_k = temperature + 273.15
+    vp = vapor_pressure.clip(min=0.0)# Prevent negative vapor pressure values causing NaNs in emissivity
+    
+    if clearsky_shortwave is not None and shortwave_down is not None:
+        cloud_factor = cloud_factor_ratio(shortwave_down, clearsky_shortwave)
+    else:
+        cloud_factor = xr.ones_like(t_k)
+
+    rnl = (
+        constants.STEFAN_BOLTZMANN
+        * t_k**4
+        * (humid_a - humid_b * np.sqrt(vp))
+        * cloud_factor
+    )
+    
+    return rnl
+
+def cloud_factor_fao56(
+    shortwave: xr.DataArray,
+    clearsky_shortwave) -> xr.DataArray:
+    # Prevent 0/0 division at night by using xr.where. 
+    # When clearsky is 0 (night), assume a clear-sky ratio of 1.0
+    rs_rso = xr.where(
+        clearsky_shortwave > 0, 
+        shortwave / clearsky_shortwave, 
+        1.0
+    )
+    # Clip the ratio to physically valid bounds per FAO-56
+    rs_rso = rs_rso.clip(0.25, 1.0)
+    
+    # Apply the actual FAO-56 Eq 39 cloudiness correction factor
+    cloud_factor = 1.35 * rs_rso - 0.35
+    return cloud_factor
+
+
+def net_longwave_brutsaert2(
     temperature: xr.DataArray,        # °C
     vapor_pressure: xr.DataArray,     # kPa  (actual, not saturation)
     clearsky_shortwave: xr.DataArray | None = None,
@@ -277,6 +503,7 @@ def net_longwave_brutsaert(
     humid_b: float = 0.14,
 ) -> xr.DataArray:
     """
+    Verify against new method.
     Estimate net longwave radiation loss (W/m²) using Brutsaert's atmospheric
     emissivity parameterisation.
 
