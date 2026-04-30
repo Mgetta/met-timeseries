@@ -10,8 +10,3 @@ SOLAR_CONSTANT_W_M2 = 1361.0    # Solar constant (W/m²)
 SOLAR_CONSTANT_MJ_DAY = 117.5   # Solar constant (MJ/m²/day)
 
 
-# --- Thermodynamic ---
-PSYCHROMETRIC_COEFFICIENT = 0.000665  # γ = cp / (λ·ε) (kPa/°C per kPa pressure)
-LAMBDA_0 = 2.501                      # Latent heat of vaporisation at 0 °C (MJ/kg)
-LAMBDA_T = 0.002361                   # Temperature correction for λ (MJ/kg/°C)
-RECIPROCAL_LAMBDA_20C = 0.408         # 1/λ at ~20 °C, FAO-56 shorthand (kg/MJ)

@@ -494,53 +494,6 @@ def cloud_factor_fao56(
     return cloud_factor
 
 
-def net_longwave_brutsaert2(
-    temperature: xr.DataArray,        # °C
-    vapor_pressure: xr.DataArray,     # kPa  (actual, not saturation)
-    clearsky_shortwave: xr.DataArray | None = None,
-    shortwave_down: xr.DataArray | None = None,
-    humid_a: float = 0.34,
-    humid_b: float = 0.14,
-) -> xr.DataArray:
-    """
-    Verify against new method.
-    Estimate net longwave radiation loss (W/m²) using Brutsaert's atmospheric
-    emissivity parameterisation.
-
-    R_nl = σ T⁴ · (a - b√eₐ) · (Rs/Rso)
-
-    The cloud correction term (Rs/Rso) requires both shortwave_down and
-    clearsky_shortwave. If either is None the term is omitted (clear-sky assumed).
-
-    Args:
-        temperature:        Air temperature (°C)
-        vapor_pressure:     Actual vapor pressure (kPa) — pass actual, not saturation.
-                            Use humidity.saturation_vapor_pressure_arm(dewpoint) to derive.
-        clearsky_shortwave: Clear-sky shortwave (W/m²) for cloud correction.
-        shortwave_down:     Observed shortwave (W/m²) for cloud correction.
-        humid_a:            Emissivity coefficient a (default 0.34, Bruin 1987)
-        humid_b:            Emissivity coefficient b (default 0.14, Bruin 1987)
-
-    Returns:
-        Net longwave radiation in W/m² (positive = upward loss).
-    """
-    t_k = temperature + 273.15
-
-    if clearsky_shortwave is not None and shortwave_down is not None:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rs_rso = (shortwave_down / clearsky_shortwave).clip(0.25, 1.0)
-    else:
-        rs_rso = xr.ones_like(temperature)
-
-    rnl = (
-        constants.STEFAN_BOLTZMANN
-        * t_k**4
-        * (humid_a - humid_b * np.sqrt(vapor_pressure.clip(min=0.0)))
-        * rs_rso
-    )
-    return rnl # .rename("net_longwave_brutsaert")
-
-
 def net_radiation_arm(
     shortwave_down: xr.DataArray,
     temperature: xr.DataArray,        # °C
@@ -575,7 +528,7 @@ def net_radiation_arm(
     )
     rns = shortwave_down * (1.0 - albedo)
 
-    rnl = net_longwave_brutsaert(
+    rnl = net_longwave_brunt(
         temperature,
         vapor_pressure=e_a,
         clearsky_shortwave=clearsky_shortwave,

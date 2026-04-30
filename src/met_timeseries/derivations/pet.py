@@ -61,37 +61,38 @@ def penman_knb(
     
     # Prevent log(0) errors using xarray/numpy clipping
     solar_langley = solar_langley.clip(min=25.0)
-
-    # 2. Helper function for legacy empirical vapor pressure
     
     # 3. Radiation Term (Equivalent to Qn * Delta)
     rad_exponent = (t_mean_f - 212.0) * (0.1024 - 0.01066 * np.log(solar_langley))
     rad_term = np.exp(rad_exponent) - 0.0001
     
     #4. Vapor Pressure Deficit (es - ea)
-    # es_max = humidity.vapor_pressure_lamoreux(temp_max_f)
-    # es_min = humidity.vapor_pressure_lamoreux(temp_min_f)
-    # es = (es_max + es_min) / 2.0
-    es = humidity.vapor_pressure_lamoreux(t_mean_f) # alternate method for es
-    ea = humidity.vapor_pressure_lamoreux(t_dew_f)
-    
-    # es_max = humidity.vapor_pressure_magnus(temp_max_c)
-    # es_min = humidity.vapor_pressure_magnus(temp_min_c)
-    # es = (es_max + es_min) / 2.0
-    # es = humidity.vapor_pressure_magnus(temp_mean_c) # alternate method for es
-    # ea = humidity.vapor_pressure_magnus(temp_dew_c)
-    # convert kPa to inHg
-    # es = es / 3.38639
-    # ea = ea / 3.38639
+    # Current: Lamoreux on mean temp (English units, stays in inHg)
+    es = humidity.vapor_pressure_lamoreux(t_mean_f)
 
+    # Option B (commented): Lamoreux averaged over min/max — KNB (1959) original
+    # es = (vapor_pressure_lamoreux(temp_max_f) + vapor_pressure_lamoreux(temp_min_f)) / 2.0 
+
+    # Option C (commented): Magnus on mean temp — metric, modern
+    # es = humidity.vapor_pressure_magnus(temp_mean_c) / 3.38639 # convert kPa to inHg
+
+    # Option D (commented): Magnus averaged over min/max — metric, WMO standard
+    es = (humidity.vapor_pressure_magnus(temp_max_c) + humidity.vapor_pressure_magnus(temp_min_c)) / 2.0 / 3.38639# convert kPa to inHg
+
+    ea = humidity.vapor_pressure_lamoreux(t_dew_f)
+   
     vpd = (es - ea).clip(min=0.0)
     
     # 5. Aerodynamic Term (Equivalent to Ea * gamma)
     aero_term = 0.0105 * (vpd ** 0.88) * (0.37 + 0.0041 * wind_mpd)
     
     # 6. Slope of saturation vapor pressure curve (Delta)
+    # Current: legacy KNB empirical formula (English units, internally consistent)
     delta = (47987800000.0 * np.exp(-7482.6 / (t_mean_f + 398.36))) / ((t_mean_f + 398.36) ** 2)
-    
+
+    # Alternate: modern humidity module
+    # delta = humidity.delta_svp(temp_mean_c)
+
     # 7. Compute Pan Evaporation in Inches
     pan_evap_in = (rad_term + aero_term) / (delta + 0.0105)
     
@@ -156,13 +157,21 @@ def penman_monteith_asce(
 ) -> xr.DataArray:
     """Compute hourly ASCE Standardized Penman-Monteith Reference ET (mm/hour)."""
 
+    LAMBDA = 2.45 #MJ/kg
+    PSYCHROMETRIC_COEFFICIENT = 0.000665 #kPa/degC
+    
     # 1. Net Radiation (Hourly Volume)
     net_radiation = radiation.net_radiation(shortwave_down, longwave_down, temperature, albedo)
     rn_mj = net_radiation * 0.0036  
 
     # 2. Dynamic Hourly Soil Heat Flux (G) and Aerodynamic Coefficient (Cd)
     # ASCE defines "daytime" as any hour where Rn > 0
+    # Current: ASCE-standard Rn > 0 proxy
     is_daytime = rn_mj > 0
+
+    # Alternate: pvlib solar elevation (used in all other methods)
+    # daytime_mask = radiation.daytime_mask_solar_elevation(shortwave_down, min_solar_elevation=10.0)
+
 
     g_mj = xr.where(is_daytime, 0.10 * rn_mj, 0.50 * rn_mj)
     cd_dynamic = xr.where(is_daytime, cd_day, cd_night)
@@ -176,8 +185,14 @@ def penman_monteith_asce(
     vapor_pressure_deficit = (e_s - e_a).clip(min=0.0)
 
     # 5. Psychrometric & Thermodynamics
+    # Current: simplified constant × pressure
     pressure_kpa = pressure / 1000.0
-    gamma = humidity.PSYCHROMETRIC_COEFFICIENT * pressure_kpa  
+    gamma = PSYCHROMETRIC_COEFFICIENT * pressure_kpa   # fixed λ assumed
+
+    # Alternate: temperature-dependent λ (now available in humidity module)
+    # lambda_v = humidity.latent_heat_linear(temperature)
+    # gamma = humidity.psychrometric_constant_dynamic(pressure_kpa, lambda_v)
+
     delta = humidity.delta_svp(temperature, humidity.VAPOR_B_MAGNUS)
 
     # 6. ASCE PM Equation
