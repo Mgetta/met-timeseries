@@ -33,6 +33,9 @@ def hargreaves(daily_tmin, daily_tmax, lat: float):
 def penman_pan():
     raise NotImplementedError("Daily Penman Pan method is not yet implemented. Use pet_penman_kohler instead, which replicates the Kohler 1955 pan method and can be disaggregated to hourly resolution.")
 
+def preistly_tayler():
+    raise NotImplementedError()
+
 def penman_knb(
     temp_mean_c: xr.DataArray,
     temp_min_c: xr.DataArray,
@@ -43,8 +46,8 @@ def penman_knb(
 ) -> xr.DataArray:
     """
     Computes daily pan evaporation replicating legacy Kohler-Nordenson-Baker (1959). 
-    Refactored from 2017 TetraTech MetTool.
-    
+    Refactored from 2017 TetraTech MetTool. This is also the same method that RESPEC uses
+
     Accepts metric xarray DataArrays, vectorizes the empirical English-unit 
     computations, and returns evaporation in metric mm/day.
     """
@@ -52,7 +55,7 @@ def penman_knb(
     #temp_min_f = temp_min_c * 1.8 + 32.0
     #temp_max_f = temp_max_c * 1.8 + 32.0
     #t_mean_f = (temp_min_f + temp_max_f) / 2.0
-    t_mean_f = temp_mean_c*1.8 + 32
+    t_mean_f = temp_mean_c*1.8 + 32.0
     t_dew_f = temp_dew_c * 1.8 + 32.0
     
     
@@ -71,31 +74,35 @@ def penman_knb(
     es = humidity.vapor_pressure_lamoreux(t_mean_f)
 
     # Option B (commented): Lamoreux averaged over min/max — KNB (1959) original
-    # es = (vapor_pressure_lamoreux(temp_max_f) + vapor_pressure_lamoreux(temp_min_f)) / 2.0 
+    #es = (humidity.vapor_pressure_lamoreux(temp_max_f) + humidity.vapor_pressure_lamoreux(temp_min_f)) / 2.0 
 
     # Option C (commented): Magnus on mean temp — metric, modern
-    # es = humidity.vapor_pressure_magnus(temp_mean_c) / 3.38639 # convert kPa to inHg
+    #es = humidity.vapor_pressure_magnus(temp_mean_c) / 3.38639 # convert kPa to inHg
 
     # Option D (commented): Magnus averaged over min/max — metric, WMO standard
-    es = (humidity.vapor_pressure_magnus(temp_max_c) + humidity.vapor_pressure_magnus(temp_min_c)) / 2.0 / 3.38639# convert kPa to inHg
+    #es = (humidity.vapor_pressure_magnus(temp_max_c) + humidity.vapor_pressure_magnus(temp_min_c)) / 2.0 / 3.38639# convert kPa to inHg
 
     ea = humidity.vapor_pressure_lamoreux(t_dew_f)
-   
+    #ea = humidity.vapor_pressure_magnus(temp_dew_c) / 3.38639
+
     vpd = (es - ea).clip(min=0.0)
     
-    # 5. Aerodynamic Term (Equivalent to Ea * gamma)
-    aero_term = 0.0105 * (vpd ** 0.88) * (0.37 + 0.0041 * wind_mpd)
-    
+    # 5. Aerodynamic Term (using the PAN psychrometric constant: 0.025) (Equivalent to Ea * gamma) 
+    gamma_pan = 0.0105 
+    #gamma_pan = 0.025
+    aero_term = gamma_pan * (vpd ** 0.88) * (0.37 + 0.0041 * wind_mpd)
+    #aero_term = 0.0105 * (vpd ** 0.88) * (0.37 + 0.0041 * wind_mpd)
+
     # 6. Slope of saturation vapor pressure curve (Delta)
     # Current: legacy KNB empirical formula (English units, internally consistent)
     delta = (47987800000.0 * np.exp(-7482.6 / (t_mean_f + 398.36))) / ((t_mean_f + 398.36) ** 2)
 
     # Alternate: modern humidity module
-    # delta = humidity.delta_svp(temp_mean_c)
+    #delta = humidity.delta_svp(temp_mean_c) #kPa/°C convert to 
 
     # 7. Compute Pan Evaporation in Inches
-    pan_evap_in = (rad_term + aero_term) / (delta + 0.0105)
-    
+    pan_evap_in = (rad_term + aero_term) / (delta + gamma_pan)
+
     # 8. Convert back to Metric (mm/day) and clip negative values
     pan_evap_mm = (pan_evap_in * 25.4).clip(min=0.0)
     

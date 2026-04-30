@@ -28,10 +28,9 @@ from met_timeseries.derivations.radiation import (
     actual_radiation_hww,
 )
 from met_timeseries.derivations.pet import (
-    pet_hargreaves,
-    pet_penman_kohler,
-    pet_penman_knb,
-    pet_oudin,
+    hargreaves,
+    penman_knb,
+    oudin,
     penman_monteith_asce,
     _disaggregate_daily_to_hourly_solar,
     _disaggregate_pet_trapezoidal,
