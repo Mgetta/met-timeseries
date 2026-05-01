@@ -785,7 +785,13 @@ def _disaggregate_mean_multiplicative(
     """
     coarse_freq = _infer_freq(coarse)
     pattern_mean = fine_pattern.resample(time=coarse_freq).mean()
-    scale = xr.where(pattern_mean > 0, coarse / pattern_mean, np.nan)
+    scale = xr.where(
+        pattern_mean > 0,
+        coarse / pattern_mean,
+        # np.nan used as sentinel: these cells fall back to the coarse value
+        # (handled below via isnull check) rather than the scaled fine pattern.
+        np.nan,
+    )
     scale_h = scale.reindex_like(fine_pattern, method="ffill")
     coarse_h = coarse.reindex_like(fine_pattern, method="ffill")
     return xr.where(scale_h.isnull(), coarse_h, (fine_pattern * scale_h).clip(min=0.0))
@@ -833,12 +839,12 @@ def _trapezoidal_weights(
         Coarse period over which weights must sum to 1.0.
         Default ``"1D"`` (daily).
     """
-    hourly_template = template.resample(time=fine_freq).ffill()
-    lat = hourly_template.coords["lat"]
+    fine_template = template.resample(time=fine_freq).ffill()
+    lat = fine_template.coords["lat"]
     lat_rad = np.radians(lat)
 
-    doy = hourly_template.coords["time"].dt.dayofyear
-    hour = hourly_template.coords["time"].dt.hour
+    doy = fine_template.coords["time"].dt.dayofyear
+    hour = fine_template.coords["time"].dt.hour
 
     # Solar declination and day length (legacy KNB empirical constants)
     declination = 0.40928 * np.cos(0.0172141 * (172.0 - doy))
@@ -1091,7 +1097,6 @@ def disaggregate_precipitation_stochastic(
     pattern_times = pd.DatetimeIndex(fine_pattern.coords["time"].values)
     # Use fine_pattern's own time axis as the output — the cascade methods
     # return a Series with the same index as pattern_times.
-    n_fine = len(pattern_times)
 
     def _apply_1d(coarse_vals: np.ndarray, pattern_vals: np.ndarray) -> np.ndarray:
         coarse_s = pd.Series(coarse_vals, index=coarse_times)
@@ -1120,7 +1125,7 @@ def disaggregate_precipitation_stochastic(
 
     # nD case: iterate over spatial indices, applying cascade per grid cell
     result_shape = tuple(
-        n_fine if d == "time" else coarse.sizes[d] for d in coarse.dims
+        len(pattern_times) if d == "time" else coarse.sizes[d] for d in coarse.dims
     )
     result_vals = np.full(result_shape, np.nan)
     time_axis = list(coarse.dims).index("time")

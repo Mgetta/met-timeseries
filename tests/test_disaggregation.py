@@ -289,7 +289,11 @@ class TestPetHargreaves:
 
 
 def _daily_da(values, start="2000-01-01"):
-    """Create a daily xr.DataArray from a list of values (at least 3 for freq inference)."""
+    """Create a daily xr.DataArray from a list of values.
+
+    Note: pass at least 3 values if the result will be passed to
+    functions that call ``_infer_freq`` (which requires >= 3 timestamps).
+    """
     import xarray as xr
     index = pd.date_range(start, periods=len(values), freq="D")
     return xr.DataArray(np.array(values, dtype=float), coords={"time": index}, dims=["time"])
@@ -467,7 +471,8 @@ class TestDisaggregateAPI:
 
     def test_sum_requires_fine_pattern_proportional(self):
         from met_timeseries.disaggregation import disaggregate
-        coarse = _daily_da([5.0])  # single value OK — error raised before freq check
+        # Validation happens before freq inference, so a single-value DataArray is fine.
+        coarse = _daily_da([5.0])
         with pytest.raises(ValueError, match="fine_pattern"):
             disaggregate(coarse, conservation="sum")
 
