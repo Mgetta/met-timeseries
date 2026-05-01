@@ -295,11 +295,9 @@ def _daily_da(values, start="2000-01-01"):
     return xr.DataArray(np.array(values, dtype=float), coords={"time": index}, dims=["time"])
 
 
-def _hourly_da(values, n_days=None, start="2000-01-01"):
-    """Create an hourly xr.DataArray from a list of values (or n_days * 24 ones)."""
+def _hourly_da(values, start="2000-01-01"):
+    """Create an hourly xr.DataArray from a list of values."""
     import xarray as xr
-    if n_days is not None:
-        values = [1.0] * (n_days * 24)
     index = pd.date_range(start, periods=len(values), freq="h")
     return xr.DataArray(np.array(values, dtype=float), coords={"time": index}, dims=["time"])
 
@@ -336,7 +334,7 @@ class TestInferFreq:
         from met_timeseries.disaggregation import _infer_freq
         times = pd.to_datetime(["2000-01-01", "2000-01-02", "2000-01-04"])
         da = xr.DataArray([1.0, 2.0, 3.0], coords={"time": times}, dims=["time"])
-        with pytest.raises(ValueError, match="Cannot infer"):
+        with pytest.raises(ValueError, match="Cannot infer time frequency"):
             _infer_freq(da)
 
 

@@ -735,8 +735,11 @@ def _infer_freq(da: xr.DataArray) -> str:
     times = pd.DatetimeIndex(da.coords["time"].values)
     freq = pd.infer_freq(times)
     if freq is None:
+        name_hint = f" '{da.name}'" if da.name else ""
+        time_hint = f" (first timestamp: {times[0]})" if len(times) else ""
         raise ValueError(
-            "Cannot infer time frequency — check for gaps or irregular spacing"
+            f"Cannot infer time frequency for DataArray{name_hint}{time_hint}"
+            " — check for gaps or irregular spacing"
         )
     return freq
 
@@ -807,13 +810,30 @@ def _normalise_weights(fine_pattern: xr.DataArray, coarse_freq: str) -> xr.DataA
     return xr.where(period_sum_h > 0, fine_pattern / safe_sum_h, 1.0 / n_fine)
 
 
-def _trapezoidal_weights(template: xr.DataArray) -> xr.DataArray:
-    """Generate normalised daily-sum=1 weights from solar trapezoid geometry.
+def _trapezoidal_weights(
+    template: xr.DataArray,
+    fine_freq: str = "1h",
+    coarse_freq: str = "1D",
+) -> xr.DataArray:
+    """Generate normalised weights from solar trapezoid geometry.
 
     Refactored from the legacy KNB/TetraTech solar-geometry PET disaggregation.
-    Requires a ``lat`` coordinate on *template*.  Weights sum to 1.0 per day.
+    Requires a ``lat`` coordinate on *template*.  Weights sum to 1.0 per
+    coarse period (default: daily).
+
+    Parameters
+    ----------
+    template : xr.DataArray
+        DataArray providing the time range and ``lat`` coordinate.
+        Typically a daily PET or similar variable.
+    fine_freq : str
+        Target fine temporal resolution for the output weights.
+        Default ``"1h"`` (hourly).
+    coarse_freq : str
+        Coarse period over which weights must sum to 1.0.
+        Default ``"1D"`` (daily).
     """
-    hourly_template = template.resample(time="1h").ffill()
+    hourly_template = template.resample(time=fine_freq).ffill()
     lat = hourly_template.coords["lat"]
     lat_rad = np.radians(lat)
 
@@ -856,8 +876,8 @@ def _trapezoidal_weights(template: xr.DataArray) -> xr.DataArray:
         fraction,
     )
 
-    # Normalise so weights sum exactly to 1.0 per day
-    return _normalise_weights(fraction, "1D").rename("trapezoidal_weights")
+    # Normalise so weights sum exactly to 1.0 per coarse period
+    return _normalise_weights(fraction, coarse_freq).rename("trapezoidal_weights")
 
 
 def _solar_weights(template: xr.DataArray, coarse_freq: str) -> xr.DataArray:
@@ -1069,6 +1089,9 @@ def disaggregate_precipitation_stochastic(
     """
     coarse_times = pd.DatetimeIndex(coarse.coords["time"].values)
     pattern_times = pd.DatetimeIndex(fine_pattern.coords["time"].values)
+    # Use fine_pattern's own time axis as the output — the cascade methods
+    # return a Series with the same index as pattern_times.
+    n_fine = len(pattern_times)
 
     def _apply_1d(coarse_vals: np.ndarray, pattern_vals: np.ndarray) -> np.ndarray:
         coarse_s = pd.Series(coarse_vals, index=coarse_times)
@@ -1081,9 +1104,6 @@ def disaggregate_precipitation_stochastic(
             raise ValueError(f"Unknown method: {method!r}")
         return result.values
 
-    n_hours = len(coarse_times) * 24
-    hourly_times = pd.date_range(start=coarse_times[0], periods=n_hours, freq="h")
-
     # Identify non-time dimensions for spatial iteration
     spatial_dims = [d for d in coarse.dims if d != "time"]
 
@@ -1092,7 +1112,7 @@ def disaggregate_precipitation_stochastic(
         result_vals = _apply_1d(coarse.values, fine_pattern.values)
         return xr.DataArray(
             result_vals,
-            coords={"time": hourly_times},
+            coords={"time": pattern_times},
             dims=["time"],
             attrs=coarse.attrs,
             name="precip_mm",
@@ -1100,7 +1120,7 @@ def disaggregate_precipitation_stochastic(
 
     # nD case: iterate over spatial indices, applying cascade per grid cell
     result_shape = tuple(
-        n_hours if d == "time" else coarse.sizes[d] for d in coarse.dims
+        n_fine if d == "time" else coarse.sizes[d] for d in coarse.dims
     )
     result_vals = np.full(result_shape, np.nan)
     time_axis = list(coarse.dims).index("time")
@@ -1119,7 +1139,7 @@ def disaggregate_precipitation_stochastic(
         result_vals[tuple(result_idx)] = hourly_1d
 
     out_coords = {
-        d: (hourly_times if d == "time" else coarse.coords[d].values)
+        d: (pattern_times if d == "time" else coarse.coords[d].values)
         for d in coarse.dims
     }
     return xr.DataArray(
