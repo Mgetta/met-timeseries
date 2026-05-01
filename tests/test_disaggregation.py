@@ -292,7 +292,8 @@ def _daily_da(values, start="2000-01-01"):
     """Create a daily xr.DataArray from a list of values.
 
     Note: pass at least 3 values if the result will be passed to
-    functions that call ``_infer_freq`` (which requires >= 3 timestamps).
+    functions that call ``_infer_freq`` (``pd.infer_freq`` requires
+    at least 3 timestamps for unambiguous frequency detection).
     """
     import xarray as xr
     index = pd.date_range(start, periods=len(values), freq="D")
@@ -340,6 +341,22 @@ class TestInferFreq:
         da = xr.DataArray([1.0, 2.0, 3.0], coords={"time": times}, dims=["time"])
         with pytest.raises(ValueError, match="Cannot infer time frequency"):
             _infer_freq(da)
+
+    def test_error_message_includes_name_and_timestamp(self):
+        import xarray as xr
+        from met_timeseries.disaggregation import _infer_freq
+        times = pd.to_datetime(["2000-01-01", "2000-01-02", "2000-01-04"])
+        da = xr.DataArray(
+            [1.0, 2.0, 3.0],
+            coords={"time": times},
+            dims=["time"],
+            name="precip",
+        )
+        with pytest.raises(ValueError) as exc_info:
+            _infer_freq(da)
+        msg = str(exc_info.value)
+        assert "precip" in msg
+        assert "2000-01-01" in msg
 
 
 # ---------------------------------------------------------------------------
