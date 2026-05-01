@@ -33,5 +33,4 @@ from met_timeseries.derivations.pet import (
     oudin,
     penman_monteith_asce,
     _disaggregate_daily_to_hourly_solar,
-    _disaggregate_pet_trapezoidal,
 )

@@ -221,85 +221,6 @@ def penman_monteith_asce(
     )
 
 
-def _disaggregate_pet_trapezoidal(
-    daily_pet: xr.DataArray,
-) -> xr.DataArray:
-    """
-    Distributes daily PET into an hourly curve using a legacy trapezoidal 
-    solar day-length approximation. Refactored from 2017 TetraTech MetTool.
-    
-    Args:
-        daily_pet: DataArray containing daily PET values.
-           """
-    # 1. Extract coordinates and time arrays
-    hourly_template = daily_pet.resample(time="1h").ffill()
-    lat = hourly_template.coords["lat"]
-    lat_rad = np.radians(lat)
-    
-    # Use exact datetime properties instead of the legacy '30.5 * Month' approximation
-    doy = hourly_template.coords["time"].dt.dayofyear
-    hour = hourly_template.coords["time"].dt.hour
-    
-    # 2. Solar Geometry (Preserving legacy empirical constants for exact replication)
-    declination = 0.40928 * np.cos(0.0172141 * (172.0 - doy))
-    
-    # SS / CS mathematically reduces to -tan(lat) * tan(declination)
-    x2 = -np.tan(lat_rad) * np.tan(declination)
-    
-    # Safety clip to prevent domain errors in polar regions during solstices
-    x2 = x2.clip(min=-1.0, max=1.0)
-    
-    # Replace the legacy atan(x/sqrt(1-x^2)) hack with native arccos
-    day_length = 7.6394 * np.arccos(x2)
-    sunrise = 12.0 - day_length / 2.0
-    
-    # 3. Prevent Division by Zero (Polar Night)
-    # If day_length is 0, we temporarily set it to 1.0 to let the math evaluate safely.
-    # The valid_day mask ensures the final output is still 0.0 for those days.
-    valid_day = day_length > 0.0
-    safe_day_length = day_length.where(valid_day, 1.0)
-    
-    # 4. Trapezoid Parameters
-    dtr2 = safe_day_length / 2.0
-    dtr4 = safe_day_length / 4.0
-    
-    crad = (2.0 / 3.0) / dtr2    # Peak multiplier
-    sl = crad / dtr4             # Slope of the curve
-    
-    tr2 = sunrise + dtr4
-    tr3 = tr2 + dtr2
-    tr4 = sunrise + safe_day_length # Sunset
-    
-    # 5. Build the Piecewise Hourly Mask using xr.where
-    # Condition 1: Morning Ramp Up
-    fraction = xr.where(
-        valid_day & (hour > sunrise) & (hour <= tr2),
-        (hour - sunrise) * sl,
-        0.0
-    )
-    
-    # Condition 2: Midday Peak (Flat Top)
-    fraction = xr.where(
-        valid_day & (hour > tr2) & (hour <= tr3),
-        crad,
-        fraction
-    )
-    
-    # Condition 3: Afternoon Ramp Down
-    fraction = xr.where(
-        valid_day & (hour > tr3) & (hour <= tr4),
-        crad - (hour - tr3) * sl,
-        fraction
-    )
-    
-    # 6. Apply to Daily Data
-    # Forward-fill the daily PET values onto the hourly grid shape
-    daily_pet_hourly_grid = daily_pet.resample(time="1h").ffill().reindex_like(hourly_template, method="ffill")
-    
-    hourly_pet = daily_pet_hourly_grid * fraction
-    
-    return hourly_pet.rename("pet_hourly_trapezoidal")
-
 def _disaggregate_daily_to_hourly_solar(
     daily: xr.DataArray,
     shortwave_hourly: xr.DataArray,
@@ -314,6 +235,13 @@ def _disaggregate_daily_to_hourly_solar(
 
     PET is allocated only during daytime hours (where daytime_mask is True).
     Nighttime hours and days with no daytime SW receive 0.
+
+    Note
+    ----
+    This function uses *observed* shortwave radiation as the weight source.
+    For synthetic clearsky-based disaggregation (no observed data required)
+    use :func:`met_timeseries.disaggregation.disaggregate_pet_solar`, which
+    is the public counterpart that wraps the generic ``disaggregate()`` API.
 
     Args:
         daily:            Daily values to disaggregate (any units per day).

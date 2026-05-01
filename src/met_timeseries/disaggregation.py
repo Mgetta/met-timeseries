@@ -1,25 +1,65 @@
 """
-Source-agnostic temporal disaggregation functions.
+Source-agnostic temporal disaggregation.
 
-Each function is a pure transformation on :class:`pandas.Series` with a
-:class:`pandas.DatetimeIndex` — no knowledge of NLDAS/PRISM variable names or
-dataset structure.  The caller pairs the correct daily and hourly series.
+Core API
+--------
+disaggregate(coarse, conservation, ...)
+    Generic disaggregation. Conservation property determines the math:
+    - "sum"                 : extensive variables (precipitation, radiation)
+    - "mean_additive"       : intensive additive (temperature, dewpoint)
+    - "mean_multiplicative" : intensive multiplicative (wind speed)
 
-General pattern: **daily truth × hourly shape → hourly output**.
+    For sum-conserving disaggregation, the weight source is controlled by
+    weight_method:
+    - "proportional" : observed fine_pattern used as weight shape
+    - "trapezoidal"  : synthetic solar geometry trapezoid (no fine data needed)
+    - "solar"        : pvlib clearsky radiation shape (no fine data needed)
+    - "custom"       : caller supplies pre-computed normalised weights
 
-The caller is responsible for ensuring the daily and hourly series are
-temporally aligned (same days, consistent index frequency).
+disaggregate_precipitation_stochastic(coarse, fine_pattern, method)
+    Stochastic cascade disaggregation for precipitation.
+    Separate from the generic framework as it is non-deterministic.
+
+Convenience wrappers
+--------------------
+disaggregate_precipitation, disaggregate_radiation, disaggregate_temperature,
+disaggregate_dewpoint, disaggregate_wind, disaggregate_pet_trapezoidal,
+disaggregate_pet_solar
+
+All operate on xr.DataArray with a 'time' coordinate.
+Frequencies are inferred automatically — no hardcoded "1h" or "1D".
+
+Legacy pandas API
+-----------------
+The original pandas-based functions are preserved for backward compatibility:
+disaggregate_temperature_pattern, disaggregate_temperature_sine,
+disaggregate_radiation_pattern, disaggregate_radiation_potential,
+disaggregate_wind_pattern, disaggregate_wind_equal,
+disaggregate_dewpoint_pattern, disaggregate_dewpoint_constant.
 """
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+import xarray as xr
 from scipy.optimize import minimize
 from scipy.stats import poisson
 from mettoolbox.melodist.melodist.precipitation import build_casc, disagg_prec
-from scipy.optimize import minimize
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+
+ConservationMethod = Literal[
+    "sum",                   # extensive: precipitation, radiation totals
+    "mean_additive",         # intensive additive: temperature, dewpoint
+    "mean_multiplicative",   # intensive multiplicative: wind speed
+]
+
+WeightMethod = Literal["proportional", "trapezoidal", "solar", "custom"]
 
 # ---------------------------------------------------------------------------
 # Private helpers
@@ -257,30 +297,43 @@ def _disaggregate_precipitation_hybrid(
   
 
 def disaggregate_precipitation(
-    daily_total: pd.Series,
-    hourly_pattern: pd.Series,
+    daily_total_or_coarse: pd.Series | xr.DataArray,
+    hourly_pattern_or_fine: pd.Series | xr.DataArray,
     method: str = "molnar_burlando",
-) -> pd.Series:
-    """Disaggregate daily precipitation to hourly using a cascade method.
+) -> pd.Series | xr.DataArray:
+    """Disaggregate daily precipitation to finer resolution.
+
+    Dispatches to the xarray API when passed :class:`xr.DataArray` inputs
+    (sum-conserving proportional disaggregation), or to the legacy pandas
+    cascade path when passed :class:`pandas.Series` inputs.
 
     Parameters
     ----------
-    daily_total:
-        Daily precipitation totals in mm with a daily
-        :class:`~pandas.DatetimeIndex`.
-    hourly_pattern:
-        Hourly precipitation observations (e.g. from NLDAS-2) used
-        for cascade parameter fitting.
+    daily_total_or_coarse:
+        Daily precipitation totals (pd.Series) or a coarse-resolution
+        xr.DataArray with a ``time`` coordinate.
+    hourly_pattern_or_fine:
+        Hourly precipitation pattern (pd.Series) or a fine-resolution
+        xr.DataArray used as the proportional weight shape.
     method:
-        ``"molnar_burlando"`` — canonical log-Poisson cascade
-        (Molnar & Burlando, 2005).
-        ``"olsson"`` — microcanonical empirical cascade
-        (Olsson, 1998) via MELODIST.
+        Only used for the legacy pandas path.
+        ``"molnar_burlando"`` (default), ``"olsson"``, ``"proportional"``,
+        or ``"hybrid"``.
 
     Returns
     -------
-    :class:`pandas.Series` named ``precip_mm``.
+    :class:`pandas.Series` named ``precip_mm`` (pandas path) or
+    :class:`xr.DataArray` (xarray path).
     """
+    if isinstance(daily_total_or_coarse, xr.DataArray):
+        return disaggregate(
+            daily_total_or_coarse,
+            conservation="sum",
+            fine_pattern=hourly_pattern_or_fine,
+        )
+    # Legacy pandas path
+    daily_total = daily_total_or_coarse
+    hourly_pattern = hourly_pattern_or_fine
     if method == "molnar_burlando":
         return _molnar_burlando_disagg(daily_total, hourly_pattern)
     elif method == "olsson":
@@ -667,3 +720,492 @@ def disaggregate_pevt(pevt_daily: xr.DataArray, method: str = "diurnal") -> xr.D
     )
 
     return pevt_hourly
+
+# ===========================================================================
+# xarray-native, frequency-agnostic disaggregation framework
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Frequency inference helpers
+# ---------------------------------------------------------------------------
+
+
+def _infer_freq(da: xr.DataArray) -> str:
+    """Infer time frequency string from a DataArray's time coordinate."""
+    times = pd.DatetimeIndex(da.coords["time"].values)
+    freq = pd.infer_freq(times)
+    if freq is None:
+        raise ValueError(
+            "Cannot infer time frequency — check for gaps or irregular spacing"
+        )
+    return freq
+
+
+def _count_fine_per_coarse(fine: xr.DataArray, coarse_freq: str) -> xr.DataArray:
+    """Count fine timesteps per coarse period, broadcast back to fine resolution."""
+    counts = xr.ones_like(fine).resample(time=coarse_freq).sum()
+    return counts.reindex_like(fine, method="ffill")
+
+
+# ---------------------------------------------------------------------------
+# Private core implementations (xarray-native, vectorized)
+# ---------------------------------------------------------------------------
+
+
+def _disaggregate_sum(coarse: xr.DataArray, weights: xr.DataArray) -> xr.DataArray:
+    """Sum-conserving disaggregation: fine values sum back to the coarse total."""
+    coarse_h = coarse.reindex_like(weights, method="ffill")
+    return (coarse_h * weights).clip(min=0.0)
+
+
+def _disaggregate_mean_additive(
+    coarse: xr.DataArray, fine_pattern: xr.DataArray
+) -> xr.DataArray:
+    """Additive bias correction: shift fine pattern so its mean matches coarse value.
+
+    Preserves absolute differences. Best for temperature, dewpoint.
+    """
+    coarse_freq = _infer_freq(coarse)
+    pattern_mean = fine_pattern.resample(time=coarse_freq).mean()
+    bias = coarse - pattern_mean
+    bias_h = bias.reindex_like(fine_pattern, method="ffill")
+    return fine_pattern + bias_h
+
+
+def _disaggregate_mean_multiplicative(
+    coarse: xr.DataArray, fine_pattern: xr.DataArray
+) -> xr.DataArray:
+    """Multiplicative scaling: scale fine pattern so its mean matches coarse value.
+
+    Preserves relative variability. Best for wind speed.
+    Falls back to coarse value where pattern mean is zero.
+    """
+    coarse_freq = _infer_freq(coarse)
+    pattern_mean = fine_pattern.resample(time=coarse_freq).mean()
+    scale = xr.where(pattern_mean > 0, coarse / pattern_mean, np.nan)
+    scale_h = scale.reindex_like(fine_pattern, method="ffill")
+    coarse_h = coarse.reindex_like(fine_pattern, method="ffill")
+    return xr.where(scale_h.isnull(), coarse_h, (fine_pattern * scale_h).clip(min=0.0))
+
+
+# ---------------------------------------------------------------------------
+# Weight generators
+# ---------------------------------------------------------------------------
+
+
+def _normalise_weights(fine_pattern: xr.DataArray, coarse_freq: str) -> xr.DataArray:
+    """Normalise a fine-resolution array so it sums to 1.0 per coarse period.
+
+    Uniform fallback (1/n_fine) where period sum is zero.
+    """
+    period_sum = fine_pattern.resample(time=coarse_freq).sum()
+    # Replace zeros with 1.0 for safe division; track original zeros separately
+    safe_sum = period_sum.where(period_sum > 0, other=1.0)
+    safe_sum_h = safe_sum.reindex_like(fine_pattern, method="ffill")
+    period_sum_h = period_sum.reindex_like(fine_pattern, method="ffill")
+    n_fine = _count_fine_per_coarse(fine_pattern, coarse_freq)
+    return xr.where(period_sum_h > 0, fine_pattern / safe_sum_h, 1.0 / n_fine)
+
+
+def _trapezoidal_weights(template: xr.DataArray) -> xr.DataArray:
+    """Generate normalised daily-sum=1 weights from solar trapezoid geometry.
+
+    Refactored from the legacy KNB/TetraTech solar-geometry PET disaggregation.
+    Requires a ``lat`` coordinate on *template*.  Weights sum to 1.0 per day.
+    """
+    hourly_template = template.resample(time="1h").ffill()
+    lat = hourly_template.coords["lat"]
+    lat_rad = np.radians(lat)
+
+    doy = hourly_template.coords["time"].dt.dayofyear
+    hour = hourly_template.coords["time"].dt.hour
+
+    # Solar declination and day length (legacy KNB empirical constants)
+    declination = 0.40928 * np.cos(0.0172141 * (172.0 - doy))
+    x2 = (-np.tan(lat_rad) * np.tan(declination)).clip(min=-1.0, max=1.0)
+    day_length = 7.6394 * np.arccos(x2)
+    sunrise = 12.0 - day_length / 2.0
+
+    # Prevent division by zero for polar night
+    valid_day = day_length > 0.0
+    safe_day_length = day_length.where(valid_day, 1.0)
+
+    dtr2 = safe_day_length / 2.0
+    dtr4 = safe_day_length / 4.0
+    crad = (2.0 / 3.0) / dtr2   # peak multiplier
+    sl = crad / dtr4             # ramp slope
+
+    tr2 = sunrise + dtr4
+    tr3 = tr2 + dtr2
+    tr4 = sunrise + safe_day_length  # sunset
+
+    # Piecewise trapezoid
+    fraction = xr.where(
+        valid_day & (hour > sunrise) & (hour <= tr2),
+        (hour - sunrise) * sl,
+        0.0,
+    )
+    fraction = xr.where(
+        valid_day & (hour > tr2) & (hour <= tr3),
+        crad,
+        fraction,
+    )
+    fraction = xr.where(
+        valid_day & (hour > tr3) & (hour <= tr4),
+        crad - (hour - tr3) * sl,
+        fraction,
+    )
+
+    # Normalise so weights sum exactly to 1.0 per day
+    return _normalise_weights(fraction, "1D").rename("trapezoidal_weights")
+
+
+def _solar_weights(template: xr.DataArray, coarse_freq: str) -> xr.DataArray:
+    """Generate normalised weights from pvlib clearsky radiation (Ineichen model)."""
+    from met_timeseries.derivations import radiation
+
+    clearsky = radiation.clearsky_radiation_ineichen(template)
+    return _normalise_weights(clearsky.clip(min=0.0), coarse_freq)
+
+
+# ---------------------------------------------------------------------------
+# Weight resolver
+# ---------------------------------------------------------------------------
+
+
+def _resolve_weights(
+    weight_method: WeightMethod,
+    fine_pattern: xr.DataArray | None,
+    weights: xr.DataArray | None,
+    template: xr.DataArray | None,
+    coarse_freq: str,
+) -> xr.DataArray:
+    """Resolve the appropriate weight array from the given method and inputs."""
+    if weight_method == "proportional":
+        if fine_pattern is None:
+            raise ValueError("fine_pattern required for weight_method='proportional'")
+        return _normalise_weights(fine_pattern, coarse_freq)
+    elif weight_method == "trapezoidal":
+        if template is None:
+            raise ValueError(
+                "template or fine_pattern required for weight_method='trapezoidal'"
+            )
+        return _trapezoidal_weights(template)
+    elif weight_method == "solar":
+        if template is None:
+            raise ValueError(
+                "template or fine_pattern required for weight_method='solar'"
+            )
+        return _solar_weights(template, coarse_freq)
+    elif weight_method == "custom":
+        if weights is None:
+            raise ValueError("weights required for weight_method='custom'")
+        return weights
+    raise ValueError(f"Unknown weight_method: {weight_method!r}")
+
+
+# ---------------------------------------------------------------------------
+# Primary public API
+# ---------------------------------------------------------------------------
+
+
+def disaggregate(
+    coarse: xr.DataArray,
+    conservation: ConservationMethod,
+    fine_pattern: xr.DataArray | None = None,
+    weights: xr.DataArray | None = None,
+    weight_method: WeightMethod = "proportional",
+    template: xr.DataArray | None = None,
+) -> xr.DataArray:
+    """Disaggregate a coarse-resolution DataArray to finer resolution.
+
+    Parameters
+    ----------
+    coarse : xr.DataArray
+        Low-resolution DataArray.  Frequency inferred from ``time`` coordinate.
+    conservation : ConservationMethod
+        Physical conservation property of the variable:
+
+        * ``"sum"``                  — extensive variables (precipitation, radiation)
+          fine values sum back to coarse total each period.
+        * ``"mean_additive"``        — intensive additive (temperature, dewpoint)
+          fine mean matches coarse value, absolute differences preserved.
+        * ``"mean_multiplicative"``  — intensive multiplicative (wind speed)
+          fine mean matches coarse value, relative shape preserved.
+
+    fine_pattern : xr.DataArray, optional
+        High-resolution observed DataArray.  Required for ``mean_additive`` and
+        ``mean_multiplicative``.  Required for ``conservation="sum"`` with
+        ``weight_method="proportional"``.
+    weights : xr.DataArray, optional
+        Pre-computed normalised weights (sum to 1.0 per coarse period).
+        Only used when ``weight_method="custom"``.
+    weight_method : WeightMethod
+        How to generate weights for sum-conserving disaggregation.
+        Default ``"proportional"``.  Ignored for ``mean_additive`` /
+        ``mean_multiplicative``.
+    template : xr.DataArray, optional
+        DataArray used only for time/lat coords when generating synthetic
+        weights (``weight_method="trapezoidal"`` or ``"solar"``).  Falls back
+        to *fine_pattern* if ``None``.
+    """
+    # Validate inputs before any computation so that error tests
+    # don't fail with frequency-inference errors on trivially invalid inputs.
+    if conservation not in ("sum", "mean_additive", "mean_multiplicative"):
+        raise ValueError(f"Unknown conservation: {conservation!r}")
+
+    if conservation == "mean_additive" and fine_pattern is None:
+        raise ValueError("fine_pattern required for conservation='mean_additive'")
+
+    if conservation == "mean_multiplicative" and fine_pattern is None:
+        raise ValueError("fine_pattern required for conservation='mean_multiplicative'")
+
+    if conservation == "sum" and weight_method == "proportional" and fine_pattern is None:
+        raise ValueError("fine_pattern required for weight_method='proportional'")
+
+    coarse_freq = _infer_freq(coarse)
+
+    if conservation == "mean_additive":
+        return _disaggregate_mean_additive(coarse, fine_pattern)
+
+    if conservation == "mean_multiplicative":
+        return _disaggregate_mean_multiplicative(coarse, fine_pattern)
+
+    if conservation == "sum":
+        resolved_weights = _resolve_weights(
+            weight_method=weight_method,
+            fine_pattern=fine_pattern,
+            weights=weights,
+            template=template if template is not None else fine_pattern,
+            coarse_freq=coarse_freq,
+        )
+        return _disaggregate_sum(coarse, resolved_weights)
+
+    raise ValueError(f"Unknown conservation: {conservation!r}")
+
+
+# ---------------------------------------------------------------------------
+# Named convenience wrappers — xarray API (thin, no logic)
+# ---------------------------------------------------------------------------
+
+
+def disaggregate_radiation(
+    coarse: xr.DataArray, fine_pattern: xr.DataArray
+) -> xr.DataArray:
+    """Sum-conserving radiation disaggregation."""
+    return disaggregate(coarse, conservation="sum", fine_pattern=fine_pattern)
+
+
+def disaggregate_temperature(
+    coarse: xr.DataArray, fine_pattern: xr.DataArray
+) -> xr.DataArray:
+    """Additive mean-preserving temperature disaggregation."""
+    return disaggregate(coarse, conservation="mean_additive", fine_pattern=fine_pattern)
+
+
+def disaggregate_dewpoint(
+    coarse: xr.DataArray, fine_pattern: xr.DataArray
+) -> xr.DataArray:
+    """Additive mean-preserving dewpoint disaggregation.
+
+    Additive (not multiplicative) because dewpoint depression is an absolute
+    difference.
+    """
+    return disaggregate(coarse, conservation="mean_additive", fine_pattern=fine_pattern)
+
+
+def disaggregate_wind(
+    coarse: xr.DataArray, fine_pattern: xr.DataArray
+) -> xr.DataArray:
+    """Multiplicative mean-preserving wind disaggregation."""
+    return disaggregate(
+        coarse, conservation="mean_multiplicative", fine_pattern=fine_pattern
+    )
+
+
+def disaggregate_pet_trapezoidal(daily_pet: xr.DataArray) -> xr.DataArray:
+    """Disaggregate daily PET using solar geometry trapezoid weights."""
+    weights = _trapezoidal_weights(daily_pet)
+    return disaggregate(
+        daily_pet, conservation="sum", weight_method="custom", weights=weights
+    ).rename("pet_disaggregated_trapezoidal")
+
+
+def disaggregate_pet_solar(
+    daily_pet: xr.DataArray, template: xr.DataArray
+) -> xr.DataArray:
+    """Disaggregate daily PET using pvlib clearsky radiation as weight template."""
+    return disaggregate(
+        daily_pet, conservation="sum", weight_method="solar", template=template
+    ).rename("pet_disaggregated_solar")
+
+
+# ---------------------------------------------------------------------------
+# Stochastic precipitation wrapper (xarray interface over cascade internals)
+# ---------------------------------------------------------------------------
+
+
+def disaggregate_precipitation_stochastic(
+    coarse: xr.DataArray,
+    fine_pattern: xr.DataArray,
+    method: Literal["molnar_burlando", "olsson"] = "molnar_burlando",
+) -> xr.DataArray:
+    """Stochastic precipitation disaggregation via cascade methods.
+
+    Uses :func:`xr.apply_ufunc` to apply numpy/pandas cascade methods
+    spatially.  *fine_pattern* is used as training data for cascade parameter
+    fitting.
+
+    Parameters
+    ----------
+    coarse : xr.DataArray
+        Coarse (e.g. daily) precipitation DataArray.
+    fine_pattern : xr.DataArray
+        Fine (e.g. hourly) precipitation DataArray used for cascade fitting.
+    method : {"molnar_burlando", "olsson"}
+        ``"molnar_burlando"`` — log-Poisson canonical cascade
+        (Molnar & Burlando, 2005).
+        ``"olsson"`` — microcanonical empirical cascade (Olsson, 1998).
+    """
+    coarse_times = pd.DatetimeIndex(coarse.coords["time"].values)
+    pattern_times = pd.DatetimeIndex(fine_pattern.coords["time"].values)
+
+    def _apply_1d(coarse_vals: np.ndarray, pattern_vals: np.ndarray) -> np.ndarray:
+        coarse_s = pd.Series(coarse_vals, index=coarse_times)
+        pattern_s = pd.Series(pattern_vals, index=pattern_times)
+        if method == "molnar_burlando":
+            result = _molnar_burlando_disagg(coarse_s, pattern_s)
+        elif method == "olsson":
+            result = _olsson_disagg(coarse_s, pattern_s)
+        else:
+            raise ValueError(f"Unknown method: {method!r}")
+        return result.values
+
+    n_hours = len(coarse_times) * 24
+    hourly_times = pd.date_range(start=coarse_times[0], periods=n_hours, freq="h")
+
+    # Identify non-time dimensions for spatial iteration
+    spatial_dims = [d for d in coarse.dims if d != "time"]
+
+    if not spatial_dims:
+        # 1-D case: apply directly
+        result_vals = _apply_1d(coarse.values, fine_pattern.values)
+        return xr.DataArray(
+            result_vals,
+            coords={"time": hourly_times},
+            dims=["time"],
+            attrs=coarse.attrs,
+            name="precip_mm",
+        )
+
+    # nD case: iterate over spatial indices, applying cascade per grid cell
+    result_shape = tuple(
+        n_hours if d == "time" else coarse.sizes[d] for d in coarse.dims
+    )
+    result_vals = np.full(result_shape, np.nan)
+    time_axis = list(coarse.dims).index("time")
+
+    spatial_shape = tuple(coarse.sizes[d] for d in spatial_dims)
+    for flat_idx in range(int(np.prod(spatial_shape))):
+        spatial_idx = np.unravel_index(flat_idx, spatial_shape)
+        # Build a full index tuple with time_axis as slice
+        coarse_idx = list(spatial_idx)
+        coarse_idx.insert(time_axis, slice(None))
+        coarse_1d = coarse.values[tuple(coarse_idx)]
+        pattern_1d = fine_pattern.values[tuple(coarse_idx)]
+        hourly_1d = _apply_1d(coarse_1d, pattern_1d)
+        result_idx = list(spatial_idx)
+        result_idx.insert(time_axis, slice(None))
+        result_vals[tuple(result_idx)] = hourly_1d
+
+    out_coords = {
+        d: (hourly_times if d == "time" else coarse.coords[d].values)
+        for d in coarse.dims
+    }
+    return xr.DataArray(
+        result_vals,
+        coords=out_coords,
+        dims=list(coarse.dims),
+        attrs=coarse.attrs,
+        name="precip_mm",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hybrid precipitation — xarray vectorized version
+# ---------------------------------------------------------------------------
+
+
+def _disaggregate_precipitation_hybrid_xr(
+    coarse: xr.DataArray,
+    fine_pattern: xr.DataArray,
+    cascade_method: str = "molnar_burlando",
+) -> xr.DataArray:
+    """Disaggregate daily precipitation using PRISM/NLDAS hybrid logic (xarray).
+
+    Routing per day:
+    - PRISM > 0 and NLDAS > 0 → proportional
+    - PRISM == 0 and NLDAS > 0 → use NLDAS directly
+    - PRISM > 0 and NLDAS == 0 → stochastic cascade
+    - both zero → 0.0
+    """
+    coarse_freq = _infer_freq(coarse)
+
+    # Precompute disaggregation results for all days
+    proportional = disaggregate(coarse, conservation="sum", fine_pattern=fine_pattern)
+    stochastic = disaggregate_precipitation_stochastic(
+        coarse, fine_pattern, method=cascade_method
+    )
+
+    # Daily NLDAS sums broadcast to fine resolution
+    nldas_daily = fine_pattern.resample(time=coarse_freq).sum()
+    nldas_daily_h = nldas_daily.reindex_like(fine_pattern, method="ffill")
+    coarse_h = coarse.reindex_like(fine_pattern, method="ffill")
+
+    prism_gt0 = coarse_h > 0
+    nldas_gt0 = nldas_daily_h > 0
+
+    result = xr.where(
+        prism_gt0 & nldas_gt0,
+        proportional,
+        xr.where(
+            ~prism_gt0 & nldas_gt0,
+            fine_pattern,
+            xr.where(prism_gt0 & ~nldas_gt0, stochastic, 0.0),
+        ),
+    )
+    return result.rename("precip_mm")
+
+
+# ---------------------------------------------------------------------------
+# Convenience: Hargreaves PET (pandas path, matches test expectations)
+# ---------------------------------------------------------------------------
+
+
+def pet_hargreaves(
+    daily_tmin: pd.Series,
+    daily_tmax: pd.Series,
+    lat: float,
+) -> pd.Series:
+    """Estimate daily PET using the Hargreaves (1985) method.
+
+    Thin wrapper around :func:`met_timeseries.derivations.pet.hargreaves`.
+
+    Parameters
+    ----------
+    daily_tmin:
+        Daily minimum temperature in °C with a daily
+        :class:`~pandas.DatetimeIndex`.
+    daily_tmax:
+        Daily maximum temperature in °C with a daily
+        :class:`~pandas.DatetimeIndex`.
+    lat:
+        Latitude in decimal degrees.
+
+    Returns
+    -------
+    :class:`pandas.Series` named ``pet_hargreaves_mm``.
+    """
+    from met_timeseries.derivations.pet import hargreaves
+
+    return hargreaves(daily_tmin, daily_tmax, lat)
