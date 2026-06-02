@@ -16,7 +16,8 @@ it works with any regular lat/lon grid.  Higher-level helpers build on it:
 
 import functools
 import logging
-
+from pathlib import Path
+from met_timeseries import polygons
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -45,14 +46,52 @@ def _to_ea(geom: BaseGeometry) -> BaseGeometry:
 # ---------------------------------------------------------------------------
 # Core weight computation
 # ---------------------------------------------------------------------------
+def _calculate_raster_coverage(
+    polygon: BaseGeometry,
+    lats: tuple[float, ...],
+    lons: tuple[float, ...],
+) -> float:
+    """
+    Calculates the exact fraction of a polygon's area that falls 
+    within the bounding box of the raster grid.
+    """
+    lats_arr = np.asarray(lats, dtype=float)
+    lons_arr = np.asarray(lons, dtype=float)
 
+    if len(lats_arr) < 2 or len(lons_arr) < 2:
+        raise ValueError("At least 2 lat/lon coordinates are required.")
+
+    # 1. Infer cell dimensions
+    dx = abs(float(lons_arr[1] - lons_arr[0]))
+    dy = abs(float(lats_arr[1] - lats_arr[0]))
+
+    # 2. Create a single bounding box for the ENTIRE raster extent
+    # We add half a cell width/height to the min/max coordinates to get the true edges
+    raster_box = shapely_box(
+        lons_arr.min() - dx / 2,
+        lats_arr.min() - dy / 2,
+        lons_arr.max() + dx / 2,
+        lats_arr.max() + dy / 2,
+    )
+
+    # 3. Reproject both to equal-area to get true physical areas
+    polygon_ea = _to_ea(polygon)
+    raster_box_ea = _to_ea(raster_box)
+
+    true_area = polygon_ea.area
+    if true_area == 0:
+        return 0.0
+
+    # 4. Calculate the coverage fraction
+    intersection = polygon_ea.intersection(raster_box_ea)
+    return intersection.area / true_area
 
 @functools.lru_cache(maxsize=128)
 def _compute_weights_cached(
     polygon_wkb: bytes,
     lats: tuple[float, ...],
     lons: tuple[float, ...],
-    normalize: bool,
+    normalize: bool
 ) -> np.ndarray:
     """LRU-cached implementation; keyed on hashable WKB + coordinate tuples."""
     from shapely import from_wkb
@@ -78,8 +117,26 @@ def _compute_weights_cached(
 
     weights = np.zeros((len(lats_arr), len(lons_arr)), dtype=float)
 
+    # 1. Get the polygon's bounding box
+    minx, miny, maxx, maxy = polygon.bounds
+    
+    # 2. Add a buffer of 1 cell width/height to ensure we catch edge overlaps
+    minx -= dx
+    maxx += dx
+    miny -= dy
+    maxy += dy
+
     for i, lat in enumerate(lats_arr):
+        # SKIP if the latitude row is entirely outside the polygon's bounding box
+        if not (miny <= lat <= maxy):
+            continue
+            
         for j, lon in enumerate(lons_arr):
+            # SKIP if the longitude column is entirely outside the polygon's bounding box
+            if not (minx <= lon <= maxx):
+                continue
+                
+            # Only do the expensive math if the cell is actually near the polygon
             cell = shapely_box(
                 lon - dx / 2, lat - dy / 2, lon + dx / 2, lat + dy / 2
             )
@@ -90,6 +147,7 @@ def _compute_weights_cached(
             cell_ea = _to_ea(cell)
             inter_ea = _to_ea(intersection)
             weights[i, j] = inter_ea.area / cell_ea.area
+
 
     if normalize:
         total = weights.sum()
@@ -104,7 +162,7 @@ def compute_weights(
     lats: tuple[float, ...],
     lons: tuple[float, ...],
     *,
-    normalize: bool = False,
+    normalize: bool = False
 ) -> np.ndarray:
     """Return a 2-D weight array (shape ``len(lats) × len(lons)``).
 
@@ -144,53 +202,183 @@ def compute_weights(
     """
     return _compute_weights_cached(polygon.wkb, lats, lons, normalize)
 
+def build_weightmap(
+    datarray: xr.Dataset,
+    polygons: gpd.GeoDataFrame,
+    poly_id_columns: str | list[str] | None = None,
+    lat_dim: str = "lat",
+    lon_dim: str = "lon",
+    min_coverage: float = 0.99,
+) -> xr.Dataset:
+    """Core engine for computing spatial weights across one or many polygons."""
+    
+    lats = datarray[lat_dim].values
+    lons = datarray[lon_dim].values
+    lats_tuple = tuple(float(v) for v in lats)
+    lons_tuple = tuple(float(v) for v in lons)
 
+    # 1. PRE-ALLOCATE THE 3D ARRAY
+    weights_3d = np.zeros((len(polygons), len(lats), len(lons)), dtype=datarray[lat_dim].dtype)
+
+   
+
+    # 2. Sequential processing
+    for i, (_, row) in enumerate(polygons.iterrows()):
+        geom = row.geometry
+        
+        # Fast coverage check (using the function we built earlier)
+        coverage = _calculate_raster_coverage(geom, lats_tuple, lons_tuple)
+        
+        if coverage < min_coverage:
+            continue #TODO: log a warning here, but don't raise an error — we can still compute weights for partial coverage, we just want to be aware of it.
+            # raise ValueError(
+            #     f"Polygon at index {i} has insufficient coverage ({coverage:.2%}) of the raster grid. "
+            #     "Consider increasing 'min_coverage' or checking the polygon's geometry and the raster extent."
+            # ) 
+
+        # Heavy weight computation
+        w = compute_weights(geom, lats_tuple, lons_tuple, normalize=False)
+        total = w.sum()
+        
+        if total == 0:
+            raise ValueError(f"Polygon {i} has 0 total weight despite passing coverage.")
+            
+        weights_3d[i, :, :] = (w / total)
+
+    
+    # 3. Build coordinates
+    coords = {
+        "polygon_index": np.arange(len(polygons)),
+        lat_dim: lats,
+        lon_dim: lons
+    }
+    
+    # Safely handle ID columns if they were provided
+    if poly_id_columns:
+        for col in poly_id_columns:
+            coords[col] = ("polygon_index", polygons[col].to_numpy(dtype=object))
+    
+    weights_ds = xr.Dataset(
+        data_vars={"weights": (["polygon_index", lat_dim, lon_dim], weights_3d)},
+        coords=coords,
+        attrs={"description": "Precomputed spatial weights for polygon aggregation"}
+    )
+    
+    # valid mask first array in dataset
+    valid_mask = datarray.isel(time=0).notnull()
+    weights_ds = weights_ds * valid_mask
+    return weights_ds
 
 # ---------------------------------------------------------------------------
 # High-level aggregation functions
 # ---------------------------------------------------------------------------
 
-def plot_weights(
+
+def get_weights(
     polygon: BaseGeometry,
     dataset: xr.Dataset,
     lat_dim: str = "lat",
     lon_dim: str = "lon",
-    normalize: bool = True,
+    min_coverage: float = 0.99,
+) -> xr.Dataset:
+    """
+    Return grid-cell weights for a single polygon as an xarray Dataset.
+    This wraps build_weightmap to guarantee identical output formats.
+    """
+    # Wrap the single geometry in a temporary GeoDataFrame
+    gdf = gpd.GeoDataFrame(geometry=[polygon], crs="EPSG:4326")
+    
+    # Call the engine; if the polygon is out of bounds, the engine 
+    # will automatically raise the ValueError for us.
+    return build_weightmap(
+        dataset=dataset,
+        polygons=gdf,
+        poly_id_columns=None,
+        lat_dim=lat_dim,
+        lon_dim=lon_dim,
+        min_coverage=min_coverage
+    )
+
+def weighted_mean_timeseries(
+    dataset: xr.Dataset,
+    polygon: BaseGeometry,
+    lat_dim: str = "lat",
+    lon_dim: str = "lon",
+) -> xr.Dataset:
+    """Collapse a (time, lat, lon) Dataset to one (time,) Dataset."""
+    w_da = get_weights(polygon, dataset, lat_dim=lat_dim, lon_dim=lon_dim)["weights"]
+    # Native xarray multiplication and sum over spatial dimensions!
+    # This automatically handles 2D, 3D, and NaN values, keeping time coordinates intact.
+    result_ds = (dataset * w_da['weights']).sum(dim=[lat_dim, lon_dim])
+    return result_ds
+
+def _weight_dataset(
+    dataset: xr.Dataset,
+    weights: xr.Dataset,
+    lat_dim: str = "lat",
+    lon_dim: str = "lon",
+) -> xr.Dataset:
+    """Collapse a (time, lat, lon) Dataset to one (time,) Dataset."""
+    # Native xarray multiplication and sum over spatial dimensions!
+    # This automatically handles 2D, 3D, and NaN values, keeping time coordinates intact.
+    result_ds = (dataset * weights['weights']).sum(dim=[lat_dim, lon_dim])
+    return result_ds
+
+
+def save_weightmap(weight_ds: xr.Dataset, path: str | Path):
+    encoding = {
+        "weights": {
+            "zlib": True,       # Turn on compression
+            "complevel": 5,     # 1 is fastest, 9 is smallest. 4-5 is the sweet spot.
+            # Optional but highly recommended: chunking
+            # This makes reading individual polygons much faster
+            "chunksizes": (1, len(weight_ds.lat), len(weight_ds.lon)) 
+        }
+    }
+    weight_ds.to_netcdf(path, engine="netcdf4", encoding=encoding)
+
+
+
+def plot_weights(
+    polygon: BaseGeometry,
+    weights: xr.Dataset,
+    lat_dim: str = "lat",
+    lon_dim: str = "lon",
 ) -> "matplotlib.axes.Axes":
     """Plot the weight grid for a polygon overlaid on the dataset grid."""
     import matplotlib.pyplot as plt
 
-    w_ds = get_weights(polygon, dataset, lat_dim=lat_dim, lon_dim=lon_dim, normalize=normalize)
 
-    weights = w_ds["weight"].where(w_ds["weight"] > 0)
+    #weights = weights["weights"].where(weights["weights"] > 0)
 
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.set_facecolor("lightgrey")
 
-    weights.plot.pcolormesh(
-        x=lon_dim, y=lat_dim,
-        ax=ax,
-        cmap="YlOrRd",
-        edgecolors="grey",
-        linewidths=0.3,
-        cbar_kwargs={"label": "Weight", "shrink": 0.8},
-    )
+    weights.plot()
+    # weights.plot.pcolormesh(
+    #     x=lon_dim, y=lat_dim,
+    #     ax=ax,
+    #     cmap="YlOrRd",
+    #     edgecolors="grey",
+    #     linewidths=0.3,
+    #     cbar_kwargs={"label": "Weight", "shrink": 0.8},
+    # )
 
     gpd.GeoSeries([polygon], crs="EPSG:4326").boundary.plot(
         ax=ax, color="blue", linewidth=2, label="Polygon of interest",
     )
 
     # extent = union of grid bounds + polygon bounds, with padding
-    lats = dataset[lat_dim].values
-    lons = dataset[lon_dim].values
+    lats = weights[lat_dim].values
+    lons = weights[lon_dim].values
     dy = abs(float(lats[1] - lats[0])) / 2
     dx = abs(float(lons[1] - lons[0])) / 2
     poly_bounds = polygon.bounds  # (minx, miny, maxx, maxy)
 
-    xmin = min(lons.min() - dx, poly_bounds[0]) - dx
-    xmax = max(lons.max() + dx, poly_bounds[2]) + dx
-    ymin = min(lats.min() - dy, poly_bounds[1]) - dy
-    ymax = max(lats.max() + dy, poly_bounds[3]) + dy
+    xmin =  poly_bounds[0] - dx*2
+    xmax = poly_bounds[2] + dx*2
+    ymin = poly_bounds[1] - dy*2
+    ymax = poly_bounds[3] + dy*2
 
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
@@ -199,250 +387,3 @@ def plot_weights(
     ax.set_title("Grid-Cell Weights")
 
     return ax
-
-def get_weights(
-    polygon: BaseGeometry,
-    dataset: xr.Dataset,
-    lat_dim: str = "lat",
-    lon_dim: str = "lon",
-    normalize: bool = True,
-) -> xr.Dataset:
-    """Return grid-cell weights as an xarray Dataset aligned to the input grid.
-
-    The returned Dataset has a single variable ``weight`` with the same
-    lat/lon coordinates as *dataset*.
-    """
-    lats = dataset[lat_dim].values
-    lons = dataset[lon_dim].values
-
-    w = compute_weights(
-        polygon,
-        tuple(float(v) for v in lats),
-        tuple(float(v) for v in lons),
-        normalize=normalize,
-    )
-
-    return xr.Dataset(
-        {"weight": xr.DataArray(w, dims=[lat_dim, lon_dim], coords={lat_dim: lats, lon_dim: lons})},
-    )
-
-def get_greid(
-    dataset: xr.Dataset,
-    lat_dim: str = "lat",
-    lon_dim: str = "lon",
-) -> gpd.GeoDataFrame:
-    """Build a GeoDataFrame of grid-cell polygons from an xarray Dataset.
-
-    Columns: lat, lon, row_id, column_id, geometry, test
-    """
-    lats = dataset[lat_dim].values
-    lons = dataset[lon_dim].values
-
-    dy = abs(float(lats[1] - lats[0]))
-    dx = abs(float(lons[1] - lons[0]))
-    half_x = dx / 2.0
-    half_y = dy / 2.0
-
-    records = []
-    for row_id, lat in enumerate(lats):
-        for col_id, lon in enumerate(lons):
-            records.append({
-                "lat": float(lat),
-                "lon": float(lon),
-                "row_id": row_id,
-                "column_id": col_id,
-                "geometry": shapely_box(
-                    lon - half_x, lat - half_y,
-                    lon + half_x, lat + half_y,
-                ),
-            })
-
-    return gpd.GeoDataFrame(records, crs="EPSG:4326")
-
- 
-def aggregate_over_polygon(
-    dataset: xr.Dataset,
-    polygon: BaseGeometry,
-    lat_dim: str = "lat",
-    lon_dim: str = "lon",
-) -> dict[str, list[float] | float]:
-    """Compute the spatial weighted mean of each variable over *polygon*.
-
-    Each grid cell's contribution is proportional to the fraction of its
-    area that overlaps *polygon*.  If no cells overlap the polygon the
-    function falls back to the nearest grid point to the polygon centroid.
-
-    Parameters
-    ----------
-    dataset:
-        xarray Dataset with at least *lat_dim* and *lon_dim* coordinates.
-    polygon:
-        Shapely geometry for the area of interest.
-    lat_dim, lon_dim:
-        Dimension names.
-
-    Returns
-    -------
-    dict
-        Variable name → scalar (2-D) or list of floats (3-D with time).
-    """
-    lats = dataset[lat_dim].values
-    lons = dataset[lon_dim].values
-
-    w = compute_weights(
-        polygon,
-        tuple(float(v) for v in lats),
-        tuple(float(v) for v in lons),
-        normalize=False,
-    )
-
-    total_weight = w.sum()
-
-    if total_weight == 0:
-        cx, cy = polygon.centroid.x, polygon.centroid.y
-        lat_idx = int(np.argmin(np.abs(lats - cy)))
-        lon_idx = int(np.argmin(np.abs(lons - cx)))
-        w = np.zeros_like(w)
-        w[lat_idx, lon_idx] = 1.0
-        total_weight = 1.0
-
-    result: dict[str, list[float] | float] = {}
-    for var in dataset.data_vars:
-        arr = dataset[var].values
-        if arr.ndim == 2:
-            result[str(var)] = float(np.nansum(arr * w) / total_weight)
-        elif arr.ndim == 3:
-            result[str(var)] = (
-                np.nansum(arr * w[np.newaxis, :, :], axis=(1, 2)) / total_weight
-            ).tolist()
-        else:
-            values = arr.ravel()
-            result[str(var)] = (
-                float(np.nanmean(values)) if len(values) > 0 else float("nan")
-            )
-
-    return result
-
-
-def weighted_mean_timeseries(
-    dataset: xr.Dataset,
-    polygon: BaseGeometry,
-    lat_dim: str = "lat",
-    lon_dim: str = "lon",
-    time_dim: str = "time",
-) -> dict[str, pd.Series]:
-    """Collapse a (time, lat, lon) Dataset to one Series per variable.
-
-    This is the primary entry point for producing polygon-level timeseries
-    that can be fed into the disaggregation pipeline.
-
-    Parameters
-    ----------
-    dataset:
-        xarray Dataset with ``(time, lat, lon)`` dimensions.
-    polygon:
-        Shapely geometry for the area of interest.
-    lat_dim, lon_dim, time_dim:
-        Dimension names.
-
-    Returns
-    -------
-    dict[str, pandas.Series]
-        Variable name → Series with DatetimeIndex.
-    """
-    lats = dataset[lat_dim].values
-    lons = dataset[lon_dim].values
-
-    w = compute_weights(
-        polygon,
-        tuple(float(v) for v in lats),
-        tuple(float(v) for v in lons),
-        normalize=True,
-    )
-
-    total = w.sum()
-    if total == 0:
-        cx, cy = polygon.centroid.x, polygon.centroid.y
-        lat_idx = int(np.argmin(np.abs(lats - cy)))
-        lon_idx = int(np.argmin(np.abs(lons - cx)))
-        w = np.zeros_like(w)
-        w[lat_idx, lon_idx] = 1.0
-
-    times = pd.DatetimeIndex(dataset[time_dim].values)
-
-    result: dict[str, pd.Series] = {}
-    for var in dataset.data_vars:
-        arr = dataset[var].values
-        if arr.ndim == 3:
-            values = np.nansum(arr * w[np.newaxis, :, :], axis=(1, 2))
-        elif arr.ndim == 2:
-            values = np.full(len(times), np.nansum(arr * w))
-        else:
-            values = np.full(len(times), float("nan"))
-        result[str(var)] = pd.Series(values, index=times, name=var)
-
-    return result
-
-
-
-
-
-    
-def _compute_weights_gpd(
-    polygons: gpd.GeoDataFrame,
-    polygon_id_col: str = "metzone_id",
-    grid: gpd.GeoDataFrame | None = None,
-) -> pd.DataFrame:
-    """Compute area-overlap weights between polygons and the grid.
-
-    For each polygon, finds all grid cells that intersect it and
-    computes the fractional overlap area. Weights are normalized so they
-    sum to 1.0 per polygon.
-
-    Parameters
-    ----------
-    polygons:
-        GeoDataFrame of user polygons (e.g., dissolved metzones).
-    polygon_id_col:
-        Column name for the polygon identifier.
-    grid: gpd.GeoDataFrame | None = None,
-        Pre-generated grid GeoDataFrame. If None, generates one
-        clipped to the total bounds of *polygons* (with a small buffer).
-
-    Returns
-    -------
-    pandas.DataFrame
-        Columns: ``[polygon_id_col, "lat_center", "lon_center", "weight"]``.
-        Weights sum to 1.0 per polygon.
-    """
-
-    # Ensure matching CRS
-    polygons = polygons.to_crs("EPSG:4326")
-    grid = grid.to_crs("EPSG:4326")
-
-    # Compute polygon areas in equal-area projection for accuracy
-    poly_areas = polygons.to_crs("EPSG:6933").geometry.area
-
-    # Intersection
-    intersection = gpd.overlay(
-        polygons[[polygon_id_col, "geometry"]],
-        grid[["lat_center", "lon_center", "geometry"]],
-        how="intersection",
-    )
-
-    # Compute overlap area in equal-area projection
-    intersection["overlap_area"] = intersection.to_crs("EPSG:6933").geometry.area
-
-
-    # Attach polygon area for normalization
-    area_map = dict(zip(polygons[polygon_id_col], poly_areas))
-    intersection["poly_area"] = intersection[polygon_id_col].map(area_map)
-    intersection["weight"] = intersection["overlap_area"] / intersection["poly_area"]
-
-    # Normalize per polygon so weights sum to 1.0
-    weight_sum = intersection.groupby(polygon_id_col)["weight"].transform("sum")
-    intersection["weight"] = intersection["weight"] / weight_sum
-
-    return intersection[[polygon_id_col, "lat_center", "lon_center", "weight"]].reset_index(
-        drop=True
-    )
