@@ -104,6 +104,19 @@ def clearsky_radiation_ineichen(
 
     return xr.DataArray(clearsky_values, dims=dataarray.dims, coords=dataarray.coords)
 
+def lazy_clearsky_ineichen(shortwave: xr.DataArray) -> xr.DataArray:
+    """Wraps the eager pvlib clearsky function for lazy Dask evaluation."""
+    
+    return xr.apply_ufunc(
+        clearsky_radiation_ineichen, # Your existing pvlib wrapper function
+        shortwave,                   # The lazy Dask input
+        dask="parallelized",         # The magic keyword that prevents RAM spikes
+        output_dtypes=[float],       # Crucial: Dask needs to know what type comes out without computing it
+        # If your function needs to operate along a specific dimension (like time), 
+        # uncomment and adjust the line below:
+        # vectorize=True 
+    )
+
 def extra_radiation(
     hourly_template: xr.DataArray
 ) -> xr.DataArray:
@@ -538,3 +551,74 @@ def net_radiation_arm(
     )
 
     return (rns - rnl).rename("net_radiation_arm")
+
+
+
+def _ineichen_1d(lat: float, lon: float, times: pd.DatetimeIndex) -> np.ndarray:
+    """Core PVLib calculation for clear-sky radiation at a single point."""
+    loc = pvlib.location.Location(latitude=lat, longitude=lon)
+    cs = loc.get_clearsky(times, model="ineichen")
+    return cs["ghi"].values
+
+def _solar_elevation_1d(lat: float, lon: float, times: pd.DatetimeIndex) -> np.ndarray:
+    """Core PVLib calculation for solar elevation at a single point."""
+    loc = pvlib.location.Location(latitude=lat, longitude=lon)
+    solpos = loc.get_solarposition(times)
+    return solpos["apparent_elevation"].values
+
+
+# --- 2. The Dask-Friendly Xarray Wrappers ---
+
+def _clearsky_radiation_ineichen(dataarray: xr.DataArray) -> xr.DataArray:
+    """
+    Build a clear-sky radiation array lazily.
+    Automatically adapts to 2D grids (lat, lon) or 1D arrays (polygon_id).
+    """
+    times_pd = pd.DatetimeIndex(dataarray.coords["time"].values)
+    
+    # Broadcast handles the geometry. 
+    # If inputs are 1D polygon centroids, it yields 1D arrays. 
+    # If inputs are lat/lon vectors, it builds a 2D mesh grid.
+    lat_grid, lon_grid = xr.broadcast(dataarray.coords["lat"], dataarray.coords["lon"])
+
+    clearsky_da = xr.apply_ufunc(
+        _ineichen_1d,
+        lat_grid,
+        lon_grid,
+        kwargs={"times": times_pd},
+        input_core_dims=[[], []],    # Lat and Lon are scalars per point
+        output_core_dims=[['time']], # The output adds a time dimension
+        vectorize=True,              # Let Dask handle the looping
+        dask="parallelized",
+        output_dtypes=[float]
+    )
+
+    # Reorder dimensions to exactly match the input template
+    return clearsky_da.transpose(*dataarray.dims)
+
+def _daytime_mask_solar_elevation(
+    dataarray: xr.DataArray,
+    min_solar_elevation: float = 10.0,
+    lat_coord: str = "lat",
+    lon_coord: str = "lon",
+) -> xr.DataArray:
+    """
+    Lazily compute a boolean daytime mask based on solar elevation.
+    """
+    times_pd = pd.DatetimeIndex(dataarray.coords["time"].values)
+    lat_grid, lon_grid = xr.broadcast(dataarray.coords[lat_coord], dataarray.coords[lon_coord])
+
+    elevation_da = xr.apply_ufunc(
+        _solar_elevation_1d,
+        lat_grid,
+        lon_grid,
+        kwargs={"times": times_pd},
+        input_core_dims=[[], []],
+        output_core_dims=[['time']],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[float]
+    )
+
+    elevation_da = elevation_da.transpose(*dataarray.dims)
+    return elevation_da >= min_solar_elevation
