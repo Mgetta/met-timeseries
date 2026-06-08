@@ -27,19 +27,9 @@ def adjust_wind_height(
     return adjusted.rename("wind_speed_ms")
 
 def wind_speed(u: xr.DataArray, v: xr.DataArray) -> xr.DataArray:
-    """Compute wind speed from U and V components using MetPy."""
-    from metpy.calc import wind_speed as _mpc_wind_speed
-    from metpy.units import units
+    """Compute wind speed from U and V components."""
 
-    u_q = u.values * units("m/s")
-    v_q = v.values * units("m/s")
-    ws = _mpc_wind_speed(u_q, v_q)
-    return xr.DataArray(
-        ws.magnitude,
-        dims=u.dims,
-        coords=u.coords,
-        name="wind_speed_ms",
-    )
+    return ((u**2 + v**2)**0.5).rename("wind_speed_ms")
 
 # Transfer functions
 def wind_function_kohler(wind_speed_ms: xr.DataArray) -> xr.DataArray:
