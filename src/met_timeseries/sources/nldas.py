@@ -85,6 +85,7 @@ _NLDAS_RESOLUTION: float = 0.125
 def fetch_nldas(
     date: str,
     cache_dir: str,
+    overwrite_cache: bool = False,
     bounds: BoundingBox | None = None,
     variables: list[str] | None = None,
     max_connections: int = 8,
@@ -131,7 +132,7 @@ def fetch_nldas(
 
     date = dt.date.fromisoformat(date)
     cache_path = Path(cache_dir) / f"{_CACHE_PREFIX}{date.strftime('%Y%m%d')}.nc"
-    if cache_path.exists():
+    if cache_path.exists() and not overwrite_cache:
         ds = _read_from_cache(cache_path)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars: # Add missing variables to the existing dataset
@@ -232,6 +233,60 @@ def download(
         timestamps = [start_ts + np.timedelta64(h, "h") for h in range(n_hours)]
         ds = ds.assign_coords(time=timestamps)
 
+    return ds
+
+def download_bulk(
+    start_date: dt.date,
+    end_date: dt.date,
+    max_connections: int = 3,
+    bounds: BoundingBox = CACHE_BOUNDS
+) -> xr.Dataset:
+    """Download and subset granules using optimized bulk downloads and lazy loading."""
+    import earthaccess
+    import tempfile
+    earthaccess.login()
+    results = search_nldas_granules(start_date, end_date, bounds)
+    
+    # 1. Use a temporary directory for raw files. It automatically cleans up afterward.
+    with tempfile.TemporaryDirectory() as temp_dir:
+        
+        logger.info(f"Downloading {len(results)} raw granules to temporary storage...")
+        
+        # 2. Let earthaccess handle the concurrent downloading (it uses `pqdm` under the hood)
+        downloaded_paths = earthaccess.download(
+            results, 
+            local_path=temp_dir, 
+            threads=max_connections
+        )
+        
+        if not downloaded_paths:
+            raise RuntimeError(f"All downloads failed for {start_date} to {end_date}")
+
+        # 3. Use xarray's native multi-file handler with Dask for fast, parallel reading
+        logger.info("Loading and subsetting dataset...")
+        ds = xr.open_mfdataset(
+            downloaded_paths, 
+            engine="h5netcdf", 
+            combine="nested",
+            concat_dim="time",
+            parallel=True # Leverages Dask to read metadata in parallel
+        )
+          
+        # 5. Clip spatially lazily using xarray's indexing, which will be efficient with Dask's chunking. The clipping is done before loading the data into memory, so only the relevant subset of the data is read.
+        ds = _clip_dataset(ds, bounds)
+            
+        # 6. Fix the time coordinate if needed
+        if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.datetime64):
+            n_hours = ds.sizes["time"]
+            start_ts = np.datetime64(start_date, "ns")
+            timestamps = [start_ts + np.timedelta64(h, "h") for h in range(n_hours)]
+            ds = ds.assign_coords(time=timestamps)
+
+        # 7. Execute the graph: This reads the local files, clips them, and loads only 
+        # the requested data into memory.
+        ds = ds.load()
+
+    # The temp_dir and raw 0.125-degree CONUS files are automatically deleted here
     return ds
 
 def get_nldas_gridcells(bounds: BoundingBox) -> gpd.GeoDataFrame:

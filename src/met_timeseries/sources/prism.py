@@ -372,7 +372,7 @@ def _load_from_zip(zip_path: Path, variable: str, resolution: str, date: dt.date
     date_str = date.strftime("%Y%m%d")
 
     vsi_path = f"/vsizip/{zip_path.as_posix()}/prism_{variable}_us_{_resolution}_{date_str}.tif"
-    import rioxarray  # type: ignore[import]
+    #import rioxarray  # type: ignore[import]
 
     with xr.open_dataarray(vsi_path, engine="rasterio") as da:
 

@@ -18,7 +18,7 @@ import xarray as xr
 from met_timeseries.config import PipelineConfig
 from met_timeseries.polygons import load_polygons
 from met_timeseries.ledger import is_complete, mark_complete, get_incomplete
-from met_timeseries.aggregation import aggregate_over_polygon
+from met_timeseries.weights import aggregate_over_polygon
 from met_timeseries.io import save_timeseries
 from met_timeseries.sources.nldas import fetch_nldas_grid
 from met_timeseries.sources.prism import fetch_prism
