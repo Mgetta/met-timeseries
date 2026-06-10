@@ -1,6 +1,6 @@
 # met-timeseries
 
-Meteorological timeseries downloading and processing for hydrologic models.
+Meteorological timeseries downloading and processing for hydrologic modeling. A rough work in progress.
 
 ## Overview
 
