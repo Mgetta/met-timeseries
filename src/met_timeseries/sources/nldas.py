@@ -1,33 +1,3 @@
-"""
-NLDAS-2 data source.
-
-Architecture
-------------
-The module separates data access into three layers:
-
-**Download layer** – acquires raw per-cell timeseries:
-    :func:`download_datarods` fetches raw hourly data from the Giovanni
-    Time Series API for every NLDAS grid cell within a bounding box.
-    It is independent of any weighting and caches raw per-cell CSVs.
-
-**Processing layer** – spatial aggregation:
-    :func:`process_nldas` is the main entry point for the datarods
-    workflow.  It calls :func:`download_datarods`, derives area-overlap
-    weights automatically from the bounding box and NLDAS grid (via
-    :func:`compute_nldas_weights`), and computes polygon-level
-    weighted-average timeseries via :func:`compute_weighted_averages`.
-    Pre-computed weights may also be supplied.
-
-**Grid download layer** – full gridded NetCDF access:
-    :func:`fetch_nldas_grid` downloads full NLDAS-2 gridded files via
-    ``earthaccess`` and returns an :class:`xarray.Dataset`.
-
-Data access uses the ``earthaccess`` library, which handles NASA Earthdata
-authentication automatically via ``~/.netrc``, environment variables
-(``EARTHDATA_USERNAME`` / ``EARTHDATA_PASSWORD``), or an interactive prompt.
-Users need a free NASA Earthdata account: https://urs.earthdata.nasa.gov
-"""
-
 from __future__ import annotations
 
 import concurrent.futures
@@ -43,7 +13,7 @@ import pandas as pd
 import xarray as xr
 from shapely.geometry import box
 
-from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
+from met_timeseries.geometry import CACHE_BOUNDS, BoundingBox, clip_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +106,6 @@ def fetch_nldas(
         ds = _read_from_cache(cache_path)
         missing_vars = [var for var in variables if var not in ds.data_vars]
         if missing_vars: # Add missing variables to the existing dataset
-            print(missing_vars)
             ds_missing = download(date, 
                                   date, 
                                   missing_vars, 
@@ -154,7 +123,7 @@ def fetch_nldas(
         _write_to_cache(ds, cache_path)
 
     if bounds is not None:
-        ds = _clip_dataset(ds, bounds=bounds)
+        ds = clip_dataset(ds, bounds=bounds)
 
     return ds.load()
 
@@ -273,7 +242,7 @@ def download_bulk(
         )
           
         # 5. Clip spatially lazily using xarray's indexing, which will be efficient with Dask's chunking. The clipping is done before loading the data into memory, so only the relevant subset of the data is read.
-        ds = _clip_dataset(ds, bounds)
+        ds = clip_dataset(ds, bounds)
             
         # 6. Fix the time coordinate if needed
         if "time" not in ds.coords or not np.issubdtype(ds["time"].dtype, np.datetime64):
@@ -318,45 +287,18 @@ def _read_from_cache(cache_path: Path) -> xr.Dataset:
     
     #  if bounds is None:
     #      bounds = CACHE_BOUNDS
-    #  ds_clipped = _clip_dataset(ds, bounds=bounds)
+    #  ds_clipped = clip_dataset(ds, bounds=bounds)
     #  ds.close() #Do I have to close the dataset before loading the clipped version? I think so, otherwise the file handle will remain open until the garbage collector closes it, which could lead to too many open files if many datasets are loaded.
     #  return ds_clipped.load()
-
-def _bounds_to_polygon(bounds: BoundingBox):
-    """Return a Shapely box polygon for *bounds*."""
-    return box(bounds.west, bounds.south, bounds.east, bounds.north)
 
 def _open_and_clip(file_obj: object, bounds: BoundingBox | None = None) -> xr.Dataset:
     """Open a file-like object as an xarray Dataset and clip to bounds."""
     ds = xr.open_dataset(file_obj, engine="h5netcdf")
     if bounds is None:
         bounds = CACHE_BOUNDS
-    ds_clipped = _clip_dataset(ds, bounds=bounds).load()
+    ds_clipped = clip_dataset(ds, bounds=bounds).load()
     ds.close()
     return ds_clipped
-
-def _clip_dataset(
-    ds: xr.Dataset,
-    bounds: BoundingBox,
-) -> xr.Dataset:
-    """Clip an xarray Dataset to the given spatial bounding box."""
-    lats = ds.lat.values
-    lons = ds.lon.values
-
-    # pad by half a cell so we include cells whose edges overlap the bounds
-    half_dy = abs(float(lats[1] - lats[0])) / 2
-    half_dx = abs(float(lons[1] - lons[0])) / 2
-
-    if lats[0] > lats[-1]:
-        lat_slice = slice(bounds.north + half_dy, bounds.south - half_dy)
-    else:
-        lat_slice = slice(bounds.south - half_dy, bounds.north + half_dy)
-
-    ds = ds.sel(
-        lat=lat_slice,
-        lon=slice(bounds.west - half_dx, bounds.east + half_dx),
-    )
-    return ds
 
 
 def search_nldas_granules(

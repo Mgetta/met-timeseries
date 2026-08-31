@@ -25,7 +25,7 @@ import numpy as np
 import xarray as xr
 from shapely.geometry import box as shapely_box
 
-from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
+from met_timeseries.geometry import CACHE_BOUNDS, BoundingBox, clip_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ def fetch_mrms(
     _cache_dataset(ds, cache_path)
 
     if bounds is not None:
-        ds = _clip_dataset(ds, bounds=bounds)
+        ds = clip_dataset(ds, bounds=bounds)
     return ds.load()
 
 
@@ -243,7 +243,6 @@ def _download(date: dt.date, hour: int) -> xr.Dataset:
                 engine="cfgrib",
                 backend_kwargs={"indexpath": ""},
             )
-
             # --- rename spatial coords ---
             rename_map: dict[str, str] = {}
             if "latitude" in ds_raw.coords:
@@ -290,7 +289,7 @@ def _download(date: dt.date, hour: int) -> xr.Dataset:
                 ds_raw = ds_raw.drop_vars(coords_to_drop)
 
             # --- clip to CACHE_BOUNDS immediately ---
-            ds_clipped = _clip_dataset(ds_raw, bounds=CACHE_BOUNDS)
+            ds_clipped = clip_dataset(ds_raw, bounds=CACHE_BOUNDS)
             result = ds_clipped.load()
 
     finally:
@@ -301,44 +300,6 @@ def _download(date: dt.date, hour: int) -> xr.Dataset:
                 logger.debug("Failed to close raw GRIB2 dataset", exc_info=True)
 
     return result
-
-
-def _clip_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
-    """Clip *ds* to *bounds* with a half-cell pad.
-
-    Works for both ascending and descending ``lat`` arrays.
-
-    Parameters
-    ----------
-    ds:
-        Dataset with ``lat`` and ``lon`` dimensions.
-    bounds:
-        Spatial bounding box.
-
-    Returns
-    -------
-    xarray.Dataset
-        Subset of *ds* whose cells overlap *bounds*.
-    """
-    lats = ds.lat.values
-    lons = ds.lon.values
-
-    # pad by half a cell so cells whose edges overlap the bounds are included
-    half_dy = abs(float(lats[1] - lats[0])) / 2
-    half_dx = abs(float(lons[1] - lons[0])) / 2
-
-    if lats[0] > lats[-1]:
-        # descending lat (north → south)
-        lat_slice = slice(bounds.north + half_dy, bounds.south - half_dy)
-    else:
-        # ascending lat (south → north)
-        lat_slice = slice(bounds.south - half_dy, bounds.north + half_dy)
-
-    ds = ds.sel(
-        lat=lat_slice,
-        lon=slice(bounds.west - half_dx, bounds.east + half_dx),
-    )
-    return ds
 
 
 def _cache_dataset(ds: xr.Dataset, cache_path: Path) -> Path:
@@ -395,6 +356,6 @@ def _load_from_cache(
         bounds = CACHE_BOUNDS
 
     ds = xr.open_dataset(cache_path)
-    ds_clipped = _clip_dataset(ds, bounds=bounds)
+    ds_clipped = clip_dataset(ds, bounds=bounds)
     ds.close()
     return ds_clipped.load()

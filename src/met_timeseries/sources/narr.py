@@ -34,7 +34,7 @@ import numpy as np
 import xarray as xr
 import xesmf as xe
 
-from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
+from met_timeseries.geometry import CACHE_BOUNDS, BoundingBox, clip_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,7 @@ def fetch_narr(
 
 
     if bounds is not None:
-        ds = _clip_dataset(ds, bounds=bounds)
+        ds = clip_dataset(ds, bounds=bounds)
         
 
     return ds.load()
@@ -324,28 +324,6 @@ _NARR_PROJ4 = (
     "+no_defs"
 )
 
-def _clip_dataset(
-    ds: xr.Dataset,
-    bounds: BoundingBox,
-) -> xr.Dataset:
-    """Clip an xarray Dataset to the given spatial bounding box."""
-    lats = ds.lat.values
-    lons = ds.lon.values
-
-    # pad by half a cell so we include cells whose edges overlap the bounds
-    half_dy = abs(float(lats[1] - lats[0])) / 2
-    half_dx = abs(float(lons[1] - lons[0])) / 2
-
-    if lats[0] > lats[-1]:
-        lat_slice = slice(bounds.north + half_dy, bounds.south - half_dy)
-    else:
-        lat_slice = slice(bounds.south - half_dy, bounds.north + half_dy)
-
-    ds = ds.sel(
-        lat=lat_slice,
-        lon=slice(bounds.west - half_dx, bounds.east + half_dx),
-    )
-    return ds
 
 def _clip_conformal_dataset(ds: xr.Dataset, bounds: BoundingBox) -> xr.Dataset:
     """Subset NARR data to a bounding box using rioxarray.

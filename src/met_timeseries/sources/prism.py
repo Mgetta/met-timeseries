@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from met_timeseries.sources.base import CACHE_BOUNDS, BoundingBox
+from met_timeseries.geometry import CACHE_BOUNDS, BoundingBox, clip_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ def fetch_prism(
 
     # Clip to user bounds and shift time coordinate to reflect 12Z–12Z accumulation window
     if bounds is not None:
-        ds = _clip_dataset(ds, bounds=bounds) 
+        ds = clip_dataset(ds, bounds=bounds) 
     ds = _shift_time_coord(ds)
     return ds.load()
 
@@ -305,28 +305,6 @@ def _clip_dataarray(da: xr.DataArray, bounds: BoundingBox) -> xr.DataArray:
     )
     return da
 
-def _clip_dataset(
-    ds: xr.Dataset,
-    bounds: BoundingBox,
-) -> xr.Dataset:
-    """Clip an xarray Dataset to the given spatial bounding box."""
-    lats = ds.lat.values
-    lons = ds.lon.values
-
-    # pad by half a cell so we include cells whose edges overlap the bounds
-    half_dy = abs(float(lats[1] - lats[0])) / 2
-    half_dx = abs(float(lons[1] - lons[0])) / 2
-
-    if lats[0] > lats[-1]:
-        lat_slice = slice(bounds.north + half_dy, bounds.south - half_dy)
-    else:
-        lat_slice = slice(bounds.south - half_dy, bounds.north + half_dy)
-
-    ds = ds.sel(
-        lat=lat_slice,
-        lon=slice(bounds.west - half_dx, bounds.east + half_dx),
-    )
-    return ds
 
 
 
@@ -347,7 +325,7 @@ def _read_from_cache(cache_path: Path) -> xr.DataArray:
     return xr.open_dataset(cache_path)
     # if bounds is None:
     #     bounds = CACHE_BOUNDS
-    # da_clipped = _clip_dataset(ds, bounds=bounds)
+    # da_clipped = clip_dataset(ds, bounds=bounds)
     # ds.close()
     # return da_clipped.load()
 
