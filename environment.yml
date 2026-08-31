@@ -18,9 +18,7 @@ dependencies:
   - netcdf4
   - cfgrib>=0.9
   - eccodes
-  # --- Regridding ---
-  - xesmf
-  - esmpy
+  # --- Regridding (add if needed) xesmf, esmpy--- 
   # --- Remote data access ---
   - earthaccess>=0.9
   - requests>=2.28
