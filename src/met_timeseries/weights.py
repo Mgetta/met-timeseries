@@ -245,6 +245,9 @@ def build_weightmap(
             
         weights_3d[i, :, :] = (w / total)
 
+
+    valid_mask = datarray.isel(time=0).load().notnull().values  # shape (lat, lon)
+    weights_3d = weights_3d * valid_mask[np.newaxis, :, :]
     
     # 3. Build coordinates
     coords = {
@@ -258,16 +261,12 @@ def build_weightmap(
         for col in poly_id_columns:
             coords[col] = ("polygon_index", polygons[col].to_numpy(dtype=object))
     
-    weights_ds = xr.Dataset(
+    
+    return xr.Dataset(
         data_vars={"weights": (["polygon_index", lat_dim, lon_dim], weights_3d)},
         coords=coords,
-        attrs={"description": "Precomputed spatial weights for polygon aggregation"}
+        attrs={"description": "Precomputed spatial weights for polygon aggregation"},
     )
-    
-    # valid mask first array in dataset
-    valid_mask = datarray.isel(time=0).notnull()
-    weights_ds = weights_ds * valid_mask
-    return weights_ds
 
 # ---------------------------------------------------------------------------
 # High-level aggregation functions
