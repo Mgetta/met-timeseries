@@ -1,0 +1,183 @@
+1 
+PRISM Gridded Dataset Downloads via Web Service
+(document last updated 26 Mar 2025) 
+DOCUMENT CONTENTS
+• Introduction 
+• Data Availability
+• Data File Contents
+• Download Limits 
+• Data Web Service Usage
+• Sample Bulk Data Download Script
+• Release Date Web Service Usage
+• Grid Count Web Service Usage
+INTRODUCTION
+An open web service is available for downloads of individual PRISM grids, one grid per request, at all resolutions. 
+Via this web service, PRISM grids are delivered in COG (Cloud Optimized GeoTIFF) format; however, there is 
+an option to download grids in other raster data formats (see the Data Web Service Usage section).
+Other types of files can be downloaded manually using the prism.oregonstate.edu website. For more information 
+on the formats, and for a complete explanation of the file naming conventions, see the data formats section of the 
+website. The files available via this web service use the following file naming scheme: 
+prism_<variable>_<region>_<resolution>_<time_period>.zip 
+<variable> 
+ppt (precipitation)
+tmin (minimum temperature) 
+tmax (maximum temperature) 
+tmean (mean temperature) 
+tdmean (mean dewpoint) 
+vpdmin (minimum vapor pressure deficit) 
+vpdmax (maximum vapor pressure deficit)
+IMPORTANT NOTICE
+This document describes the new PRISM web service, which is currently in effect, replaces all prior 
+web services, and will continue to operate going forward. The old PRISM web service can still be 
+accessed but will be disabled on September 30, 2025. Documentation for the old web service can be 
+found here: https://prism.oregonstate.edu/documents/PRISM_downloads_web_service_v1.pdf
+2 
+<region> us, ak, hi, pr (Corresponding to: CONUS, Alaska, Hawaii, Puerto Rico)
+<resolution> 15s, 30s, 25m (Corresponding to: 400m, 800m, 4km)
+<time_period> 
+Daily data:
+ <yyyymmdd> = 8-digit numerical designation for year, month, day 
+Monthly data: 
+ <yyyymm> = 6-digit numerical designation for year, month 
+Annual data: 
+ <yyyy> = 4-digit numerical designation for year
+Before downloading data, be sure to acquaint yourself with our terms of use, which explain how to 
+acknowledge any use of our data.
+In addition to the data web service, we also provide a “Release Date” web service. This service is intended to 
+provide the end user with the ability to obtain the date on which a grid was most recently processed and released. In 
+this manner, the user can avoid downloading an entire grid simply to determine whether it is newer than their 
+current copy (ideally as a scripted process that compares retrieved release dates against grids on the user’s 
+filesystem).
+The Release Date service provides a few columns of information per grid and can be requested for a single grid or a 
+range of grids. See the “RELEASE DATE WEB SERVICE USAGE” section at the end of this document.
+You may want to reference the PRISM update schedule document for details on when and how often PRISM grids 
+are updated to incorporate new station data and quality control procedures. Data older than six months are 
+considered stable and should not change until a new time series version is released.
+DATA AVAILABILITY
+Data Web Service
+Currently, the following PRISM data (i.e., grids in COG format) can be downloaded via the web service:
+• Variables:
+o ppt, tmin, tmax, tmean, tdmean, vpdmin, vpdmax (as time series grids) 
+• Recent data: 1981 to present; complete daily, monthly, and annual data 
+• Historical data: 1895 through 1980; complete monthly and annual data 
+• Regions: Currently CONUS is the only region available, but we will be adding data for Hawaii, Alaska, 
+and Puerto Rico in the future
+NOTE: The PRISM 30-year normals are not available via this web service. They can be downloaded via FTP, or 
+on the PRISM website.
+Release Date Web Service
+Release Date information is maintained from April 2014 forward. Requests for Release Date information on grids 
+older than April 2014 will return an unpopulated line. 
+3
+The Release Date web service currently supports requests for the following time series climate variables: ppt, tmin, 
+tmax, tmean, tdmean, vpdmin, vpdmax.
+DATA FILE CONTENTS
+Each COG grid is a collection of files delivered as a single compressed .zip file, essentially comprising a “grid
+package.” Data downloaded in other raster formats will contain similar ancillary files in each .zip file. To illustrate, 
+each COG grid package contains the following files:
+• <filename>.tif – Cloud Optimized GeoTIFF (COG) raster data file (includes header info)
+• <filename>.tif.aux.xml – auxiliary file containing grid statistics (primarily for Esri software)
+• <filename>.info.txt – information file containing various internal PRISM parameters
+• <filename>.prj – projection file describing the coordinate system
+• <filename>.stn.csv – CSV file containing information about the weather stations that provided input data to 
+the PRISM model run that produced the associated grid
+• <filename>.stx – auxiliary file containing grid statistics (for all GIS software)
+• <filename>.xml – FGDC-compliant metadata file describing the dataset
+DOWNLOAD LIMITS
+Download activity is continuously monitored. To prevent rogue download scripts from exceeding bandwidth limits, 
+if a file is downloaded twice in a 24-hour period, no more downloads of that file will be allowed during that period.
+Repeated excessive download activity may result in IP address blocking, at our discretion.
+4 
+DATA WEB SERVICE USAGE
+Time Series (daily, monthly, annual) Data Request Syntax
+To initiate a request via this web service, use a client (e.g., web browser, the wget or curl utility, etc.) that can 
+perform an http request with the following parameters: 
+https://services.nacse.org/prism/data/get/<region>/<res>/<element>/<date><?format=[nc|asc|bil]>
+Where:
+• <element> is ppt, tmin, tmax, tmean, tdmean, vpdmin, or vpdmax 
+• <region> is us, hi, ak, pr
+o us – CONUS (conterminous United States – the 48 states)
+o hi – Hawaii (not yet implemented)
+o ak – Alaska (not yet implemented)
+o pr – Puerto Rico (not yet implemented) 
+• <res> is 400m, 800m, 4km (400m not yet implemented) 
+• <date> is:
+o YYYYMMDD for daily data (19810101 to present) – returns a single grid in a .zip file 
+o YYYYMM for monthly data (189501 to present) – returns a single grid in a .zip file
+o YYYY for annual data (1895 to present) – returns a single grid in a .zip file 
+• <?format=[nc|asc|bil]>: optional command that will deliver the data in the specified format.
+Format options: 
+o nc: netCDF format (https://www.unidata.ucar.edu/software/netcdf) 
+o asc: ASCII Grid format (https://www.loc.gov/preservation/digital/formats/fdd/fdd000421.shtml) 
+o bil: BIL format (https://desktop.arcgis.com/en/arcmap/latest/manage-data/raster-and-images/bilbip-and-bsq-raster-files.htm) 
+Note that by default, this web service provides PRISM “AN” (all networks) data. It is also possible to download 
+PRISM “LT” (long-term) 800m monthly data via this web service. To do so, add “/lt” to the end of the URL 
+request, prior to any format options. For more information about AN vs. LT, see the PRISM Datasets document. 
+ Example: https://services.nacse.org/prism/data/get/us/800m/tmax/200506/lt
+If you are uncertain which type of PRISM dataset you have downloaded, simply look inside the “info.txt” file
+associated with the grid. In that file, the parameter PRISM_DATASET_TYPE will indicate whether the grid is 
+type AN or LT. 
+Valid HTTP examples: 
+800m daily grid: https://services.nacse.org/prism/data/get/us/800m/tmin/20090405
+4km monthly grid: https://services.nacse.org/prism/data/get/us/4km/ppt/199504
+4km netCDF monthly grid: https://services.nacse.org/prism/data/get/us/4km/tmin/202204?format=nc
+Valid UNIX command line example:
+wget --content-disposition https://services.nacse.org/prism/data/get/us/4km/tmin/20191121
+5
+SAMPLE BULK DOWNLOAD SCRIPT
+This web service provides a single grid per request. To perform a bulk download of multiple grids, you can create
+and run a script or batch job. An example Perl script is provided below – this example script will download a
+year’s worth of 4km daily ppt grids. (Note that it’s important to use the --content-disposition switch with the
+wget command to preserve the original filename, as in the following example.)
+#!/usr/bin/perl
+use strict;
+use warnings;
+use DateTime;
+my $day;
+my $clim_var = 'ppt';
+my $base_url = 'https://services.nacse.org/prism/data/get/us/4km';
+my $start = DateTime->new( day => 1, month => 1, year => 1999 );
+my $stop = DateTime->new( day => 31, month => 12, year => 1999 );
+while($start <= $stop) {
+ $day = $start->strftime('%Y%m%d'); #place date in proper format
+ system("wget --content-disposition $base_url/$clim_var/$day");
+ sleep 2; #to be nice to our server
+ $start->add(days => 1);
+}
+6 
+RELEASE DATE WEB SERVICE USAGE
+To initiate a request via this web service, use a client (web browser, the wget utility, etc.) that can perform an HTTP
+request with the following parameters:
+https://services.nacse.org/prism/data/get/releaseDate//<region>/<resolution><element>/<date>
+The <region>, <resolution>, <element>, and <date> content and syntax is identical to the description in the “DATA 
+WEB SERVICE USAGE” section above.
+By default, the output is delivered as tab-delimited text. The output may also be requested in JSON format, by 
+adding “?json=true” to the end of the request URL. The following columns of data are provided: 
+Data date (e.g., 1999-01-01) 
+Release date (e.g., 2013-01-14) 
+Element (e.g., tmin) 
+Grid count (e.g., 6) 
+Data URL (e.g., https://services.nacse.org/prism/data/get/us/4km/tmin/19990101) 
+This web service can provide grid release date information for a single grid, or a range of grids. Examples of both 
+approaches are given below. 
+Valid HTTP examples for a single grid:
+800m ppt daily grid: https://services.nacse.org/prism/data/get/releaseDate/us/800m/ppt/20090405?json=true
+4km tmax monthly grid: https://services.nacse.org/prism/data/get/releaseDate/us/4km/tmax/200904
+Valid HTTP examples for a range of grids:
+800m daily grids: https://services.nacse.org/prism/data/get/releaseDate/us/800m/ppt/19990101/19991231
+4km monthly grids: https://services.nacse.org/prism/data/get/releaseDate/us/800m/tmin/199201/199212?json=true
+7 
+GRID COUNT WEB SERVICE USAGE
+Over the prior six months, the PRISM monthly grids are updated a total of seven times, and the daily grids eight 
+times, before becoming stable. The gridCount web service provides the user access to the update number (1-8) as 
+an alternative way to determine whether the user has downloaded the latest release.
+The grid count update number is identical for a PRISM grid regardless of resolution. In other words, the 4km 
+PRISM daily tmin grid for 20220319 will have the same update number as the equivalent 800m grid.
+To initiate a request via this web service, use a client (web browser, the wget utility, etc.) that can perform an HTTP 
+request with the following parameters:
+https://services.nacse.org/prism/data/get/gridCount/<region>/<element>/<date>
+The <region>, <resolution>, <element>, and <date> content and syntax is identical to the description in the “DATA 
+WEB SERVICE USAGE” section above.
+This web service provides a single integer (e.g., 6) for a single grid at a time.
+Valid HTTP examples:
+Daily grid: https://services.nacse.org/prism/data/get/gridCount/us/tmax/20150819
+Monthly grid: https://services.nacse.org/prism/data/get/gridCount/us/ppt/201507
