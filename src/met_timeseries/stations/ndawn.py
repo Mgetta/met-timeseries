@@ -17,7 +17,7 @@ import time
 from io import StringIO
 from urllib.request import urlopen, Request
 import requests
-
+import re
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
@@ -205,11 +205,49 @@ def _to_xarray_dataset(
 
     return ds
 
-def get_stations() -> gpd.GeoDataFrame:
+
+def _fetch_station_details(url: str) -> dict:
+    """
+    Helper function to fetch and parse individual NDAWN station details.
+    Returns a dictionary of the parsed variables.
+    """
+    import re
+    # Initialize default values in case the request fails or data is missing
+    details = {
+        'period_of_record': None,
+        'elevation_ft': None,
+        'lat': None,
+        'lon': None
+    }
+    
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status() # Raise an exception for bad HTTP status codes
+        station_html = resp.text
+        
+        # Extract details using regex
+        lat_match = re.search(r'Latitude:.*?<td>\s*([-\d\.]+)\s*&deg;', station_html, re.DOTALL)
+        lon_match = re.search(r'Longitude:.*?<td>\s*([-\d\.]+)\s*&deg;', station_html, re.DOTALL)
+        elev_match = re.search(r'Elevation:.*?<td>\s*([\d\.]+)\s*feet', station_html, re.DOTALL)
+        por_match = re.search(r'Period of record:.*?<td>\s*(.*?)\s*</td>', station_html, re.DOTALL)
+        
+        # Safely assign values if matches were found
+        if lat_match: details['lat'] = float(lat_match.group(1))
+        if lon_match: details['lon'] = float(lon_match.group(1))
+        if elev_match: details['elevation_ft'] = float(elev_match.group(1))
+        if por_match: details['period_of_record'] = por_match.group(1)
+        
+    except requests.RequestException as e:
+        print(f"Network error fetching details for {url}: {e}")
+    except Exception as e:
+        print(f"Parsing error for {url}: {e}")
+        
+    return details
+
+def get_stations(details = True) -> gpd.GeoDataFrame:
     """Return a GeoDataFrame of available NDAWN stations in MN."""
     
         
-    import re
 
     response = requests.get(_STATION_INFO_URL)
     # Save the HTML snippet you provided to a variable
@@ -234,15 +272,33 @@ def get_stations() -> gpd.GeoDataFrame:
         
         if id_match:
             internal_id = id_match.group(1)
-            
+            station_url = f"https://ndawn.ndsu.nodak.edu{station_url}"
+            station_details = _fetch_station_details(station_url)
+
+
             stations.append({
-                'name': station_name,
-                'url': f"https://ndawn.ndsu.nodak.edu{station_url}",
-                'internal_id': internal_id
-            })
+                        'name': station_name,
+                        'internal_id': internal_id,
+                        'url': station_url,
+                        **station_details 
+                    })
 
     print(f"Found {len(stations)} stations!")
-    return pd.DataFrame(stations)
+    df = pd.DataFrame(stations)
+    
+    # Drop rows where coordinates are missing so geopandas doesn't crash
+    df_clean = df.dropna(subset=['lat', 'lon'])
+    if len(df) != len(df_clean):
+        print(f"Dropped {len(df) - len(df_clean)} stations due to missing coordinates.")
+
+    # 4. Cast to GeoDataFrame
+    gdf = gpd.GeoDataFrame(
+        df_clean, 
+        geometry=gpd.points_from_xy(df_clean.lon, df_clean.lat),
+        crs="EPSG:4326"
+    )
+
+    return gdf
 
 
 def get_station_data_daily(station_id,variables = None, begin_year = 1996, end_year = 2026, as_dataset = True):
