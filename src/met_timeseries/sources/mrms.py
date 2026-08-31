@@ -95,6 +95,38 @@ def fetch_mrms(
     return ds.load()
 
 
+
+def download(date: dt.date, cache_dir: Path) -> xr.Dataset:
+    """Download all 24 hourly GRIB2 files for *date* and return a merged Dataset.
+
+    Failed hours are skipped with a warning.  A :exc:`RuntimeError` is raised
+    only when all 24 hours fail.
+
+    Parameters
+    ----------
+    date:
+        The calendar date to download.
+    cache_dir:
+        Passed through to :func:`_download_hour` for temp-file placement.
+
+    Returns
+    -------
+    xarray.Dataset
+        Dataset with 24 time steps (or fewer if some hours were skipped),
+        clipped to :data:`CACHE_BOUNDS`.
+    """
+    
+    hourly_datasets: list[xr.Dataset] = []
+    for hour in range(24):
+        ds = _download(date, hour)
+        hourly_datasets.append(ds)
+
+    ds = xr.concat(
+        sorted(hourly_datasets, key=lambda d: d["time"].values[0]),
+        dim="time",
+    )
+    return ds
+
 def generate_grid(
     west: float = -130.0,
     south: float = 20.0,
@@ -144,60 +176,19 @@ def generate_grid(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _download_day(date: dt.date, cache_dir: Path) -> xr.Dataset:
-    """Download all 24 hourly GRIB2 files for *date* and return a merged Dataset.
-
-    Failed hours are skipped with a warning.  A :exc:`RuntimeError` is raised
-    only when all 24 hours fail.
-
-    Parameters
-    ----------
-    date:
-        The calendar date to download.
-    cache_dir:
-        Passed through to :func:`_download_hour` for temp-file placement.
-
-    Returns
-    -------
-    xarray.Dataset
-        Dataset with 24 time steps (or fewer if some hours were skipped),
-        clipped to :data:`CACHE_BOUNDS`.
-    """
-    date_str = date.strftime("%Y%m%d")
-    hourly_datasets: list[xr.Dataset] = []
-
-    for hour in range(24):
-        url = _URL_TEMPLATE.format(
-            YYYY=date.strftime("%Y"),
-            MM=date.strftime("%m"),
-            DD=date.strftime("%d"),
-            YYYYMMDD=date_str,
-            HH=f"{hour:02d}",
-        )
-        try:
-            ds_hour = _download_hour(url, date, hour)
-            hourly_datasets.append(ds_hour)
-        except (OSError, ValueError, RuntimeError, KeyError) as exc:
-            logger.warning(
-                "Skipping MRMS hour %02d for %s due to error: %s",
-                hour,
-                date_str,
-                exc,
-            )
-
-    if not hourly_datasets:
-        raise RuntimeError(
-            f"All 24 hourly MRMS downloads failed for {date_str}"
-        )
-
-    ds = xr.concat(
-        sorted(hourly_datasets, key=lambda d: d["time"].values[0]),
-        dim="time",
+def _construct_url(date: dt.date, hour: int) -> str:
+    """Construct the IEM MRMS archive URL for a given date and hour."""
+    return _URL_TEMPLATE.format(
+        YYYY=date.strftime("%Y"),
+        MM=date.strftime("%m"),
+        DD=date.strftime("%d"),
+        YYYYMMDD=date.strftime("%Y%m%d"),
+        HH=f"{hour:02d}",
     )
-    return ds
 
 
-def _download_hour(url: str, date: dt.date, hour: int) -> xr.Dataset:
+
+def _download(date: dt.date, hour: int) -> xr.Dataset:
     """Download and decode a single gzipped GRIB2 hourly MRMS file.
 
     Steps:
@@ -230,7 +221,7 @@ def _download_hour(url: str, date: dt.date, hour: int) -> xr.Dataset:
     gz_path: Path | None = None
     grib_path: Path | None = None
     ds_raw: xr.Dataset | None = None
-
+    url = _construct_url(date, hour)
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
