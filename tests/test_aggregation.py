@@ -39,7 +39,7 @@ def _make_dataset_3d(lats, lons, ntimes=3, value=1.0) -> xr.Dataset:
 class TestComputeWeights:
     def test_full_containment_weight_one(self) -> None:
         """A polygon that fully contains a cell gives weight 1.0 for that cell."""
-        from met_timeseries.aggregation import _compute_weights
+        from met_timeseries.weights import _compute_weights
 
         lats = (0.0,)
         lons = (0.0,)
@@ -52,7 +52,7 @@ class TestComputeWeights:
 
     def test_partial_overlap_weight_between_0_and_1(self) -> None:
         """A polygon partially overlapping a cell gives weight strictly between 0 and 1."""
-        from met_timeseries.aggregation import _compute_weights
+        from met_timeseries.weights import _compute_weights
 
         # Grid: single cell centred at (0, 0); dx=dy=0.125 (default for 1-point grid).
         # Cell extent: (-0.0625, -0.0625) → (0.0625, 0.0625).
@@ -65,7 +65,7 @@ class TestComputeWeights:
 
     def test_no_overlap_weight_zero(self) -> None:
         """A polygon that doesn't overlap any cell gives all-zero weights."""
-        from met_timeseries.aggregation import _compute_weights
+        from met_timeseries.weights import _compute_weights
 
         lats = (0.0,)
         lons = (0.0,)
@@ -75,7 +75,7 @@ class TestComputeWeights:
 
     def test_weights_cached(self) -> None:
         """Calling _compute_weights twice returns the same array object (cached)."""
-        from met_timeseries.aggregation import _compute_weights
+        from met_timeseries.weights import _compute_weights
 
         lats = (0.0, 0.1)
         lons = (0.0, 0.1)
@@ -92,7 +92,7 @@ class TestComputeWeights:
 class TestAggregateOverPolygon:
     def test_uniform_field_returns_same_value(self) -> None:
         """For a uniform field the weighted mean equals the constant value."""
-        from met_timeseries.aggregation import aggregate_over_polygon
+        from met_timeseries.weights import aggregate_over_polygon
 
         lats = np.array([0.0, 0.1, 0.2])
         lons = np.array([0.0, 0.1, 0.2])
@@ -104,7 +104,7 @@ class TestAggregateOverPolygon:
     def test_weighted_mean_differs_from_boolean_mean(self) -> None:
         """Area-weighted mean should differ from a simple point-in-polygon mean
         when edge cells have heterogeneous values and partial overlap."""
-        from met_timeseries.aggregation import aggregate_over_polygon
+        from met_timeseries.weights import aggregate_over_polygon
 
         # 3-cell grid, only the middle cell is fully inside; the left and right
         # cells are partially overlapped.  Values differ across columns.
@@ -128,7 +128,7 @@ class TestAggregateOverPolygon:
 
     def test_fallback_nearest_point_when_no_overlap(self) -> None:
         """When polygon doesn't overlap any cell, fall back to nearest centroid."""
-        from met_timeseries.aggregation import aggregate_over_polygon
+        from met_timeseries.weights import aggregate_over_polygon
 
         lats = np.array([0.0, 0.1])
         lons = np.array([0.0, 0.1])
@@ -144,7 +144,7 @@ class TestAggregateOverPolygon:
 
     def test_3d_data_handled(self) -> None:
         """3-D (time, lat, lon) arrays should produce a list of per-timestep spatial means."""
-        from met_timeseries.aggregation import aggregate_over_polygon
+        from met_timeseries.weights import aggregate_over_polygon
 
         lats = np.array([0.0, 0.1, 0.2])
         lons = np.array([0.0, 0.1, 0.2])
@@ -157,7 +157,7 @@ class TestAggregateOverPolygon:
 
     def test_partial_overlap_weight_applied(self) -> None:
         """A polygon covering exactly half a single cell should give weight ~0.5."""
-        from met_timeseries.aggregation import _compute_weights
+        from met_timeseries.weights import _compute_weights
 
         lats = np.array([0.0])
         lons = np.array([0.0])
