@@ -326,8 +326,8 @@ def cloud_cover_davis(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using the Davis (1975) method."""
-    clearsky = clearsky_radiation_ineichen(shortwave)
-    daytime_mask = daytime_mask_solar_elevation(shortwave, min_solar_elevation=min_clearsky)
+    clearsky = _clearsky_radiation_ineichen(shortwave)
+    daytime_mask = _daytime_mask_solar_elevation(shortwave, min_solar_elevation=min_clearsky)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         clearness_index = (shortwave / clearsky).clip(0.0, 1.0)
@@ -359,8 +359,8 @@ def cloud_cover_thompson(
     coeffs: tuple[float, float, float] | None = None,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction using Thompson's (1976) parabolic method."""
-    clearsky = clearsky_radiation_ineichen(shortwave)
-    daytime_mask = daytime_mask_solar_elevation(shortwave, min_solar_elevation)
+    clearsky = _clearsky_radiation_ineichen(shortwave)
+    daytime_mask = _daytime_mask_solar_elevation(shortwave, min_solar_elevation=min_solar_elevation)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         kt = (shortwave / clearsky).clip(0.0, 1.0)
@@ -379,8 +379,8 @@ def cloud_cover_linear(
     min_clearsky: float = 10.0,
 ) -> xr.DataArray:
     """Estimate cloud-cover fraction (linear method)."""
-    clearsky = clearsky_radiation_ineichen(shortwave)
-    daytime_mask = daytime_mask_solar_elevation(shortwave, min_solar_elevation=min_clearsky)
+    clearsky = _clearsky_radiation_ineichen(shortwave)
+    daytime_mask = _daytime_mask_solar_elevation(shortwave, min_solar_elevation=min_clearsky)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         cc = 1.0 - shortwave / clearsky
