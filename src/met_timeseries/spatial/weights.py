@@ -1,23 +1,8 @@
-"""
-Zonal statistics: aggregate raster data over a polygon.
-"""
-"""
-Zonal statistics: aggregate gridded data over polygons.
-
-The core weight computation (:func:`compute_weights`) is source-agnostic —
-it works with any regular lat/lon grid.  Higher-level helpers build on it:
-
-* :func:`aggregate_over_polygon` — weighted mean of an xarray Dataset
-  (replaces the previous implementation)
-* :func:`weighted_mean_timeseries` — collapse (time, lat, lon) → (time,)
-  returning a pandas Series per variable, convenient for disaggregation
-"""
 
 
 import functools
 import logging
 from pathlib import Path
-from met_timeseries import polygons
 import numpy as np
 import pandas as pd
 import geopandas as gpd

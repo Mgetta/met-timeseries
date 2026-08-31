@@ -13,7 +13,7 @@ import pandas as pd
 import xarray as xr
 
 from met_timeseries import derivations, disaggregation
-from met_timeseries.weights import weighted_mean_timeseries
+from met_timeseries.spatial.weights import weighted_mean_timeseries
 
 logger = logging.getLogger(__name__)
 

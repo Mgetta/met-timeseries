@@ -10,12 +10,12 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-from met_timeseries import weights
+from met_timeseries.spatial import weights
 from met_timeseries.forcings import nldas
 import xarray as xr
 
 from met_timeseries import derivations, disaggregation
-from met_timeseries.weights import weighted_mean_timeseries
+from met_timeseries.spatial.weights import weighted_mean_timeseries
 
 logger = logging.getLogger(__name__)
 

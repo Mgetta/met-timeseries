@@ -29,10 +29,10 @@ dates = [date.date().strftime("%Y-%m-%d") for date in pd.date_range(start_date,e
 
 #%% Imports
 import pandas as pd
-from met_timeseries.stations import ndawn
+from met_timeseries.sources.stations import ndawn
 from met_timeseries import forcings
 from met_timeseries import derivations, disaggregation
-from met_timeseries.weights import weighted_mean_timeseries
+from met_timeseries.spatial.weights import weighted_mean_timeseries
 from met_timeseries.sources.nldas import BoundingBox
 from met_timeseries.sources import nldas, prism, narr
 from met_timeseries.utils import mem_gb, hdf5WDM

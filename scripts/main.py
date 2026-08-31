@@ -4,11 +4,11 @@
 import geopandas as gpd
 from met_timeseries.sources.base import BoundingBox
 from met_timeseries.sources import prism
-from met_timeseries import  weights
+from met_timeseries.spatial import  weights
 from met_timeseries.utils import clip_dataset, hdf5WDM
 import xarray as xr
 import pandas as pd
-from met_timeseries.stations import ndawn
+from met_timeseries.sources.stations import ndawn
 import matplotlib.pyplot as plt
 from pathlib import Path
 import dask.dataframe as dd
