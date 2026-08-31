@@ -8,7 +8,15 @@ import numpy as np
 #from dask.distributed import Client
 #%%
 
+'''
+Some notes on the process:
+1. Storing the 30 year cache to a zarr required batch loading as I did not have enough RAM to open the entire multi-year dataset at once, even with the optimized open_mfdataset kwargs.
+2. Netcdf4 files must have identical coordinate dimensions. ran into issues with different lat/lon lengths and some instances where an hour of the NLDAS data was missing. This is fine when opening individually, but when writing to Zarr or opening using xr.open_mfdataset it crashes due to misaligned time coordinate. I had to write a quick audit function to identify and re download the bad files before the final zarr conversion.
+    - Note that this does not mean that the coordinate are correct just that they have the same shape. I did not check the actual values of lat/lon, just that they had the same shape. I spot checked a few files and they looked correct, but there may be some drift in the grid over time that I did not catch.
 
+
+
+'''
 # def main():
 #     # Setup client here
 #     #client = Client(n_workers=4, threads_per_worker=1, memory_limit="3GB")
