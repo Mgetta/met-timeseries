@@ -2,26 +2,6 @@ import xarray as xr
 from shapely.geometry import box
 
 
-
-#: Fixed clip boundary encompassing all HUC-8 watersheds that drain to or
-#: from Minnesota.  Used as the download/cache extent for both PRISM and
-#: NLDAS so that cached files are reusable across any metzone within MN.
-#:
-#: Approximate extent (rounded outward to the nearest 0.5°):
-#:   West:  -97.5   (western MN border + Red River basin into ND/SD)
-#:   South:  43.0   (southern MN border + Iowa/SD headwaters)
-#:   East:  -89.0   (eastern MN border + St. Croix into WI)
-#:   North:  50.0   (northern MN border + Rainy River into Ontario)
-
-CACHE_BOUNDS = BoundingBox(west=-97.5, south=43.0, east=-89.0, north=50.0)
-
-
-
-def bounds_to_polygon(bounds: BoundingBox):
-    """Return a Shapely box polygon for *bounds*."""
-    return box(bounds.west, bounds.south, bounds.east, bounds.north)
-
-
 class BoundingBox:
     """Axis-aligned bounding box in geographic coordinates (EPSG:4326)."""
 
@@ -47,6 +27,22 @@ class BoundingBox:
             and self.east >= other.east
             and self.north >= other.north
         )
+
+#: Fixed clip boundary encompassing all HUC-8 watersheds that drain to or
+#: from Minnesota.  Used as the download/cache extent for both PRISM and
+#: NLDAS so that cached files are reusable across any metzone within MN.
+#:
+#: Approximate extent (rounded outward to the nearest 0.5°):
+#:   West:  -97.5   (western MN border + Red River basin into ND/SD)
+#:   South:  43.0   (southern MN border + Iowa/SD headwaters)
+#:   East:  -89.0   (eastern MN border + St. Croix into WI)
+#:   North:  50.0   (northern MN border + Rainy River into Ontario)
+# This is more of a config and will eventually move there I suspect.
+CACHE_BOUNDS = BoundingBox(west=-97.5, south=43.0, east=-89.0, north=50.0)
+
+def bounds_to_polygon(bounds: BoundingBox):
+    """Return a Shapely box polygon for *bounds*."""
+    return box(bounds.west, bounds.south, bounds.east, bounds.north)
 
 
 def clip_dataset(
@@ -79,3 +75,5 @@ def clip_dataset(
     })
     
     return ds_clipped
+
+
