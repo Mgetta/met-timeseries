@@ -14,10 +14,32 @@ import geopandas as gpd
 
 logger = logging.getLogger(__name__)
 
+def _dissolve_catchments(gdf: gpd.GeoDataFrame, metzone_column: str) -> gpd.GeoDataFrame:
+    n_catchments = len(gdf)
+    dissolved = gdf.dissolve(by=metzone_column).reset_index()
+    n_metzones = len(dissolved)
+
+    logger.info(
+        "Dissolved %d catchments into %d metzones using column '%s'",
+        n_catchments,
+        n_metzones,
+        metzone_column,
+    )
+
+    # Validate and fix geometries
+    invalid_mask = ~dissolved.geometry.is_valid
+    if invalid_mask.any():
+        n_invalid = int(invalid_mask.sum())
+        logger.warning("Fixing %d invalid geometries with .buffer(0)", n_invalid)
+        dissolved.loc[invalid_mask, "geometry"] = (
+            dissolved.loc[invalid_mask, "geometry"].buffer(0)
+        )
+
+    return dissolved
 
 def load_polygons(
     catchment_path: str,
-    metzone_column: str,
+    metzone_column: str = None,
     target_crs: str = "EPSG:4326",
 ) -> gpd.GeoDataFrame:
     """Load a catchment vector file and dissolve catchments into metzones.
@@ -53,33 +75,23 @@ def load_polygons(
     else:
         gdf = gpd.read_file(catchment_path)
 
-    if metzone_column not in gdf.columns:
-        available = ", ".join(gdf.columns.tolist())
+    if gdf.crs is None:
         raise ValueError(
-            f"Column '{metzone_column}' not found in '{catchment_path}'. "
-            f"Available columns: {available}"
+            f"Input file '{catchment_path}' has no CRS defined."
         )
 
-    n_catchments = len(gdf)
-    dissolved = gdf.dissolve(by=metzone_column).reset_index()
-    n_metzones = len(dissolved)
+    if metzone_column is None:
+        dissolved = gdf
+    else:
+        if metzone_column not in gdf.columns:
+            available = ", ".join(gdf.columns.tolist())
+            raise ValueError(
+                f"Column '{metzone_column}' not found in '{catchment_path}'. "
+                f"Available columns: {available}"
+            )
 
-    logger.info(
-        "Dissolved %d catchments into %d metzones using column '%s'",
-        n_catchments,
-        n_metzones,
-        metzone_column,
-    )
-
-    # Validate and fix geometries
-    invalid_mask = ~dissolved.geometry.is_valid
-    if invalid_mask.any():
-        n_invalid = int(invalid_mask.sum())
-        logger.warning("Fixing %d invalid geometries with .buffer(0)", n_invalid)
-        dissolved.loc[invalid_mask, "geometry"] = (
-            dissolved.loc[invalid_mask, "geometry"].buffer(0)
-        )
-
+        dissolved = _dissolve_catchments(gdf, metzone_column)
+    
     # Reproject to target CRS
     if dissolved.crs is None:
         logger.warning("Input has no CRS; assuming %s", target_crs)
