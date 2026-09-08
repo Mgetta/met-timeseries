@@ -97,7 +97,7 @@ def fetch_aorc(
 
     # In case the cached version covers a larger bounding box than currently requested
     if bounds is not None:
-        ds = _clip_dataset(ds, bounds=bounds)
+        ds = clip_dataset(ds, bounds=bounds)
 
     return ds.load()
 

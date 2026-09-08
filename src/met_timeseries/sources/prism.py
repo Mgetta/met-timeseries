@@ -23,6 +23,8 @@ import zipfile
 from pathlib import Path
 import numpy as np
 import xarray as xr
+import geopandas as gpd
+from shapely.geometry import box as shapely_box
 
 from met_timeseries.geometry import CACHE_BOUNDS, BoundingBox, clip_dataset
 
@@ -243,8 +245,6 @@ def generate_grid(
 
     Columns: lat, lon, row_id, column_id, geometry
     """
-    import geopandas as gpd
-    from shapely.geometry import box as shapely_box
 
     res_degrees = {"4km": 1 / 24, "800m": 1 / 120}
     if resolution not in res_degrees:
