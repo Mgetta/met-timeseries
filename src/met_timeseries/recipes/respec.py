@@ -11,7 +11,7 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 from met_timeseries.spatial import weights
-from met_timeseries.forcings import nldas
+from met_timeseries.recipes import nldas
 import xarray as xr
 
 from met_timeseries import derivations, disaggregation
