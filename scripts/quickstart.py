@@ -18,7 +18,7 @@ configure ~/.netrc as described at:
 https://disc.gsfc.nasa.gov/data-access#python-requests
 """
 #%%
-from met_timeseries import forcings
+from met_timeseries import recipes
 from met_timeseries.sources import nldas, prism
 import pandas as pd
 
@@ -30,7 +30,7 @@ dates = [date.date().strftime("%Y-%m-%d") for date in pd.date_range(start_date,e
 #%% Imports
 import pandas as pd
 from met_timeseries.sources.stations import ndawn
-from met_timeseries import forcings
+from met_timeseries import recipes
 from met_timeseries import derivations, disaggregation
 from met_timeseries.spatial.weights import weighted_mean_timeseries
 from met_timeseries.sources.nldas import BoundingBox
