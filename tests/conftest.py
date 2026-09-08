@@ -58,20 +58,18 @@ def make_grid(
     return xr.Dataset({var_name: (dims, data)}, coords=coords)
 
 
-
 def make_polygon(
     *,
-    row_start: int,
-    row_stop: int,
-    col_start: int,
-    col_stop: int,
+    row_start: float,
+    row_stop: float,
+    col_start: float,
+    col_stop: float,
     west: float = TEST_GRID_WEST,
     south: float = TEST_GRID_SOUTH,
     dlat: float = TEST_GRID_DLAT,
     dlon: float = TEST_GRID_DLON,
     n_lat: int = TEST_GRID_N_LAT,
-    n_lon: int = TEST_GRID_N_LON,
-    shape: str = "box",
+    n_lon: int = TEST_GRID_N_LON
 ) -> tuple[BaseGeometry, int]:
     """Build a polygon and count default-grid cells with nonzero area overlap."""
     if row_stop <= row_start:
@@ -87,21 +85,9 @@ def make_polygon(
     )
 
     polygon = shapely_box(*bounds)
-    if shape == "blob":
-        polygon = polygon.buffer(min(dlon, dlat) * 0.65, resolution=8)
-    elif shape != "box":
-        raise ValueError("shape must be one of 'box' or 'blob'.")
+    grid_count = (row_stop - row_start) * (col_stop - col_start)
 
-    grid_count = _count_overlapping_grid_cells(
-        polygon,
-        n_lat=n_lat,
-        n_lon=n_lon,
-        west=west,
-        south=south,
-        dlat=dlat,
-        dlon=dlon,
-    )
-    return polygon, grid_count
+    return (polygon, grid_count)
 
 
 @pytest.fixture()
@@ -132,7 +118,7 @@ def overlapping_grid_10x15() -> xr.Dataset:
 
 
 @pytest.fixture()
-def inside_polygon -> tuple[BaseGeometry, int]:
+def inside_polygon() -> tuple[BaseGeometry, int]:
     """Cell-edge-aligned interior polygon and its covered grid-cell count."""
     row_start = 4
     row_stop = 12
@@ -143,25 +129,39 @@ def inside_polygon -> tuple[BaseGeometry, int]:
         row_stop=row_stop,
         col_start=col_start,
         col_stop=col_stop,
-        shape="box",
     )
 
-
 @pytest.fixture()
-def inside_blob_polygon() -> tuple[BaseGeometry, int]:
-    """Irregular interior polygon and its covered grid-cell count."""
-    row_start = 4
-    row_stop = 12
-    col_start = 5
-    col_stop = 15
+def inside_polygon_offset() -> tuple[BaseGeometry, int]:
+    """Cell-edge-aligned interior polygon with an offset and its covered grid-cell count."""
+    row_start = 4.25
+    row_stop = 5.25
+    col_start = 4.25
+    col_stop = 6.25
     return make_polygon(
         row_start=row_start,
         row_stop=row_stop,
         col_start=col_start,
         col_stop=col_stop,
-        shape="blob",
     )
 
+@pytest.fixture()
+def inside_single_polygon_offset() -> tuple[BaseGeometry, int]:
+    """Cell-edge-aligned single interior polygon with an offset and its covered grid-cell count."""
+    row_start = 4
+    row_stop = 5
+    col_start = 4
+    col_stop = 5
+    row_offset = 0.5
+    col_offset = 0.5
+    return make_polygon(
+        row_start=row_start,
+        row_stop=row_stop,
+        col_start=col_start,
+        col_stop=col_stop,
+        row_offset=row_offset,
+        col_offset=col_offset,
+    )
 
 @pytest.fixture()
 def overlapping_polygon() -> tuple[BaseGeometry, int]:
@@ -175,7 +175,6 @@ def overlapping_polygon() -> tuple[BaseGeometry, int]:
         row_stop=row_stop,
         col_start=col_start,
         col_stop=col_stop,
-        shape="box",
     )
 
 
@@ -191,7 +190,6 @@ def outside_polygon() -> tuple[BaseGeometry, int]:
         row_stop=row_stop,
         col_start=col_start,
         col_stop=col_stop,
-        shape="box",
     )
 
 
