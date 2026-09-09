@@ -8,30 +8,35 @@ dependencies:
   - numpy>=1.24
   - pandas>=2.0
   - xarray>=2023.1
+  - scipy
+  - dask
   # --- Geospatial ---
   - geopandas>=0.14
   - shapely>=2.0
   - pyproj
   - rioxarray
-  # --- NetCDF / GRIB I/O ---
+  # --- NetCDF / GRIB / Zarr I/O ---
   - h5netcdf>=1.0
   - netcdf4
   - cfgrib>=0.9
   - eccodes
-  # --- Regridding (add if needed) xesmf, esmpy--- 
+  - h5py
+  - zarr
   # --- Remote data access ---
   - earthaccess>=0.9
   - requests>=2.28
+  - fsspec
   # --- Meteorology ---
   - metpy>=1.5
+  - pvlib-python
   # --- Other ---
   - pyarrow>=12.0
   - click>=8.0
-  - matplotlib
   # --- pip-only packages ---
   - pip
   - pip:
     - mettoolbox>=5.0
     - SynopticPy>=2023.3
-    # Install the package itself in editable mode
-    - -e .
+    - pyet
+    # Install the package in editable mode along with testing & viz tools
+    - -e .[dev,viz]

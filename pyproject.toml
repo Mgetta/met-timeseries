@@ -11,18 +11,27 @@ requires-python = ">=3.10"
 dependencies = [
     "cfgrib>=0.9",
     "click>=8.0",
+    "dask",
     "earthaccess>=0.9",
+    "fsspec",
     "geopandas>=0.14",
     "h5netcdf>=1.0",
+    "h5py",
     "metpy>=1.5",
     "mettoolbox>=5.0",
+    "netcdf4",
     "numpy>=1.24",
     "pandas>=2.0",
     "pyarrow>=12.0",
+    "pyet",
+    "pyproj",
     "requests>=2.28",
+    "rioxarray",
+    "scipy",
     "shapely>=2.0",
     "SynopticPy>=2023.3",
     "xarray>=2023.1",
+    "zarr"
 ]
 
 [project.optional-dependencies]
@@ -31,8 +40,8 @@ dev = [
     "pytest-cov>=4.0",
 ]
 
-[project.scripts]
-met-timeseries = "met_timeseries.cli:main"
+viz = ["matplotlib"]
+stations = ["stations"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
